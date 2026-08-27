@@ -391,7 +391,9 @@ def classify_failure(text: str) -> str:
     A wrong token retried three times is three minutes of a powered-off node.
     """
     low = text.lower()
-    if any(marker in low for marker in ("unauthorized", "401", "forbidden", "403", "invalid token")):
+    if any(marker in low for marker in ("unauthorized", "401", "forbidden", "403",
+                                         "invalid token", "token_readonly",
+                                         "token is readonly")):
         return "auth"
     if "hcloud_token is not set" in low:
         return "auth"

@@ -834,6 +834,15 @@ class TestConfig(Base):
         self.assertFalse(rotate.same_place("nbg1", "hel1"))
         self.assertFalse(rotate.same_place("nbg1-dc3", "fsn1-dc14"))
 
+    def test_a_read_only_token_is_an_auth_failure_not_a_retry(self):
+        """Found live: a read-only HCLOUD_TOKEN reached allocate and retried
+        4x at 10s apiece before rolling back. The retries are not free — they
+        happen at any step, and on unassign or assign the node is mid-swap.
+        The marker the API returned was 'token_readonly' / 'token is readonly'.
+        """
+        self.assertEqual(rotate.classify_failure("not allowed because token is readonly (token_readonly)"), "auth")
+        self.assertEqual(rotate.classify_failure("code: token_readonly, message: ...readonly..."), "auth")
+
     def test_every_reachable_state_has_a_label(self):
         """A new step without a label would show as a bare identifier in the table."""
         for step in rotate.STEPS:
