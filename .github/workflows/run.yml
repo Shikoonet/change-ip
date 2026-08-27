@@ -102,6 +102,14 @@ concurrency:
   group: rotate
   cancel-in-progress: false
 
+# The default GITHUB_TOKEN has no scope on artifacts. The rollback job reads
+# rotation-state artifacts from earlier runs; granting only `actions: read` and
+# `contents: read` keeps the surface minimal. Without this, urllib gets a 403
+# from api.github.com and rollback dies before reading the checkpoint.
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   # ===========================================================================
   # Offline half — the merge-request gate. Push and PR only: these belong to
