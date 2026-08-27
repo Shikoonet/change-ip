@@ -289,6 +289,12 @@ jobs:
     name: 4 · verify the checkpoint says done
     needs: [swap, dns]
     runs-on: ubuntu-latest
+    # No mutating access — just reads the artifact and the config. Sits on
+    # hetzner-plan because that's where ROTATION_CONFIG lives; without an
+    # environment, secrets.ROTATION_CONFIG reads from the repo (empty) and the
+    # setup step fails with "ROTATION_CONFIG secret is empty" — exactly the
+    # failure we just saw on run #42.
+    environment: hetzner-plan
     env:
       TXID: ${{ needs.swap.outputs.txid }}
     steps:
