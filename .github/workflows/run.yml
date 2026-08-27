@@ -103,10 +103,14 @@ concurrency:
 
 jobs:
   # ===========================================================================
-  # Offline half — runs on every push AND before every operation. Free.
+  # Offline half — the merge-request gate. Push and PR only: these belong to
+  # the code review, not in front of a live operation. An operator dispatching
+  # a rotation is acting on a commit that already passed them, and 40s of
+  # unit tests between a decision and a powered-off node buys nothing.
   # ===========================================================================
   offline:
     name: unit + self-test + contract
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,6 +123,7 @@ jobs:
 
   lint:
     name: syntax, yamllint, ansible-lint
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -137,12 +142,10 @@ jobs:
   # operation: change-ip
   # ===========================================================================
   # 1. plan — read-only against the real API. Safe, but it needs the token, so
-  #    it still goes through the environment. Needs `offline` first: the tests
-  #    are free, the API is not.
+  #    it still goes through the environment.
   plan:
     name: 1 · plan (read-only)
     if: inputs.operation == 'change-ip'
-    needs: [offline]
     runs-on: ubuntu-latest
     environment: hetzner-plan
     env:
@@ -312,7 +315,6 @@ jobs:
   rollback:
     name: roll back to the old IP
     if: inputs.operation == 'rollback'
-    needs: [offline]
     runs-on: ubuntu-latest
     environment: hetzner-production
     env:

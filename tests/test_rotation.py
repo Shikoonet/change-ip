@@ -49,10 +49,10 @@ FINGERPRINT = "deadbeefcafe"
 #: How many MUTATING provider calls are still owed from each state. Used by the
 #: resume test to prove a resume repeats nothing and skips nothing.
 REMAINING_WRITES = {
-    "confirmed": 6,          # protect_ip, stop, unassign, allocate, assign, start
-    "server_off": 4,
-    "old_ip_unassigned": 3,
-    "new_ip_allocated": 2,
+    "confirmed": 6,          # allocate, protect_ip, stop, unassign, assign, start
+    "new_ip_allocated": 5,
+    "server_off": 3,
+    "old_ip_unassigned": 2,
     "new_ip_assigned": 1,
     "server_on": 0,
     "connectivity_ok": 0,
@@ -387,10 +387,6 @@ class TestStateMachine(Base):
         rot = self.build()
         cp = rot.plan(txid="tx-crash")
         rot._transition(cp, "confirmed")
-        rot._step_stop(cp)
-        rot._transition(cp, "server_off")
-        rot._step_unassign(cp)
-        rot._transition(cp, "old_ip_unassigned")
         rot._step_allocate(cp)
         first_id = cp["new_ip"]["id"]
         ip_count = len(self.fake.ips)
@@ -565,13 +561,30 @@ class TestRollback(Base):
         self.assertIn("powering back on failed too", cp["escalations"][-1]["message"])
 
     def test_rollback_failure_escalates_with_commands(self):
+        """The attach fails mid-swap, and putting the old one back fails too."""
         fake = FakeHcloud()
-        fake.inject("allocate", "no capacity", "retryable", times=9)
         fake.inject("assign", "also broken", "retryable", times=9)
         rot = self.build(fake)
         cp = self.full_run(rot)
         self.assertEqual(cp["state"], "escalated")
         self.assertTrue(cp["escalations"][-1]["recovery_commands"])
+
+    def test_a_failed_allocation_never_takes_the_node_down(self):
+        """The whole reason allocate runs before stop: no capacity is not an outage.
+
+        The node is never powered off, never detached, and the old address is
+        still on it. Compare with the same failure after the detach, which is a
+        node with no address waiting on a rollback.
+        """
+        fake = FakeHcloud()
+        fake.inject("allocate", "no capacity in this datacenter", "retryable", times=9)
+        rot = self.build(fake)
+        cp = self.full_run(rot)
+        self.assertEqual(cp["outcome"], "rolled_back")
+        self.assertTrue(cp["rollback"]["ips_untouched"])
+        self.assertEqual(fake.server["ipv4_address"], cp["old_ip"]["ip"])
+        self.assertEqual(fake.server["status"], "running")
+        self.assertNotIn("unassign", [h["action"] for h in cp["history"]])
 
     def test_nothing_in_the_rollback_path_deletes(self):
         fake = FakeHcloud()

@@ -134,14 +134,29 @@ class Step:
 
 
 STEPS = (
+    # Allocation FIRST, while the node is still up and still has its address.
+    # A quota, a full datacenter or an API outage then costs nothing but a
+    # failed run — the box is untouched, and the downtime window has not
+    # opened. Doing this after the detach is what turns "no address available"
+    # into "node with no address".
+    #
+    # The price is honest and small: an allocated address that a later step
+    # abandons is retained and billed, because Rule One says nothing is
+    # deleted. The deterministic name makes a re-run adopt it instead of
+    # minting a second one.
+    Step("confirmed", "new_ip_allocated", "_step_allocate", "restart_only"),
     # Nothing has moved yet, so a shutdown that never completes costs only the
     # downtime: power the box back on and stop. No address was touched.
-    Step("confirmed", "server_off", "_step_stop", "restart_only"),
+    Step("new_ip_allocated", "server_off", "_step_stop", "restart_only"),
     # From here to server_on the box is mid-swap and a failure means "put the
     # old address back", which is only possible because protect_ip ran first.
+    #
+    # ⚠ Hetzner allows a server exactly ONE Primary IPv4. The detach cannot be
+    # deferred until after the attach — there is no window where both are on
+    # the box, and no API call that swaps them atomically. These two lines are
+    # the entire outage.
     Step("server_off", "old_ip_unassigned", "_step_unassign", "restore"),
-    Step("old_ip_unassigned", "new_ip_allocated", "_step_allocate", "restore"),
-    Step("new_ip_allocated", "new_ip_assigned", "_step_assign", "restore"),
+    Step("old_ip_unassigned", "new_ip_assigned", "_step_assign", "restore"),
     # Swapping the addresses back does not fix a box that will not boot, so
     # this one goes straight to a human with the commands in hand.
     Step("new_ip_assigned", "server_on", "_step_start", "escalate"),
@@ -709,7 +724,9 @@ class Rotation:
         self.record(cp, "unassign", f"{cp['old_ip']['ip']} detached and retained")
 
     def _step_allocate(self, cp: Dict[str, Any]) -> None:
-        self.assert_identity(cp, expect_ip="none")
+        # The old address is still on the box here — allocation happens before
+        # anything is detached, on purpose. See the comment on STEPS.
+        self.assert_identity(cp, expect_ip="old")
         name = cp["new_ip"]["name"]
 
         # The deterministic name IS the checkpoint for this step. A crash

@@ -35,7 +35,8 @@ GitHub Actions — **one workflow**, `.github/workflows/run.yml`:
 
 ```
 push / PR          offline suite + lint only. No secrets, no cost.
-Run workflow       a dropdown picks the operation:
+                   This is the merge-request gate and it runs nowhere else.
+Run workflow       a dropdown picks the operation; no tests in front of it:
   change-ip        1·plan → 2·swap → 3·dns → 4·verify
                      ↑        ↑       ↑
                      └────────┴───────┴── environment approval, one per job
@@ -56,6 +57,30 @@ more `operation` choice plus jobs gated `if: inputs.operation == '<it>'` in
 the does-this-match check), and `rotate.py`'s job-summary table — any state
 machine that calls `github_summary` on transition gets the same readable run
 summary for free.
+
+### The order, and the one part of it Hetzner dictates
+
+```
+1  allocate the new address     node still up, still on the old address
+2  power off                    ── the outage starts here
+3  detach the old address       node has NO address
+4  attach the new address
+5  power on                     ── the outage ends here
+6  TCP on the new address
+```
+
+Allocation is **first**, before anything is powered off. A quota, a full
+datacenter or an API outage then costs a failed run and nothing else — the box
+is untouched. Doing it after the detach is what turns "no address available"
+into "node with no address". The price is small and stated: an allocated
+address that a later step abandons is retained and billed, because Rule One
+says nothing is deleted; the deterministic name makes a re-run adopt it rather
+than mint a second.
+
+Steps 3 and 4 cannot be reordered. **Hetzner allows a server exactly one
+Primary IPv4** — there is no window where both are attached and no API call
+that swaps them atomically, so the detach must precede the attach. That pair
+is the entire outage, and it is as short as the platform permits.
 
 `swap` runs `--until connectivity_ok` and stops exactly where the interactive
 tool asks a human to edit the inventory. It expects **exit 6** — a deliberate
