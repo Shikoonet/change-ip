@@ -1,6 +1,6 @@
 # Offline checks. No token, no network, no cost — this is the only workflow
 # that runs without a human pressing anything.
-name: test
+name: ci · offline checks
 
 on:
   push:
@@ -9,6 +9,7 @@ on:
 
 jobs:
   offline:
+    name: unit + self-test + contract
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +21,7 @@ jobs:
       - run: ansible-playbook tests/contract.yml
 
   lint:
+    name: syntax, yamllint, ansible-lint
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

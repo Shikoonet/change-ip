@@ -34,13 +34,39 @@ in `rotation.yml` at that checkout; in CI the `dns` job clones it.
 GitHub Actions, in `.github/workflows/`:
 
 ```
-test.yml     push / PR        offline suite + lint. No secrets, no cost
-rotate.yml   workflow_dispatch(server_id)
-               plan  → swap → dns → verify
-                ↑       ↑      ↑
-                └───────┴──────┴── environment approval, one per job
-rollback.yml workflow_dispatch(txid, server_id, run_id)
+ci.yml           push / PR    offline suite + lint. No secrets, no cost
+ip-rotate.yml    dispatch(target, server_id, server_name, old_ipv4)
+                   plan  → swap → dns → verify
+                    ↑       ↑      ↑
+                    └───────┴──────┴── environment approval, one per job
+ip-rollback.yml  dispatch(target, txid, server_id, run_id)
 ```
+
+### Naming, because this is the first flow and not the last
+
+The file name is `<subject>-<verb>.yml` and the sidebar name is `<subject> ·
+<what it does to the box>`. The subject prefix is doing the work: the Actions
+sidebar sorts alphabetically, so everything that touches an address stays
+together and a node lifecycle flow added later does not interleave with it.
+
+| file | sidebar | exists |
+|---|---|---|
+| `ci.yml` | `ci · offline checks` | yes |
+| `ip-rotate.yml` | `ip · change old IP to new IP` | yes |
+| `ip-rollback.yml` | `ip · roll back to the old IP` | yes |
+| `node-onboard.yml` | `node · onboard a new box` | not yet |
+| `node-update.yml` | `node · update` | not yet |
+| `node-monitoring.yml` | `node · add to monitoring` | not yet |
+
+Jobs inside a flow are numbered (`1 · plan`, `2 · swap …`) because GitHub draws
+them as a graph with no order of its own, and the order is the whole safety
+argument here — a `swap` that ran before `plan` is a different tool.
+
+Two things a new flow should reuse rather than reinvent:
+`.github/actions/setup` (python + collection + the config secret + the
+does-this-match check), and `rotate.py`'s job-summary table — any state machine
+that calls `github_summary` on transition gets the same readable run summary
+for free.
 
 `swap` runs `--until connectivity_ok` and stops exactly where the interactive
 tool asks a human to edit the inventory. It expects **exit 6** — a deliberate
@@ -66,10 +92,10 @@ boundary.
 
 `rollback` is a separate workflow rather than a job, because GitHub — unlike
 GitLab — leaves no clickable button on a run that has finished. It takes the
-txid and the `rotate` run id and pulls that run's checkpoint artifact back
+txid and the `ip · change` run id and pulls that run's checkpoint artifact back
 down. Artifacts expire in 30 days; after that a rollback is a hand job.
 
-See the header of `.github/workflows/rotate.yml` for the secrets it needs.
+See the header of `.github/workflows/ip-rotate.yml` for the secrets it needs.
 
 ---
 

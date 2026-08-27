@@ -48,7 +48,7 @@
 # only readable by a job that has passed that environment's reviewers. A repo
 # secret is readable by any workflow on any branch. Masking is not a boundary.
 # =============================================================================
-name: rotate
+name: ip · change old IP to new IP
 
 on:
   workflow_dispatch:
@@ -81,6 +81,7 @@ jobs:
   #    it still goes through the environment.
   # ===========================================================================
   plan:
+    name: 1 · plan (read-only)
     runs-on: ubuntu-latest
     environment: hetzner-plan
     env:
@@ -105,6 +106,7 @@ jobs:
   #    ⚠ Between the detach and the start the node has NO public address.
   # ===========================================================================
   swap:
+    name: 2 · swap the address (node is offline in here)
     needs: [plan]
     runs-on: ubuntu-latest
     environment: hetzner-production
@@ -157,6 +159,7 @@ jobs:
   #    assumption.
   # ===========================================================================
   dns:
+    name: 3 · move DNS (needs the inventory commit)
     needs: [swap]
     runs-on: ubuntu-latest
     environment: hetzner-production
@@ -208,6 +211,7 @@ jobs:
   # 4. verify — the checkpoint says done, and says so on its own terms.
   # ===========================================================================
   verify:
+    name: 4 · verify the checkpoint says done
     needs: [swap, dns]
     runs-on: ubuntu-latest
     env:

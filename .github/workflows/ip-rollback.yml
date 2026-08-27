@@ -13,7 +13,7 @@
 # The NEW address is RETAINED after a rollback. Deleting it is a separate
 # decision with a separate approval.
 # =============================================================================
-name: rollback
+name: ip · roll back to the old IP
 
 on:
   workflow_dispatch:
