@@ -71,10 +71,11 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: 'What to do'
+        description: 'What to do. plan reads everything and changes nothing — run it first.'
         required: true
         type: choice
         options:
+          - plan
           - change-ip
           - rollback
       server_id:
@@ -131,10 +132,12 @@ jobs:
   # operation: change-ip
   # ===========================================================================
   # 1. plan — read-only against the real API. Safe, but it needs the token, so
-  #    it still goes through the environment.
+  #    it still goes through an environment. `operation: plan` stops here: it
+  #    is the dry run, and on a config that has never been used it is the only
+  #    honest first move.
   plan:
     name: 1 · plan (read-only)
-    if: inputs.operation == 'change-ip'
+    if: inputs.operation == 'plan' || inputs.operation == 'change-ip'
     runs-on: ubuntu-latest
     environment: hetzner-plan
     env:
@@ -157,6 +160,7 @@ jobs:
   #    ⚠ Between the detach and the start the node has NO public address.
   swap:
     name: 2 · swap the address (node is offline in here)
+    if: inputs.operation == 'change-ip'
     needs: [plan]
     runs-on: ubuntu-latest
     environment: hetzner-production
