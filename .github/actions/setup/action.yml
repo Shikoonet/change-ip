@@ -4,16 +4,12 @@ name: setup
 description: python + ansible-core + hetzner.hcloud, and rotation.yml from the secret
 inputs:
   rotation_config:
-    description: contents of rotation.yml (the ROTATION_CONFIG_<TARGET> secret)
+    description: contents of rotation.yml (the ROTATION_CONFIG secret)
     required: true
-  expect_name:
-    description: >
-      What the operator typed on the dispatch form as the server name. Checked
-      against the config, NOT written into it — see the assert step below.
-    required: false
-    default: ''
   expect_ipv4:
-    description: the address the operator says the node is on today. Same deal.
+    description: >
+      The address the operator typed on the dispatch form. Checked against the
+      config, NOT written into it — see the assert step below.
     required: false
     default: ''
 runs:
@@ -44,18 +40,16 @@ runs:
       # with it stops the run here, before plan has touched the API. Filling a
       # form is not the same as knowing, and this is the difference.
       env:
-        EXPECT_NAME: ${{ inputs.expect_name }}
         EXPECT_IPV4: ${{ inputs.expect_ipv4 }}
       run: |
         python3 - <<'EOF'
         import os, sys, yaml
         cfg = yaml.safe_load(open("rotation.yml"))["server"]
-        for field, typed in (("expected_name", os.environ["EXPECT_NAME"]),
-                             ("expected_ipv4", os.environ["EXPECT_IPV4"])):
+        for field, typed in (("expected_ipv4", os.environ["EXPECT_IPV4"]),):
             if typed and typed.strip() != str(cfg[field]):
-                sys.exit(f"REFUSING: you typed {field}={typed.strip()!r}, but this "
-                         f"target's config says {cfg[field]!r}. Wrong server, wrong "
-                         f"target, or the config is stale — none of them are safe.")
+                sys.exit(f"REFUSING: you typed {field}={typed.strip()!r}, but the "
+                         f"config says {cfg[field]!r}. Wrong server, or the config "
+                         f"is stale — neither is safe to rotate.")
         print(f"target agrees: {cfg['expected_name']} on {cfg['expected_ipv4']} "
               f"in {cfg['expected_location']} (id {cfg['id']})")
         EOF

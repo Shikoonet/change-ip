@@ -7,10 +7,15 @@
 # reach `swap` no matter what else regresses. tests/contract.yml asserts that
 # gate as text.
 #
-# `Run workflow` adds a dropdown: pick the operation, pick the node, answer
-# the identity questions. New capability later (node-onboard, node-update,
-# node-monitoring) = one more `operation` choice + jobs gated on it, in THIS
-# file — not a new workflow.
+# `Run workflow` asks three things and nothing else: what to do, which server
+# (its id), and the address that server is on right now. Everything else it
+# needs is in the config secret or is re-read live from the API — a form field
+# is a chance to mistype something the run could have proved instead.
+#
+# New capability later (node-onboard, node-update, node-monitoring) = one more
+# `operation` choice + jobs gated on it, in THIS file — not a new workflow.
+# A second datacenter needs no new field either: the config grows a second
+# server and the id on the form picks it.
 #
 # WHAT REPLACED THE INTERACTIVE PROMPT.
 #
@@ -43,12 +48,11 @@
 #
 #   HCLOUD_TOKEN            the modules read it from the environment
 #                           themselves — it is in no argv.
-#   ROTATION_CONFIG_<T>     the contents of rotation.yml for target <T>, one
-#                           secret per node. Not committed: it pins a real
-#                           server id and a real project fingerprint. A second
-#                           datacenter is a second secret plus one line in the
-#                           `target` choice list — no code change, and no way
-#                           for one node's run to read another node's config.
+#   ROTATION_CONFIG         the contents of rotation.yml. Not committed: it
+#                           pins a real server id and a real project
+#                           fingerprint. It is the TRUTH — the two things the
+#                           form asks for are checked against it, never
+#                           written into it.
 #   SSH_PRIVATE_KEY         only `dns` needs it (ip-change.yml SSHes the node
 #                           on its new address).
 #   ANSIBLE_VAULT_PASSWORD  shikoonet's vault, for the Cloudflare token.
@@ -67,33 +71,18 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: 'What to do to the box. change-ip swaps the Primary IPv4 and moves DNS; rollback puts the old address back on a paused/failed transaction.'
+        description: 'What to do'
         required: true
         type: choice
         options:
           - change-ip
           - rollback
-      target:
-        description: 'Which node. Each one is a separate ROTATION_CONFIG_<TARGET> secret on the environment; adding a datacenter is a secret plus one line here, no code.'
-        required: true
-        type: choice
-        options:
-          - HETZNER_DE
       server_id:
-        description: 'Hetzner server id. Must equal server.id in the config — "true" is not a spelling of a specific server. `make ip-rotate-plan` prints it.'
+        description: 'Server id — the number in the Hetzner console URL. Must equal server.id in the config.'
         required: true
-      server_name:
-        description: 'change-ip: name the node currently has. Checked against the config; a mismatch stops the run before the API is touched. Blank skips the check.'
-        required: false
-      old_ipv4:
-        description: 'change-ip: address the node is on TODAY — the one being burned. Same check, same stop.'
-        required: false
-      txid:
-        description: 'rollback only: transaction id. The swap job printed it; state/ holds one JSON file per transaction.'
-        required: false
-      run_id:
-        description: 'rollback only: the change-ip run whose checkpoint artifact to restore. Leave empty if state/ is already in this checkout (it is not, normally).'
-        required: false
+      server_ip:
+        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on.'
+        required: true
 
 concurrency:
   # One rotation at a time — across operations too: a rollback racing the
@@ -154,9 +143,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
-          expect_name: "${{ inputs.server_name }}"
-          expect_ipv4: "${{ inputs.old_ipv4 }}"
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
       - run: python3 rotate.py plan --config rotation.yml
 
   # 2. swap — THE PROVIDER HALF. Powers the node off, detaches the burned
@@ -182,9 +170,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
-          expect_name: "${{ inputs.server_name }}"
-          expect_ipv4: "${{ inputs.old_ipv4 }}"
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
       - id: run
         run: |
           set +e
@@ -233,9 +220,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
-          expect_name: "${{ inputs.server_name }}"
-          expect_ipv4: "${{ inputs.old_ipv4 }}"
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
       - uses: actions/download-artifact@v4
         with: {name: rotation-state, path: state/}
       # Secrets go through env, never inlined into the script: an inlined
@@ -278,9 +264,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
-          expect_name: "${{ inputs.server_name }}"
-          expect_ipv4: "${{ inputs.old_ipv4 }}"
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
       - uses: actions/download-artifact@v4
         with: {name: rotation-state-final, path: state/}
       - run: python3 rotate.py status --config rotation.yml --txid "$TXID"
@@ -301,9 +286,9 @@ jobs:
   # operation: rollback — puts the OLD address back.
   #
   # Never automatic. GitLab keeps a finished pipeline's manual jobs clickable;
-  # GitHub does not — a run that ended has no button left. So rollback takes
-  # the txid and the run it came from, and pulls that run's checkpoint back
-  # down.
+  # GitHub does not — a run that ended has no button left. So this one finds
+  # the transaction itself: the newest unexpired checkpoint artifact in the
+  # repo, then proves it is the box the operator meant before touching it.
   #
   # A node that is up on the new address is not an emergency, and swapping back
   # does not fix a box that will not boot. Read the checkpoint first:
@@ -321,36 +306,55 @@ jobs:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      # The dropdown cannot make txid required for this choice only, so the
-      # first step is the form check — red before any secret is used.
-      - name: Refuse without a txid
-        run: |
-          test -n "${{ inputs.txid }}" || {
-            echo "operation=rollback needs a txid. The swap job printed it;"
-            echo "it is also the artifact's JSON file name."
-            exit 1; }
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
-      - name: Fetch the checkpoint from the change-ip run
-        if: inputs.run_id != ''
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+      - name: Find the last transaction
         run: |
-          # -final first: if dns ran, that is the newer state. Either is a
-          # valid resume point; the wrong one is a rollback of a transaction
-          # that already moved on.
-          gh run download "${{ inputs.run_id }}" -n rotation-state-final -D state/ \
-            || gh run download "${{ inputs.run_id }}" -n rotation-state -D state/
-      - name: Refuse without a checkpoint
-        run: |
-          test -f "state/${{ inputs.txid }}.json" || {
-            echo "No checkpoint for ${{ inputs.txid }}. Pass run_id, or the"
-            echo "artifact has expired (30 days) and this must be done by hand."
+          # The operator is not asked for a txid. Typing one is a chance to
+          # mistype one, and the answer is already in the artifacts: the newest
+          # unexpired checkpoint IS the transaction to roll back.
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+                 --jq '[.artifacts[] | select(.name|startswith("rotation-state"))
+                        | select(.expired|not)] | sort_by(.created_at) | last | .id')
+          test -n "$ID" || {
+            echo "No checkpoint artifact left. They expire after 30 days;"
+            echo "past that a rollback is done by hand from the console."
             exit 1; }
-          python3 rotate.py status --config rotation.yml --txid "${{ inputs.txid }}"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" > state.zip
+          unzip -qo state.zip -d state/
+      - name: Prove it is the box you meant
+        id: cp
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+          SERVER_IP: ${{ inputs.server_ip }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json, os, sys
+          files = sorted(glob.glob("state/*.json"), key=os.path.getmtime)
+          if not files:
+              sys.exit("the artifact held no checkpoint")
+          cp = json.load(open(files[-1]))
+          txid = cp["txid"]
+          # Two independent facts, both from the operator, both re-proved
+          # against the checkpoint before anything is powered off. The address
+          # typed on the form is the one the box is sitting on NOW — after a
+          # swap that is the NEW one.
+          if str(cp["server"]["id"]) != os.environ["SERVER_ID"].strip():
+              sys.exit(f"{txid} is server {cp['server']['id']}, you typed "
+                       f"{os.environ['SERVER_ID']}. Wrong transaction.")
+          now = (cp.get("new_ip") or {}).get("ip") or cp["old_ip"]["ip"]
+          if now != os.environ["SERVER_IP"].strip():
+              sys.exit(f"{txid} left the box on {now}, you typed "
+                       f"{os.environ['SERVER_IP']}. Read it before rolling back.")
+          print(f"txid={txid}")
+          EOF
+      - run: python3 rotate.py status --config rotation.yml --txid "${{ steps.cp.outputs.txid }}"
       - run: |
           python3 rotate.py rollback --config rotation.yml \
-            --txid "${{ inputs.txid }}" --confirm-server-id "${{ inputs.server_id }}"
+            --txid "${{ steps.cp.outputs.txid }}" \
+            --confirm-server-id "${{ inputs.server_id }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state-rolledback, path: state/, retention-days: 30}

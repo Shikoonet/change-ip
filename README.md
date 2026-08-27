@@ -36,12 +36,23 @@ GitHub Actions — **one workflow**, `.github/workflows/run.yml`:
 ```
 push / PR          offline suite + lint only. No secrets, no cost.
                    This is the merge-request gate and it runs nowhere else.
-Run workflow       a dropdown picks the operation; no tests in front of it:
+Run workflow       three fields: operation, server_id, server_ip.
   change-ip        1·plan → 2·swap → 3·dns → 4·verify
                      ↑        ↑       ↑
                      └────────┴───────┴── environment approval, one per job
-  rollback         refuse-without-txid → fetch checkpoint → roll back
+  rollback         find last checkpoint → prove it is that box → roll back
 ```
+
+The form asks **what to do, which server, and the address it is on right
+now** — nothing else. Every other value is in the config secret or is re-read
+live from the API. A field the run could prove for itself is a field the
+operator can mistype, and the two it does ask for are *assertions*: they are
+compared against the config (and, for a rollback, against the checkpoint) and
+a mismatch stops the run before anything is powered off. They are never a
+source for what gets rotated.
+
+A second datacenter needs no new field: the config grows a second server and
+the id on the form picks it.
 
 On push the operation jobs show as *skipped*: they are gated on
 `inputs.operation`, which a push does not have, and `tests/contract.yml`
