@@ -349,58 +349,52 @@ jobs:
           # mistype one, and the answer is already in the artifacts: the newest
           # unexpired checkpoint IS the transaction to roll back.
           #
-          # urllib + GITHUB_TOKEN. `gh api` exits 1 silently on certain endpoint
-          # combinations inside the runner (the same trap that bit the dns gate),
-          # so we hit the REST API directly. The token is the same one Actions
-          # exposes to every job — no extra secret needed.
+          # urllib hits the API, and the action below does the actual download
+          # (which is a redirect to S3 that urllib alone cannot follow with the
+          # Authorization header). Found live: this is the same artifact fetch
+          # that worked in `dns`'s skipped branch, just here we actually use it.
           python3 - <<'EOF'
-          import io, json, os, sys, urllib.request, zipfile
+          import json, os, sys, urllib.request
 
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GITHUB_TOKEN"]
           h = {"Authorization": f"Bearer {token}",
                "Accept": "application/vnd.github+json"}
 
-          def get_json(path):
-              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}",
-                                           headers=h)
-              with urllib.request.urlopen(req) as r:
-                  return json.loads(r.read())
-
-          def get_bytes(path):
-              # /actions/artifacts/{id}/zip returns 302 to S3; urllib follows the
-              # redirect but strips the Authorization header, and S3 then 401s.
-              # Pass a custom opener that keeps the header across redirects.
-              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}",
-                                           headers=h)
-              opener = urllib.request.build_opener(
-                  urllib.request.HTTPRedirectHandler(),
-                  # default HTTPRedirectHandler keeps headers, but Python 3.x
-                  # drops Authorization on cross-origin redirect for safety;
-                  # rebuild the request with the same header.
-              )
-              # Re-add headers on redirect by hand:
-              class _KeepAuth(urllib.request.HTTPRedirectHandler):
-                  def http_error_302(self, req, fp, code, msg, headers):
-                      new = urllib.request.HTTPRedirectHandler.http_error_302(
-                          self, req, fp, code, msg, headers)
-                      new.headers.update(h)
-                      return new
-              op = urllib.request.build_opener(_KeepAuth())
-              with op.open(req) as r:
-                  return r.read()
-
-          arts = get_json("actions/artifacts?per_page=100")["artifacts"]
+          arts = json.loads(urllib.request.urlopen(urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/actions/artifacts?per_page=100",
+              headers=h)).read())["artifacts"]
           live = [a for a in arts
                   if not a["expired"] and a["name"].startswith("rotation-state")]
           if not live:
               sys.exit("No checkpoint artifact left. They expire after 30 days; "
                        "past that a rollback is done by hand from the console.")
           art = max(live, key=lambda a: a["created_at"])
-          zipfile.ZipFile(io.BytesIO(get_bytes(f"actions/artifacts/{art['id']}/zip"))
-                          ).extractall("state/")
-          print(f"checkpoint {art['name']} ({art['id']}) restored.")
+          with open("/tmp/last_artifact_id", "w") as f:
+              f.write(str(art["id"]))
+          print(f"will restore {art['name']} ({art['id']}).")
           EOF
+      - name: Download the checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: rotation-state
+          path: state/
+          github-token: ${{ github.token }}
+        # If the very latest rotation ran dns, the artifact is named
+        # rotation-state-final; try that if rotation-state was not found.
+      - name: Try the final artifact if the bare one was missing
+        if: hashFiles('state/*.json') == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: rotation-state-final
+          path: state/
+          github-token: ${{ github.token }}
+      - name: Refuse without a checkpoint
+        run: |
+          test -n "$(ls state/*.json 2>/dev/null)" || {
+            echo "No rotation-state* artifact found. They expire after 30 days;"
+            echo "past that a rollback is done by hand from the console."
+            exit 1; }
       - name: Prove it is the box you meant
         id: cp
         env:
