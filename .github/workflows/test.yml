@@ -1,0 +1,33 @@
+# Offline checks. No token, no network, no cost — this is the only workflow
+# that runs without a human pressing anything.
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install --quiet ansible-core
+      - run: python3 -m unittest discover -s tests -t .
+      - run: python3 rotate.py --self-test
+      - run: ansible-playbook tests/contract.yml
+
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install --quiet ansible-core ansible-lint yamllint
+      - run: ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
+      - run: python3 -m compileall -q rotate.py providers.py ansible_adapter.py
+      - run: yamllint hcloud_step.yml tests/contract.yml rotation.example.yml || true
+      - run: ansible-lint hcloud_step.yml || true

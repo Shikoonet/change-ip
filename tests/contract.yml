@@ -1,0 +1,345 @@
+---
+# =============================================================================
+# server-ip-rotation — offline contract + the Python suite, in one target.
+#
+#   ansible-playbook tests/contract.yml            (or: make test)
+#
+# Fully offline: no inventory, no host, no network, no Hetzner. The Python
+# tests fake the runner seam, so `ansible-playbook hcloud_step.yml` is never
+# invoked either.
+#
+# Two jobs, and they are different jobs:
+#
+#   1. RUN the unittest suite and the self-test. Those cover behaviour — the
+#      state machine, the rollback table, resume-from-every-checkpoint.
+#
+#   2. READ hcloud_step.yml as text and as YAML, and assert the never-delete
+#      contract on it, the same way tests/no_delete_contract_offline_test.yml
+#      does for roles/. Behaviour tests cannot catch a `state: absent` added to
+#      a branch no test exercises; this can.
+#
+# This file deliberately does NOT scan the Python sources for the forbidden
+# strings: they legitimately appear there in error messages and in comments
+# explaining the ban. hcloud_step.yml is the only file that can actually issue
+# a delete, so it is the only file that matters here.
+# =============================================================================
+- name: "server-ip-rotation contract"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    ansible_managed: "Managed by Ansible (server-ip-rotation) - do not edit by hand"
+    _repo: "{{ playbook_dir | dirname }}"
+    _proj: "{{ playbook_dir | dirname }}"
+    _step_file: "{{ playbook_dir | dirname }}/hcloud_step.yml"
+
+    # Patterns that must appear NOWHERE in hcloud_step.yml. Comments are
+    # stripped before the scan, because that file EXPLAINS several of these in
+    # a comment right above the safe version.
+    forbidden:
+      - pattern: 'state:\s*absent'
+        why: >-
+          Nothing this tool runs may delete a server or a Primary IP. The
+          rollback path RETAINS the new address and the old one is never
+          removed — deleting either is a separate operator decision.
+
+      - pattern: 'auto_delete:\s*true'
+        why: >-
+          auto_delete lets Hetzner reclaim a Primary IP when the resource it is
+          attached to goes away. On the OLD address that destroys the only way
+          back mid-rotation; on the new one it makes the result unstable.
+
+      - pattern: 'server_type:'
+        why: >-
+          `force: true` next to `server_type:` authorises an irreversible disk
+          resize. This file uses force to power a box down for an IP move and
+          must never carry a server type at all.
+
+      - pattern: 'ignore_errors:'
+        why: >-
+          A green-but-failed step here means a powered-off box with an address
+          nobody knows. A module failure must abort the play, write no JSON,
+          and let rotate.py see the non-zero rc.
+
+      - pattern: 'failed_when:\s*false'
+        why: >-
+          Same as ignore_errors. This repo already paid for this once: an AIDE
+          task with failed_when:false silently checked nothing for months.
+
+      - pattern: 'no_log:\s*true'
+        why: >-
+          no_log on an hcloud task hides WHICH action failed while hiding
+          nothing that matters — the modules' own argspec already marks
+          api_token as no_log. Losing the result turns a debuggable failure
+          into a powered-off box and a shrug.
+
+      - pattern: 'api_token:'
+        why: >-
+          The token is read from HCLOUD_TOKEN by the modules themselves. Passing
+          it as a parameter puts it in a var file or in argv.
+
+    # Values that must be PRESENT. Each one removes a failure class.
+    required:
+      - file: "hcloud_step.yml"
+        pattern: 'connection:\s*local'
+        why: "the node is powered off for half a rotation"
+      - file: "hcloud_step.yml"
+        pattern: 'gather_facts:\s*false'
+        why: "a stray fact gather would hang on the box that has no address"
+      # Trap #2: `enable_ipv4: false` on its own is a silent no-op — the
+      # collection only calls _update_server_ip() when `ipv4:` is not None.
+      - file: "hcloud_step.yml"
+        pattern: 'enable_ipv4:\s*false'
+        why: "the unassign op needs it alongside an explicit ipv4:"
+      # The confirmation is the target's own numeric id, never `true`.
+      - file: "rotate.py"
+        pattern: 'confirm-server-id'
+        why: "the destructive-confirmation pattern this repo uses everywhere"
+      - file: "rotate.py"
+        pattern: "retention.*must be 'keep'"
+        why: "deleting the previous address is not implemented on purpose"
+      - file: "ansible_adapter.py"
+        pattern: 'IP_CHANGE_ARGV_TEMPLATE'
+        why: >-
+          the DNS move goes through the existing `make ip-change HOST=<alias>`
+          target, not a hand-rolled -l invocation that would strip the doctor
+      - file: ".gitignore"
+        pattern: 'state/'
+        why: "checkpoints are runtime state, not source"
+      # The CD split. Both of these are what keep a pipeline stage boundary
+      # from becoming a node parked with no address.
+      - file: "rotate.py"
+        pattern: 'PAUSABLE = \("connectivity_ok", "ansible_done"\)'
+        why: >-
+          --until may only name a state where the box is up and reachable.
+          Widening this list lets a CI job stop between detach and attach.
+      # The human gate the interactive prompt used to be, on GitHub Actions.
+      # Three independent halves, because any one of them alone still lets a
+      # real rotation happen off a git push:
+      - file: ".github/workflows/rotate.yml"
+        pattern: 'on:\n  workflow_dispatch:'
+        why: >-
+          the rotation is dispatched by a person, never by push or schedule
+      - file: ".github/workflows/rotate.yml"
+        pattern: 'environment: hetzner-production'
+        why: >-
+          the pause. Required reviewers on that environment are what makes the
+          run wait for a human between swap and dns — GitHub has no per-job
+          manual button, this is it. The protection rule lives in repo
+          settings, so this only asserts the job asks for it
+      - file: ".github/workflows/rotate.yml"
+        pattern: 'grep -q -- "\$NEW_IP" /tmp/shikoonet/inventory/hosts.yml'
+        why: >-
+          `yes` is only ever answered to the inventory prompt after the new
+          address has been re-derived from the shikoonet checkout. Delete this
+          and the pipeline is piping yes at a question it did not verify
+
+  tasks:
+
+    # ---- 1. behaviour -------------------------------------------------------
+    - name: "ip-rotation | the offline python suite"
+      ansible.builtin.command:
+        cmd: "python3 -m unittest discover -s tests -t ."
+        chdir: "{{ _proj }}"
+      register: _unittest
+      changed_when: false
+
+    - name: "ip-rotation | unittest summary"
+      ansible.builtin.debug:
+        msg: "{{ _unittest.stderr_lines[-3:] }}"
+
+    - name: "ip-rotation | rotate.py --self-test"
+      ansible.builtin.command:
+        cmd: "python3 rotate.py --self-test"
+        chdir: "{{ _proj }}"
+      register: _selftest
+      changed_when: false
+
+    # A plan with no credential must stop before contacting anything. Exit 1,
+    # and — the part that matters — zero provider calls, which the python suite
+    # asserts directly (test_plan_without_a_token_never_contacts_anything).
+    - name: "ip-rotation | plan without HCLOUD_TOKEN exits 1"
+      ansible.builtin.command:
+        cmd: "python3 rotate.py plan --config rotation.example.yml"
+        chdir: "{{ _proj }}"
+      environment:
+        HCLOUD_TOKEN: ""
+      register: _notoken
+      changed_when: false
+      failed_when: _notoken.rc != 1
+
+    # ---- 2. the never-delete contract, by reading the source ----------------
+    - name: "ip-rotation | read hcloud_step.yml"
+      ansible.builtin.slurp:
+        src: "{{ _step_file }}"
+      register: _step_raw
+
+    # ⚠ `(?m)` INSTEAD OF split/map/join, AND THE REASON IS NOT WHAT IT LOOKS
+    # LIKE. The split/map/join idiom works in no_delete_contract_offline_test.yml
+    # and silently did nothing here. Measured 2026-08-26, same input, same
+    # folded `>-` scalar, both spellings on ONE line so line count cannot be the
+    # variable:
+    #
+    #   {{ src.split('\n') | length }}                     -> 1     (no split)
+    #   {%- set n = src.split('\n') | length -%}{{ n }}     -> 4     (split)
+    #   the same two in PURE Jinja2, no Ansible             -> 4, 4  (both)
+    #
+    # So it is not YAML folding, not the continuation line, and not Jinja: an
+    # Ansible template of the `{{ }}` form does not deliver `\n` inside a
+    # string literal as a newline, while a `{% %}` statement does. With the
+    # split returning one element, `#.*$` (no re.M) then strips only the
+    # FINAL line's comment — 3 hashes in, 2 out — which looks like a working
+    # filter having a quiet day.
+    #
+    # THE RULE, which is all that matters downstream: do not rely on a `\n`
+    # escape inside a Jinja string literal in Ansible. Use `(?m)`, or a real
+    # newline, or put the pipeline in a `{% set %}`.
+    #
+    # It failed GREEN: five rules matched the banner that EXPLAINS those rules,
+    # so the first run reported five violations that were all documentation. A
+    # comment-stripper that strips nothing is otherwise invisible — hence the
+    # assert immediately below, which is the real defence.
+    - name: "ip-rotation | strip comments before scanning"
+      ansible.builtin.set_fact:
+        _step_body: "{{ (_step_raw.content | b64decode) | regex_replace('(?m)#.*$', '') }}"
+
+    - name: "ip-rotation | the stripper actually stripped"
+      ansible.builtin.assert:
+        that:
+          - (_step_body | length) < ((_step_raw.content | b64decode) | length)
+          - not (_step_body is search('ONLY file in this repo'))
+        fail_msg: >-
+          Comment stripping produced no change, so every rule below is being
+          matched against the banner that EXPLAINS the rules. The scan would
+          report violations that are documentation.
+        success_msg: "comments stripped"
+
+    - name: "ip-rotation | find forbidden patterns"
+      ansible.builtin.set_fact:
+        _violations: >-
+          {%- set out = [] -%}
+          {%- for rule in forbidden -%}
+          {%-   if _step_body is search(rule.pattern, multiline=True) -%}
+          {%-     set _ = out.append(rule) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | report each violation"
+      ansible.builtin.debug:
+        msg: "hcloud_step.yml matched /{{ item.pattern }}/ — {{ item.why | trim }}"
+      loop: "{{ _violations }}"
+      loop_control:
+        label: "{{ item.pattern }}"
+
+    - name: "ip-rotation | assert none"
+      ansible.builtin.assert:
+        that:
+          - (_violations | length) == 0
+        fail_msg: >-
+          {{ _violations | length }} forbidden pattern(s) in hcloud_step.yml —
+          see the messages above.
+        success_msg: >-
+          hcloud_step.yml is clean against {{ forbidden | length }} rules.
+
+    # ---- 3. trap #2/#3: every `server` task is explicit about its address ---
+    # Parsed as YAML rather than grepped: "the task two lines below has an
+    # ipv4 key" is not something a regex can answer, and the whole point of
+    # this rule is that an OMISSION is the bug.
+    - name: "ip-rotation | parse hcloud_step.yml"
+      ansible.builtin.set_fact:
+        # NOT selectattr('hetzner.hcloud.server', 'defined') — Jinja reads a
+        # dotted attribute name as a NESTED path, so that spelling looks for
+        # item['hetzner']['hcloud']['server'], finds nothing, and the two
+        # asserts below would pass by inspecting an empty list. The length
+        # guard after them exists because that failure is invisible.
+        _server_tasks: >-
+          {%- set flat = [] -%}
+          {%- set srv = [] -%}
+          {%- for t in (lookup('file', _step_file) | from_yaml | first)['tasks'] -%}
+          {%-   if t.block is defined -%}
+          {%-     for b in t.block -%}{%- set _ = flat.append(b) -%}{%- endfor -%}
+          {%-   else -%}{%- set _ = flat.append(t) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {%- for t in flat -%}
+          {%-   if 'hetzner.hcloud.server' in t -%}
+          {%-     set _ = srv.append(t['hetzner.hcloud.server']) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ srv }}
+
+    - name: "ip-rotation | every server task is state-only or names its ipv4"
+      ansible.builtin.assert:
+        that:
+          - ('ipv4' in item) or ((item.keys() | list | difference(['id', 'state'])) | length == 0)
+        fail_msg: >-
+          A hetzner.hcloud.server task carries {{ item.keys() | list }}. On the
+          create path an omitted `ipv4:` with the default `enable_ipv4: true`
+          allocates a brand-new Primary IP nobody planned; and on the update
+          path an omitted `ipv4:` makes `enable_ipv4: false` a silent no-op,
+          because the collection only calls _update_server_ip() when `ipv4` is
+          not None (server.py:607). Either name the address or restrict the
+          task to `id` + `state`.
+        quiet: true
+      loop: "{{ _server_tasks }}"
+      loop_control:
+        label: "{{ item.keys() | list | join(', ') }}"
+
+    # The numeric id is immutable; a name can be changed by anyone with console
+    # access. Every mutation in this file must address the server by id.
+    - name: "ip-rotation | no server task targets by name"
+      ansible.builtin.assert:
+        that:
+          - "'id' in item"
+          - "'name' not in item"
+        fail_msg: >-
+          A hetzner.hcloud.server task targets by name. Use the immutable
+          numeric id — a renamed server must abort the run, not redirect it.
+        quiet: true
+      loop: "{{ _server_tasks }}"
+      loop_control:
+        label: "{{ item.keys() | list | join(', ') }}"
+
+    - name: "ip-rotation | there is at least one server task to check"
+      ansible.builtin.assert:
+        that:
+          - (_server_tasks | length) >= 4
+        fail_msg: >-
+          Only {{ _server_tasks | length }} hetzner.hcloud.server task(s) found.
+          The parser above probably stopped matching the file's shape, which
+          would make the two asserts before this one pass by inspecting
+          nothing. A test that cannot fail is worse than no test.
+        success_msg: "{{ _server_tasks | length }} server tasks inspected"
+
+    # ---- 4. things that must still be there --------------------------------
+    - name: "ip-rotation | required patterns"
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', _repo ~ '/' ~ item.file)) is search(item.pattern, multiline=True)
+        fail_msg: >-
+          {{ item.file }} no longer contains /{{ item.pattern }}/ — {{ item.why | trim }}
+        quiet: true
+      loop: "{{ required }}"
+      loop_control:
+        label: "{{ item.file }} :: {{ item.pattern }}"
+
+    - name: "ip-rotation | no rotation.yml or checkpoint was committed"
+      ansible.builtin.find:
+        paths: "{{ _proj }}"
+        patterns: ["rotation.yml"]
+        recurse: false
+      register: _real_config
+
+    - name: "ip-rotation | assert the real config stays out of git"
+      ansible.builtin.assert:
+        that:
+          - (_real_config.files | length) == 0
+            or (lookup('file', _repo ~ '/.gitignore') is search('rotation.yml'))
+        fail_msg: >-
+          rotation.yml exists and .gitignore does not cover
+          it. It pins a real server id and a real project fingerprint.
+        success_msg: "no operator config in the working tree"

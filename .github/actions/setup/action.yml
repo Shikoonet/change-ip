@@ -1,0 +1,28 @@
+# Every job needs the same three things. One place, so a version bump is one
+# edit and not five.
+name: setup
+description: python + ansible-core + hetzner.hcloud, and rotation.yml from the secret
+inputs:
+  rotation_config:
+    description: contents of rotation.yml (the ROTATION_CONFIG secret)
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with: {python-version: '3.11'}
+    - shell: bash
+      run: |
+        pip install --quiet --disable-pip-version-check ansible-core
+        ansible-galaxy collection install hetzner.hcloud
+    - shell: bash
+      # rotation.yml is not committed: it pins a real server id and a real
+      # project fingerprint. Via env, not inline in the script — an inlined
+      # ${{ }} would be pasted into the shell source and a stray quote in the
+      # YAML would become a syntax error, or worse, a command.
+      env:
+        ROTATION_CONFIG: ${{ inputs.rotation_config }}
+      run: |
+        printf '%s' "$ROTATION_CONFIG" > rotation.yml
+        test -s rotation.yml || { echo "ROTATION_CONFIG secret is empty."; exit 1; }
+        mkdir -p state

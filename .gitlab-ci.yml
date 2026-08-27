@@ -1,0 +1,233 @@
+# =============================================================================
+# server-ip-rotation — GitLab CI/CD
+#
+# WHAT REPLACED THE INTERACTIVE PROMPT.
+#
+# The tool was built around a human sitting at a terminal: it powers the node
+# down, swaps the address, then STOPS and waits for someone to type the new IP
+# into shikoonet's inventory/hosts.yml before it moves DNS. A pipeline has no
+# stdin, and the honest way to keep that gate is not to pipe `yes` at it — it
+# is to move the gate to where CI can actually see it:
+#
+#   * the human gate becomes `when: manual` — a button, per job, per pipeline
+#   * the inventory edit becomes a COMMIT in the shikoonet repo, and the `dns`
+#     job GREPS that checkout for the new address before it answers the prompt.
+#     If the commit is not there, the job fails and answers nothing.
+#
+# So `yes` is never a guess here. It is a fact the job re-derived from git.
+#
+# ⚠ THE PIPELINE HAS NEVER RUN AGAINST A REAL SERVER, and neither has the tool
+# it drives. `--check` cannot validate the stop → detach → attach → start
+# ordering, because the hcloud modules create no actions in check mode. The
+# first live pipeline needs its own approval.
+#
+# -----------------------------------------------------------------------------
+# CI/CD VARIABLES (Settings → CI/CD → Variables)
+#
+#   HCLOUD_TOKEN            masked, protected. The modules read it from the
+#                           environment themselves — it is in no argv.
+#   ROTATION_CONFIG         type: File. The contents of rotation.yml.
+#                           Not committed: it pins a real server id and a real
+#                           project fingerprint.
+#   SSH_PRIVATE_KEY         type: File, protected. Only the `dns` job needs it
+#                           (ip-change.yml SSHes the node on its new address).
+#   ANSIBLE_VAULT_PASSWORD  type: File, protected. shikoonet's vault, for the
+#                           Cloudflare token.
+#   SHIKOONET_REPO          https URL of the shikoonet checkout, with a
+#                           read-only deploy token.
+#
+# The token is masked, but MASKING IS NOT A BOUNDARY: anyone who can run a job
+# in this project can read it. Protect the variables and protect the branch.
+# =============================================================================
+
+stages: [check, plan, swap, dns, verify, undo]
+
+default:
+  image: python:3.11-slim
+  before_script:
+    - python3 -m pip install --quiet --disable-pip-version-check ansible-core
+    - ansible-galaxy collection install hetzner.hcloud
+
+variables:
+  # Never used as a default target. `apply` refuses without it and the value
+  # must equal server.id in the config, so "rotate whatever is configured" has
+  # no spelling. Set it per pipeline run.
+  SERVER_ID: ""
+  GIT_DEPTH: "1"
+
+# -- reusable bits ------------------------------------------------------------
+.rotation_env: &rotation_env
+  - cp "$ROTATION_CONFIG" rotation.yml
+  - mkdir -p state
+
+.checkpoint_artifact: &checkpoint_artifact
+  paths: [state/]
+  reports:
+    dotenv: rotation.env
+  expire_in: 30 days
+  when: always
+
+# =============================================================================
+# 1. check — every push. Offline, free, contacts nothing.
+# =============================================================================
+offline:
+  stage: check
+  before_script:
+    - python3 -m pip install --quiet --disable-pip-version-check ansible-core
+  script:
+    - python3 -m unittest discover -s tests -t .
+    - python3 rotate.py --self-test
+    - ansible-playbook tests/contract.yml
+  rules:
+    - if: $CI_PIPELINE_SOURCE
+
+lint:
+  stage: check
+  script:
+    - python3 -m pip install --quiet ansible-lint yamllint
+    - ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
+    - yamllint hcloud_step.yml tests/contract.yml rotation.example.yml || true
+    - ansible-lint hcloud_step.yml || true
+  allow_failure: true
+
+# =============================================================================
+# 2. plan — read-only against the real API. Safe, but it needs the token, so
+#    it is manual and scoped to a protected environment.
+# =============================================================================
+plan:
+  stage: plan
+  environment:
+    name: hetzner/plan
+    action: prepare
+  script:
+    - *rotation_env
+    - python3 rotate.py plan --config rotation.yml
+  artifacts: *checkpoint_artifact
+  when: manual
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+
+# =============================================================================
+# 3. swap — THE PROVIDER HALF. Powers the node off, detaches the burned
+#    address, allocates a new one in the same datacenter, attaches it, powers
+#    back on, and waits for TCP on the SSH port.
+#
+#    `--until connectivity_ok` stops it exactly where the interactive tool used
+#    to ask a human to edit the inventory. Exit 6 (paused) is SUCCESS here and
+#    is deliberately not exit 4 (escalated) — a stage boundary that shows red
+#    is how a real escalation stops being noticed.
+#
+#    ⚠ Between the detach and the start the node has NO public address.
+# =============================================================================
+swap:
+  stage: swap
+  environment:
+    name: hetzner/production
+    action: start
+  script:
+    - *rotation_env
+    - test -n "$SERVER_ID" || { echo "SERVER_ID is required and must equal server.id in the config."; exit 1; }
+    - |
+      set +e
+      python3 rotate.py apply --config rotation.yml \
+        --confirm-server-id "$SERVER_ID" --until connectivity_ok
+      rc=$?
+      set -e
+      # 6 = paused at --until, the expected end of this job.
+      # 5 = rolled_back: the tool already put the old address back. Red on
+      #     purpose — nothing changed, but somebody has to read why.
+      test "$rc" -eq 6 || exit "$rc"
+    - TXID=$(ls -t state/*.json | head -1 | xargs -n1 basename | sed 's/\.json$//')
+    - echo "TXID=$TXID" >> rotation.env
+    - python3 rotate.py status --config rotation.yml --txid "$TXID"
+  artifacts: *checkpoint_artifact
+  when: manual
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+
+# =============================================================================
+# 4. dns — the half that already worked. Runs `make ip-change HOST=<alias>` in
+#    a shikoonet checkout, which PATCHes the Cloudflare record in place and
+#    reads it back from the API as a gate.
+#
+#    THE GATE THAT REPLACED THE PROMPT is the grep below. rotate.py is about to
+#    ask "did you type the new address into the inventory?" — this job answers
+#    that from the shikoonet default branch, never from an assumption. No
+#    commit, no answer, no DNS change.
+# =============================================================================
+dns:
+  stage: dns
+  needs: [swap]
+  environment:
+    name: hetzner/production
+  script:
+    - *rotation_env
+    - apt-get update -qq && apt-get install -y -qq git openssh-client make >/dev/null
+    - git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
+    - NEW_IP=$(python3 -c "import json,sys;print(json.load(open('state/$TXID.json'))['new_ip']['ip'])")
+    - ALIAS=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['ansible']['host_alias'])")
+    - |
+      # The whole human gate, in four lines. An inventory that still names the
+      # old address means nobody has merged the edit yet: fail, and leave the
+      # node exactly where `swap` left it — up, reachable, on the new address,
+      # with DNS still on the old one. That state is stable and resumable.
+      grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml || {
+        echo "REFUSING: $NEW_IP is not in shikoonet inventory/hosts.yml."
+        echo "  Commit  $ALIAS: ansible_host: $NEW_IP  and re-run this job."
+        exit 1; }
+    - install -m 600 -D "$SSH_PRIVATE_KEY" ~/.ssh/id_ed25519
+    - install -m 600 -D "$ANSIBLE_VAULT_PASSWORD" ~/.vault_pass_pasarguard
+    - export ANSIBLE_HOST_KEY_CHECKING=False
+    - printf 'yes\n' | python3 rotate.py resume --config rotation.yml --txid "$TXID" --confirm-server-id "$SERVER_ID"
+  artifacts: *checkpoint_artifact
+  when: manual
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+
+# =============================================================================
+# 5. verify — the checkpoint says done, and says so on its own terms.
+# =============================================================================
+verify:
+  stage: verify
+  needs: [dns]
+  script:
+    - *rotation_env
+    - python3 rotate.py status --config rotation.yml --txid "$TXID"
+    - |
+      python3 - <<'EOF'
+      import json, os, sys
+      cp = json.load(open(f"state/{os.environ['TXID']}.json"))
+      if cp.get("outcome") != "done":
+          sys.exit(f"outcome is {cp.get('outcome')!r}, not 'done'")
+      print(f"{cp['server']['expected_name']} is on {cp['new_ip']['ip']}; "
+            f"{cp['old_ip']['ip']} is unassigned and RETAINED.")
+      EOF
+    - echo "Now run 'make monitoring-doctor' in the shikoonet repo. It is the"
+    - echo "only thing that notices a node that is up but silently unmonitored."
+  artifacts: *checkpoint_artifact
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+
+# =============================================================================
+# 6. rollback — puts the OLD address back. Never automatic: a node that is up
+#    on the new address is not an emergency, and swapping back does not fix a
+#    box that will not boot.
+#
+#    The new address is RETAINED after a rollback. Deleting it costs money to
+#    keep and is a separate decision with a separate approval.
+# =============================================================================
+rollback:
+  stage: undo
+  environment:
+    name: hetzner/production
+    action: stop
+  script:
+    - *rotation_env
+    - test -n "$TXID" || { echo "TXID is required. Read it from the swap job's dotenv report."; exit 1; }
+    - test -n "$SERVER_ID" || { echo "SERVER_ID is required."; exit 1; }
+    - python3 rotate.py rollback --config rotation.yml --txid "$TXID" --confirm-server-id "$SERVER_ID"
+  artifacts: *checkpoint_artifact
+  when: manual
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_REF_PROTECTED == "true"

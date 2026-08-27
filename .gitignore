@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Transaction checkpoints are runtime state, not source. They name a real
+# server id and a real address, and a stale one in git is a resume pointed at
+# the wrong transaction.
+state/*
+!state/.gitkeep
+
+# The operator's filled-in config. rotation.example.yml is the committed one.
+rotation.yml
+
+# CI artifacts.
+ci-out/

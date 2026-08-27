@@ -1,0 +1,84 @@
+---
+# =============================================================================
+# server-ip-rotation — example config. PLACEHOLDERS ONLY, no real values.
+#
+#   cp rotation.example.yml rotation.yml     # rotation.yml is gitignored
+#   $EDITOR rotation.yml                     # fill in the four server.* values
+#   export HCLOUD_TOKEN=...                  # see README.md
+#   python3 rotate.py plan --config rotation.yml
+#
+# There is no secret in this file and there must never be one. The API token is
+# read from the HCLOUD_TOKEN environment variable by the hcloud modules
+# themselves — it appears in no config, no argv and no checkpoint.
+# =============================================================================
+
+provider: hcloud
+
+# Printed by `plan` as "project <12 hex chars>": the first 12 chars of
+# sha256(HCLOUD_TOKEN). Pin it here after the first plan and every later run
+# asserts against it. That is what stops a rotation started against production
+# from being resumed with a staging token still exported in the shell — the
+# token itself is not recoverable from this value.
+# Leave empty to skip the check (only reasonable before the very first plan).
+project_fingerprint: ""
+
+server:
+  # The IMMUTABLE numeric id, read once from the Hetzner Cloud console
+  # (Servers -> the server -> the number in the URL). Not the name: a name can
+  # be changed by anyone with console access, an id cannot.
+  id: 0
+  # What a fresh read must say before ANY mutation. All four are compared
+  # before every mutating step, not just at the start.
+  expected_name: "Hetzner-DE"
+  expected_ipv4: "203.0.113.10"
+  expected_location: "nbg1"
+
+ansible:
+  # The inventory alias. It is what `make ip-change HOST=<alias>` receives and
+  # what ip-change.yml gates on twice.
+  host_alias: "Hetzner-DE"
+  inventory: "inventory/hosts.yml"
+  # Where `make` is run: the repo root, relative to THIS file.
+  repo_dir: ".."
+  # Must stay false. inventory/hosts.yml is the single source of truth and
+  # nothing writes to it automatically; `true` is refused, not ignored.
+  auto_edit_inventory: false
+
+dns:
+  # <alias>.<node_record_zone> is the one record `make ip-change` moves. The
+  # public verb name in cf_zone is not in its scope and is not touched.
+  node_record_zone: "tinooer.top"
+  # The allow-list. The record above must appear here or the run stops at
+  # `validated`, before anything is powered off. An empty list is a stop, not
+  # a pass — "allowed to change nothing" is the safe reading of silence.
+  allowed_records:
+    - "Hetzner-DE.tinooer.top"
+
+timeouts:
+  power_off: 180
+  power_on: 300
+  # One TCP handshake against the new address. Not an SSH auth attempt: this
+  # runs seconds after a boot and the question is "is the address live".
+  ssh: 10
+
+retries:
+  # Retries apply to TRANSIENT failures only; an auth error aborts on the first
+  # attempt. During the middle of a rotation the node is off, so every wasted
+  # retry is real downtime.
+  provider: 3
+  provider_delay: 10
+  # 30 x 10s = five minutes for the box to finish booting.
+  health: 30
+  health_delay: 10
+
+old_ip:
+  # `keep` is the only implemented value and the only one that will ever be
+  # accepted without a separate decision. The previous address is unassigned
+  # and RETAINED — it is still billed, and removing it is your call.
+  retention: keep
+
+health:
+  ssh_port: 22
+
+# Checkpoints, relative to this file. Gitignored except for .gitkeep.
+state_dir: "state"

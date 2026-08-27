@@ -1,0 +1,314 @@
+---
+# =============================================================================
+# hcloud_step.yml — the ONLY file in this repo that talks to Hetzner Cloud.
+#
+#   ansible-playbook hcloud_step.yml -e op=read_server \
+#       -e rotate_out=/tmp/x.json -e '{"server_id": 12345}'
+#
+# One invocation, one operation. rotate.py drives it as a subprocess and reads
+# back the JSON written to `rotate_out`; it never imports the collection and
+# never opens a socket itself. Reads go through here too, not just writes —
+# one code path to the provider means one place a credential can leak and one
+# place the offline tests have to fake.
+#
+# THE TOKEN IS NEVER PASSED IN. Every hetzner.hcloud module reads HCLOUD_TOKEN
+# from the environment on its own, so the value appears in no argv, no var
+# file, no -e blob and no line of the JSON below. Export it before running:
+#
+#   export HCLOUD_TOKEN="$(ansible-vault view vault.yml \
+#       | awk '/^hcloud_api_token:/ {print $2}' | tr -d "\"'")"
+#
+# `connection: local` + `gather_facts: false` are load-bearing, not tidiness:
+# for half of a rotation the target node is POWERED OFF, and a stray fact
+# gather against it would hang the play at the exact moment the box has no
+# address at all.
+#
+# -----------------------------------------------------------------------------
+# ⚠ FOUR THINGS ABOUT hetzner.hcloud 6.2.1 THAT ARE NOT IN ITS DOCUMENTATION
+# Verified 2026-08-26 by reading the installed source at
+# /usr/lib/python3/dist-packages/ansible_collections/hetzner/hcloud/, not from
+# memory. Each one is a GREEN run that did the wrong thing.
+#
+# 1. `primary_ip` CANNOT assign or unassign an existing address.
+#    primary_ip.py:242 `_update_primary_ip()` only ever touches auto_delete,
+#    labels and delete_protection. Pointing it at an existing IP with a
+#    `server:` is a silent green no-op — the `server:` parameter is only read
+#    on the CREATE path. Every assign/unassign here goes through the `server`
+#    module's `ipv4:` parameter instead. `primary_ip` is used for exactly two
+#    things below: allocate, and auto_delete=false.
+#
+# 2. `enable_ipv4: false` ALONE DOES NOT UNASSIGN ANYTHING.
+#    server.py:607 — `_update_server_ip()` is only called `if
+#    self.module.params.get("ipv4") is not None`. So the obvious spelling of
+#    "take the address away", `enable_ipv4: false` with no `ipv4:`, changes
+#    nothing and reports ok. The unassign task below therefore passes BOTH
+#    `ipv4:` (the address to detach) and `enable_ipv4: false` (do not put one
+#    back). This is the sharper form of the trap below.
+#
+# 3. Every `server` task here is either `state`-only or carries an explicit
+#    `ipv4:`. On the create path (server.py:421) an omitted `ipv4` with the
+#    default `enable_ipv4: true` allocates a brand-new Primary IP — an address
+#    nobody planned, billed monthly. We never create servers, but the rule is
+#    cheap, it is what makes #2 work, and the offline contract test asserts it.
+#
+# 4. `force: true` and `server_type:` MUST NOT meet in one task. `force` means
+#    "power the box off to apply this"; next to `server_type` that authorises
+#    an irreversible disk resize. `server_type:` appears nowhere in this file
+#    and the contract test keeps it that way.
+#
+# Two more shapes worth writing down, both read from the source:
+#   * `server_info` returns `ipv4_address` (a string) and NO Primary IP id.
+#     The id is correlated from `primary_ip_info` by `assignee_id` — that is
+#     what the read_server block below is doing, and it is why read_server
+#     makes two calls instead of one.
+#   * `primary_ip_info` calls the datacenter field `home_location` while
+#     `primary_ip` calls the same value `datacenter`. Both names are emitted
+#     below; providers.py accepts either.
+#
+# ⚠ NO `ignore_errors:` AND NO `failed_when: false` ANYWHERE IN THIS FILE.
+# This repo already paid for that lesson once: an AIDE task with
+# `failed_when: false` silently checked nothing for months (CLAUDE.md). Here
+# the price is higher — a green-but-failed assign means a powered-off box with
+# an address nobody knows. A failed module must abort the play, write no JSON,
+# and let rotate.py see a non-zero rc.
+#
+# ⚠ `state: absent` appears nowhere in this file, deliberately. Nothing this
+# tool can run deletes a server or an address. The rollback path RETAINS the
+# new IP rather than removing it; deletion is a separate operator decision.
+# tests/ip_rotation_offline_test.yml asserts all of that by reading this file.
+# =============================================================================
+- name: "hcloud step"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    ansible_managed: "Managed by Ansible (shikoonet) - do not edit by hand"
+    _ops:
+      - read_server
+      - read_ip
+      - find_ip
+      - protect_ip
+      - stop
+      - unassign
+      - allocate
+      - assign
+      - start
+
+  tasks:
+
+    - name: "hcloud | the operation and the output path are both required"
+      ansible.builtin.assert:
+        that:
+          - op is defined
+          - op in _ops
+          - rotate_out is defined
+          - (rotate_out | default('', true) | length) > 0
+        fail_msg: >-
+          Usage: ansible-playbook hcloud_step.yml -e op=<{{ _ops | join('|') }}>
+          -e rotate_out=<path> [-e '{"server_id": N, ...}'].
+          This playbook is driven by rotate.py and is not meant to be run by
+          hand except for a read.
+        quiet: true
+
+    # A missing token here would surface as a confusing API error from inside
+    # the module. Say it plainly instead, once, before anything is attempted.
+    - name: "hcloud | HCLOUD_TOKEN must be exported"
+      ansible.builtin.assert:
+        that:
+          - (lookup('ansible.builtin.env', 'HCLOUD_TOKEN') | default('', true) | length) > 0
+        fail_msg: >-
+          HCLOUD_TOKEN is not set in the environment. The hcloud modules read
+          it themselves; it is never passed as a variable. Export it from the
+          vault first — see server-ip-rotation/README.md.
+        quiet: true
+
+    # ---------------------------------------------------------------- reads --
+    # read_server is two calls on purpose: server_info knows the ADDRESS but
+    # not the Primary IP id, and every mutation below addresses the IP by id.
+    - name: "hcloud | read_server"
+      when: op == 'read_server'
+      block:
+
+        - name: "hcloud | read_server | the server"
+          hetzner.hcloud.server_info:
+            id: "{{ server_id | int }}"
+          register: _srv
+
+        - name: "hcloud | read_server | every Primary IP in the project"
+          hetzner.hcloud.primary_ip_info: {}
+          register: _ips
+
+        - name: "hcloud | read_server | correlate the ipv4 id by assignee_id"
+          ansible.builtin.set_fact:
+            _data: >-
+              {{ (_srv.hcloud_server_info | first)
+                 | combine({'ipv4_id': (
+                     _ips.hcloud_primary_ip_info
+                     | selectattr('type', 'eq', 'ipv4')
+                     | selectattr('assignee_id', 'defined')
+                     | selectattr('assignee_id', 'equalto', (_srv.hcloud_server_info | first).id)
+                     | map(attribute='id') | list | first | default(none)
+                   )}) }}
+
+    - name: "hcloud | read_ip"
+      when: op == 'read_ip'
+      block:
+
+        - name: "hcloud | read_ip | by id or by name"
+          hetzner.hcloud.primary_ip_info:
+            id: "{{ (ip_id | int) if (ip_id is defined) else omit }}"
+            name: "{{ ip_name if (ip_name is defined) else omit }}"
+          register: _ip
+
+        - name: "hcloud | read_ip | it must exist"
+          ansible.builtin.assert:
+            that:
+              - (_ip.hcloud_primary_ip_info | length) == 1
+            fail_msg: >-
+              No Primary IP matched
+              {{ ('id=' ~ ip_id) if (ip_id is defined) else ('name=' ~ ip_name) }}.
+            quiet: true
+
+        - name: "hcloud | read_ip | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _ip.hcloud_primary_ip_info | first }}"
+
+    # Zero or one. Names are unique per project, so a second match means our
+    # assumption about the API is wrong — providers.py refuses to choose.
+    - name: "hcloud | find_ip"
+      when: op == 'find_ip'
+      block:
+
+        - name: "hcloud | find_ip | by name"
+          hetzner.hcloud.primary_ip_info:
+            name: "{{ ip_name }}"
+          register: _found
+
+        - name: "hcloud | find_ip | shape it"
+          ansible.builtin.set_fact:
+            _data:
+              matches: "{{ _found.hcloud_primary_ip_info }}"
+
+    # ------------------------------------------------------------ mutations --
+    # Trap #1: this is `primary_ip` doing the ONLY update it is capable of.
+    # auto_delete=false on the old address, so nothing can reclaim the single
+    # way back while the rotation is in flight.
+    - name: "hcloud | protect_ip"
+      when: op == 'protect_ip'
+      block:
+
+        - name: "hcloud | protect_ip | auto_delete off on the old address"
+          hetzner.hcloud.primary_ip:
+            id: "{{ ip_id | int }}"
+            auto_delete: false
+            state: present
+          register: _prot
+
+        - name: "hcloud | protect_ip | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _prot.hcloud_primary_ip }}"
+
+    # Trap #3, `state`-only branch: no `ipv4:`, so _update_server_ip() is never
+    # reached and no address is touched by a power-off.
+    - name: "hcloud | stop"
+      when: op == 'stop'
+      block:
+
+        - name: "hcloud | stop | power off"
+          hetzner.hcloud.server:
+            id: "{{ server_id | int }}"
+            state: stopped
+          register: _stopped
+
+        - name: "hcloud | stop | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _stopped.hcloud_server | combine({'ipv4_id': none}) }}"
+
+    # Traps #2 and #3 together. BOTH parameters are required:
+    #   ipv4:        names the address to detach (without it, nothing happens)
+    #   enable_ipv4: false — do not hand the server a replacement
+    # server.py:711 then unassigns `current` and returns before assigning.
+    - name: "hcloud | unassign"
+      when: op == 'unassign'
+      block:
+
+        - name: "hcloud | unassign | detach the old Primary IPv4"
+          hetzner.hcloud.server:
+            id: "{{ server_id | int }}"
+            ipv4: "{{ ip_id | string }}"
+            enable_ipv4: false
+            state: stopped
+            force: true
+          register: _unassigned
+
+        - name: "hcloud | unassign | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _unassigned.hcloud_server | combine({'ipv4_id': none}) }}"
+
+    # The deterministic name is what makes this idempotent, and it is the
+    # allocate checkpoint: a crash between here and `assign` cannot mint a
+    # second paid address, because the next run finds this one by name.
+    - name: "hcloud | allocate"
+      when: op == 'allocate'
+      block:
+
+        - name: "hcloud | allocate | a new Primary IPv4 in the same datacenter"
+          hetzner.hcloud.primary_ip:
+            name: "{{ ip_name }}"
+            datacenter: "{{ datacenter }}"
+            type: ipv4
+            auto_delete: false
+            state: present
+          register: _alloc
+
+        - name: "hcloud | allocate | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _alloc.hcloud_primary_ip }}"
+
+    - name: "hcloud | assign"
+      when: op == 'assign'
+      block:
+
+        - name: "hcloud | assign | attach the new Primary IPv4"
+          hetzner.hcloud.server:
+            id: "{{ server_id | int }}"
+            ipv4: "{{ ip_name }}"
+            state: stopped
+            force: true
+          register: _assigned
+
+        - name: "hcloud | assign | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _assigned.hcloud_server }}"
+
+    # `ipv4:` here re-asserts rather than changes: server.py:717 returns early
+    # when the current address already is the wanted one. No `force:` — there
+    # is nothing to power off, and force next to a started box is a foot-gun.
+    - name: "hcloud | start"
+      when: op == 'start'
+      block:
+
+        - name: "hcloud | start | power on with the new address in place"
+          hetzner.hcloud.server:
+            id: "{{ server_id | int }}"
+            ipv4: "{{ ip_name }}"
+            state: started
+          register: _started
+
+        - name: "hcloud | start | shape it"
+          ansible.builtin.set_fact:
+            _data: "{{ _started.hcloud_server }}"
+
+    # ----------------------------------------------------------------- out --
+    # Only reached when every task above succeeded: a module failure aborts the
+    # play and leaves NO file behind, which is exactly how rotate.py tells
+    # "this step did not happen" from "this step happened".
+    - name: "hcloud | write the result"
+      ansible.builtin.copy:
+        content: "{{ {'op': op, 'ok': true, 'data': _data} | to_nice_json }}\n"
+        dest: "{{ rotate_out }}"
+        mode: "0600"
+      changed_when: false
