@@ -342,6 +342,7 @@ jobs:
         with:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
       - name: Find the last transaction
+        id: pick
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -349,10 +350,9 @@ jobs:
           # mistype one, and the answer is already in the artifacts: the newest
           # unexpired checkpoint IS the transaction to roll back.
           #
-          # urllib hits the API, and the action below does the actual download
-          # (which is a redirect to S3 that urllib alone cannot follow with the
-          # Authorization header). Found live: this is the same artifact fetch
-          # that worked in `dns`'s skipped branch, just here we actually use it.
+          # We need the run-id of the workflow_run that produced the artifact,
+          # because actions/download-artifact defaults to THIS run's artifacts.
+          # Without an explicit run-id, it sees nothing.
           python3 - <<'EOF'
           import json, os, sys, urllib.request
 
@@ -369,26 +369,22 @@ jobs:
           if not live:
               sys.exit("No checkpoint artifact left. They expire after 30 days; "
                        "past that a rollback is done by hand from the console.")
-          art = max(live, key=lambda a: a["created_at"])
-          with open("/tmp/last_artifact_id", "w") as f:
-              f.write(str(art["id"]))
-          print(f"will restore {art['name']} ({art['id']}).")
+          # Prefer rotation-state-final (the post-dns artifact) over the bare
+          # one, so the rollback has the post-swap truth on disk.
+          finals = [a for a in live if a["name"].endswith("-final")]
+          art = max(finals or live, key=lambda a: a["created_at"])
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ARTIFACT_NAME={art['name']}\n")
+              f.write(f"ARTIFACT_RUN_ID={art['workflow_run']['id']}\n")
+          print(f"will restore {art['name']} from run {art['workflow_run']['id']}.")
           EOF
       - name: Download the checkpoint
         uses: actions/download-artifact@v4
         with:
-          name: rotation-state
+          name: ${{ env.ARTIFACT_NAME }}
           path: state/
           github-token: ${{ github.token }}
-        # If the very latest rotation ran dns, the artifact is named
-        # rotation-state-final; try that if rotation-state was not found.
-      - name: Try the final artifact if the bare one was missing
-        if: hashFiles('state/*.json') == ''
-        uses: actions/download-artifact@v4
-        with:
-          name: rotation-state-final
-          path: state/
-          github-token: ${{ github.token }}
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
       - name: Refuse without a checkpoint
         run: |
           test -n "$(ls state/*.json 2>/dev/null)" || {
