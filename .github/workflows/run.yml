@@ -160,14 +160,6 @@ jobs:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
           expect_ipv4: "${{ inputs.server_ip }}"
       - run: python3 rotate.py plan --config rotation.yml
-      # The receipt. `swap` refuses to run without a fresh one naming these
-      # exact two values — see its first step for why that is the gate.
-      - run: |
-          mkdir -p receipt
-          printf '%s %s\n' "${{ inputs.server_id }}" "${{ inputs.server_ip }}" \
-            > receipt/plan
-      - uses: actions/upload-artifact@v4
-        with: {name: plan-receipt, path: receipt/, retention-days: 1}
 
   # 2. swap — THE PROVIDER HALF. Powers the node off, detaches the burned
   #    address, allocates a new one in the same datacenter, attaches it, powers

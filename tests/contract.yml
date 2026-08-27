@@ -134,16 +134,10 @@
         why: >-
           the mutating jobs read HCLOUD_TOKEN from an environment secret, not a
           repo secret: a repo secret is readable by any workflow on any branch.
-          Required reviewers on this environment would also be the pause, but
-          that is a PAID feature on a private repo — see the receipt rule below
-          for what actually stops an unplanned swap
-      - file: ".github/workflows/run.yml"
-        pattern: 'REFUSING: no plan receipt'
-        why: >-
-          the human gate, on a plan with no approval button. `plan` uploads a
-          receipt naming the server it read; `swap` refuses unless a fresh one
-          names the same server. Delete this and a rotation becomes one click
-          on a form nobody had to read first
+          Required reviewers on this environment would be the pause too, but
+          that is PAID for a private repo. Without reviewers the pause is two
+          dispatches — `operation: plan` then `operation: change-ip` — and it
+          is a habit, not a check.
       - file: ".github/workflows/run.yml"
         pattern: 'grep -q -- "\$NEW_IP" /tmp/shikoonet/inventory/hosts.yml'
         why: >-

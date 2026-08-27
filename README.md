@@ -51,11 +51,10 @@ rules" heading never renders, the run never enters *Waiting*, and the
 environment does nothing but scope the secret (which is still worth having —
 an environment secret is not readable by any workflow on any branch).
 
-So the pause is two dispatches: `plan` reads and prints, `change-ip` acts. And
-that is **not** left as a habit somebody might skip. `plan` uploads a receipt
-naming the server id and address it read; `swap`'s first step refuses unless a
-receipt exists, is under an hour old, and names the same two values typed on
-the form. Skipping the reading is a red run, not a powered-off node.
+So the pause is two dispatches: `plan` reads and prints, `change-ip` acts. It
+is a habit, not a check — and that is deliberate, because every check
+implemented inside the runner so far has hit a free-plan limitation. Read the
+plan, then dispatch the swap.
 
 Making the repository public, or moving to a paid plan, brings the real
 approval button back — the `environment:` lines are already there and would
