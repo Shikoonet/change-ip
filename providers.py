@@ -278,7 +278,11 @@ class HcloudProvider:
                 name=str(data["name"]),
                 status=str(data["status"]),
                 location=str(data["location"]),
-                datacenter=str(data["datacenter"]),
+                # server_info derives both names from one object, and a payload
+                # that carries only the location is still a usable answer: a
+                # Primary IP can be allocated against either name. Found live —
+                # a real server came back with `location` and no `datacenter`.
+                datacenter=str(data.get("datacenter") or data["location"]),
                 ipv4_id=int(data["ipv4_id"]) if data.get("ipv4_id") is not None else None,
                 ipv4=data.get("ipv4_address") or data.get("ipv4") or None,
             )

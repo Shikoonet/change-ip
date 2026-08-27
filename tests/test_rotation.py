@@ -793,6 +793,29 @@ class TestConfig(Base):
         os.environ.pop("GITHUB_STEP_SUMMARY", None)
         rotate.github_summary("done", {"txid": "t", "server": {}})  # must not raise
 
+    def test_a_server_payload_without_a_datacenter_still_reads(self):
+        """Found live: a real server came back with `location` and no `datacenter`."""
+        import providers
+
+        srv = providers.HcloudProvider._server(
+            {"id": 1, "name": "n", "status": "running", "location": "nbg1",
+             "ipv4_id": 2, "ipv4_address": "203.0.113.1"}
+        )
+        self.assertEqual(srv.location, "nbg1")
+        self.assertEqual(srv.datacenter, "nbg1")
+
+    def test_a_location_and_a_datacenter_in_it_are_the_same_place(self):
+        """Allocation answers `nbg1-dc3`; a location-only snapshot says `nbg1`.
+
+        Comparing those raw reports a move that never happened, and the step
+        that compares them raises NonRetryableError — a rotation stopped for a
+        difference in naming, with the node already detached.
+        """
+        self.assertTrue(rotate.same_place("nbg1", "nbg1-dc3"))
+        self.assertTrue(rotate.same_place("nbg1-dc3", "nbg1"))
+        self.assertFalse(rotate.same_place("nbg1", "hel1"))
+        self.assertFalse(rotate.same_place("nbg1-dc3", "fsn1-dc14"))
+
     def test_every_reachable_state_has_a_label(self):
         """A new step without a label would show as a bare identifier in the table."""
         for step in rotate.STEPS:

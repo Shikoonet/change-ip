@@ -222,6 +222,18 @@ class ConfigError(Exception):
 
 
 # -- helpers ---------------------------------------------------------------
+def same_place(a: str, b: str) -> bool:
+    """Is `a` the same place as `b`, given one may be a location and one a DC?
+
+    Hetzner names a datacenter `<location>-dcN`, and the two names reach this
+    tool from different calls: allocation answers with the datacenter, while a
+    server payload may carry only the location. Comparing them raw reports a
+    move that never happened. What is actually guaranteed — and all that is
+    guaranteed — is the location.
+    """
+    return a.split("-")[0] == b.split("-")[0]
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -740,7 +752,7 @@ class Rotation:
             allocated = self.with_retries(
                 "allocate", self.provider.allocate_ip, name, cp["snapshot"]["datacenter"]
             )
-        if allocated.datacenter != cp["snapshot"]["datacenter"]:
+        if not same_place(allocated.datacenter, cp["snapshot"]["datacenter"]):
             raise NonRetryableError(
                 f"{name} landed in {allocated.datacenter}, not {cp['snapshot']['datacenter']}"
             )
