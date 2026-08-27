@@ -794,6 +794,10 @@ class TestConfig(Base):
         text = open(path, encoding="utf-8").read()
         self.assertIn("| utc | state |", text)  # header, written once
         self.assertEqual(text.count("| utc | state |"), 1)
+        # `---` is line one of any YAML document, so a config pasted into a
+        # multi-line Actions secret makes GitHub mask every `---` it ever
+        # prints — including this table's separator. Live-observed.
+        self.assertNotIn("---", text)
         for state in ("server_off", "old_ip_unassigned", "new_ip_assigned",
                       "server_on", "connectivity_ok", "done"):
             self.assertIn(f"`{state}`", text)

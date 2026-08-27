@@ -202,10 +202,15 @@ def github_summary(state: str, cp: Dict[str, Any]) -> None:
     row = f"| {utcnow()[11:19]} | `{state}` | {STATE_LABELS.get(state, state)} | {ip} |\n"
     with open(path, "a", encoding="utf-8") as handle:
         if handle.tell() == 0:
+            # `|:-|` and not `|---|`. A multi-line Actions secret registers
+            # EVERY line as a mask token, and `---` is line one of any YAML
+            # document — so the config secret turns every `---` in this file
+            # into `***`, the separator stops being a separator, and the table
+            # renders as a wall of pipes. Seen on the first live run.
             handle.write(
-                f"### rotation `{cp['txid']}` — server {cp['server']['id']} "
-                f"({cp['server']['expected_name']}, {cp['server']['expected_location']})\n\n"
-                "| utc | state | what happened | address |\n|---|---|---|---|\n"
+                f"**rotation `{cp['txid']}` — server {cp['server']['id']} "
+                f"({cp['server']['expected_name']}, {cp['server']['expected_location']})**\n\n"
+                "| utc | state | what happened | address |\n|:-|:-|:-|:-|\n"
             )
         handle.write(redact(row))
 

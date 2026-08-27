@@ -53,6 +53,10 @@
 #                           fingerprint. It is the TRUTH — the two things the
 #                           form asks for are checked against it, never
 #                           written into it.
+#                           ⚠ Paste it WITHOUT the leading `---`. Actions masks
+#                           every line of a multi-line secret independently, so
+#                           a `---` in there replaces every `---` this run ever
+#                           prints with `***`.
 #   SSH_PRIVATE_KEY         only `dns` needs it (ip-change.yml SSHes the node
 #                           on its new address).
 #   ANSIBLE_VAULT_PASSWORD  shikoonet's vault, for the Cloudflare token.
