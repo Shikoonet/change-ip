@@ -37,11 +37,29 @@ GitHub Actions — **one workflow**, `.github/workflows/run.yml`:
 push / PR          offline suite + lint only. No secrets, no cost.
                    This is the merge-request gate and it runs nowhere else.
 Run workflow       three fields: operation, server_id, server_ip.
-  change-ip        1·plan → 2·swap → 3·dns → 4·verify
-                     ↑        ↑       ↑
-                     └────────┴───────┴── environment approval, one per job
+  plan             read everything, change nothing, leave a receipt
+  change-ip        2·swap → 3·dns → 4·verify   (refuses without that receipt)
   rollback         find last checkpoint → prove it is that box → roll back
 ```
+
+### ⚠ The approval button is a paid feature
+
+This pipeline was designed around `environment:` + **required reviewers** —
+GitHub's answer to GitLab's per-job manual button. On a **private repository
+with a free plan that section does not exist**: the "Deployment protection
+rules" heading never renders, the run never enters *Waiting*, and the
+environment does nothing but scope the secret (which is still worth having —
+an environment secret is not readable by any workflow on any branch).
+
+So the pause is two dispatches: `plan` reads and prints, `change-ip` acts. And
+that is **not** left as a habit somebody might skip. `plan` uploads a receipt
+naming the server id and address it read; `swap`'s first step refuses unless a
+receipt exists, is under an hour old, and names the same two values typed on
+the form. Skipping the reading is a red run, not a powered-off node.
+
+Making the repository public, or moving to a paid plan, brings the real
+approval button back — the `environment:` lines are already there and would
+start pausing immediately.
 
 The form asks **what to do, which server, and the address it is on right
 now** — nothing else. Every other value is in the config secret or is re-read

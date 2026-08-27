@@ -132,10 +132,18 @@
       - file: ".github/workflows/run.yml"
         pattern: 'environment: hetzner-production'
         why: >-
-          the pause. Required reviewers on that environment are what makes the
-          run wait for a human between swap and dns — GitHub has no per-job
-          manual button, this is it. The protection rule lives in repo
-          settings, so this only asserts the job asks for it
+          the mutating jobs read HCLOUD_TOKEN from an environment secret, not a
+          repo secret: a repo secret is readable by any workflow on any branch.
+          Required reviewers on this environment would also be the pause, but
+          that is a PAID feature on a private repo — see the receipt rule below
+          for what actually stops an unplanned swap
+      - file: ".github/workflows/run.yml"
+        pattern: 'REFUSING: no plan receipt'
+        why: >-
+          the human gate, on a plan with no approval button. `plan` uploads a
+          receipt naming the server it read; `swap` refuses unless a fresh one
+          names the same server. Delete this and a rotation becomes one click
+          on a form nobody had to read first
       - file: ".github/workflows/run.yml"
         pattern: 'grep -q -- "\$NEW_IP" /tmp/shikoonet/inventory/hosts.yml'
         why: >-

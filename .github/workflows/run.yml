@@ -25,18 +25,25 @@
 # and the honest way to keep that gate is not to pipe `yes` at it — it is to
 # move the gate somewhere the workflow can actually fail on:
 #
-#   * the human pause becomes an `environment:` with required reviewers. The
-#     run sits in "Waiting" until a person approves that job — one approval per
-#     mutating job, exactly like GitLab's per-job `when: manual` button.
+#   * the human pause was designed as an `environment:` with required
+#     reviewers — GitLab's per-job manual button, in GitHub's vocabulary.
+#     ⚠ THAT FEATURE IS PAID for private repositories. On a free plan the
+#     "Deployment protection rules" section does not even render, so the
+#     Waiting state never happens and the environment only scopes the secret.
+#     The pause is therefore TWO DISPATCHES: `operation: plan` reads and
+#     prints, `operation: change-ip` acts. And that is not left as a habit —
+#     plan uploads a receipt and swap refuses without a fresh one naming the
+#     same server. See swap's first step.
 #   * the inventory edit becomes a COMMIT in the shikoonet repo, and the `dns`
 #     job GREPS that checkout for the new address before it answers the prompt.
 #     No commit, no answer, no DNS change.
 #
 # So `yes` is never a guess here. It is a fact the job re-derived from git.
 #
-# The human window is the approval wait between `swap` and `dns`: the node is
-# already up on the new address, DNS still points at the old one. That state is
-# stable and resumable — take as long as the edit needs.
+# The human window is between `swap` and `dns`: the node is already up on the
+# new address, DNS still points at the old one. That state is stable and
+# resumable — take as long as the edit needs. `dns` fails until the inventory
+# commit lands, so the window closes on a fact, not on a timer.
 #
 # ⚠ THIS HAS NEVER RUN AGAINST A REAL SERVER, and neither has the tool it
 # drives. `--check` cannot validate the stop → detach → attach → start
@@ -141,7 +148,7 @@ jobs:
   #    honest first move.
   plan:
     name: 1 · plan (read-only)
-    if: inputs.operation == 'plan' || inputs.operation == 'change-ip'
+    if: inputs.operation == 'plan'
     runs-on: ubuntu-latest
     environment: hetzner-plan
     env:
@@ -153,6 +160,14 @@ jobs:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
           expect_ipv4: "${{ inputs.server_ip }}"
       - run: python3 rotate.py plan --config rotation.yml
+      # The receipt. `swap` refuses to run without a fresh one naming these
+      # exact two values — see its first step for why that is the gate.
+      - run: |
+          mkdir -p receipt
+          printf '%s %s\n' "${{ inputs.server_id }}" "${{ inputs.server_ip }}" \
+            > receipt/plan
+      - uses: actions/upload-artifact@v4
+        with: {name: plan-receipt, path: receipt/, retention-days: 1}
 
   # 2. swap — THE PROVIDER HALF. Powers the node off, detaches the burned
   #    address, allocates a new one in the same datacenter, attaches it, powers
@@ -165,7 +180,6 @@ jobs:
   swap:
     name: 2 · swap the address (node is offline in here)
     if: inputs.operation == 'change-ip'
-    needs: [plan]
     runs-on: ubuntu-latest
     environment: hetzner-production
     outputs:
@@ -174,7 +188,58 @@ jobs:
       alias: ${{ steps.run.outputs.alias }}
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
     steps:
+      # ==================== THE HUMAN GATE, ON A FREE PLAN ====================
+      # Required reviewers on an environment are a paid feature for private
+      # repositories, so the "Waiting → Review deployments" pause this pipeline
+      # was designed around does not exist here. It is NOT replaced by trusting
+      # the operator to have run `plan` first: this step re-derives that fact.
+      #
+      # `plan` uploads a receipt naming the server id and address it read. This
+      # refuses unless one exists, is under an hour old, and names the SAME two
+      # values typed on this form. So a rotation is two deliberate dispatches
+      # with a human reading the plan in between, and skipping the reading is a
+      # red run rather than a powered-off node.
+      # ========================================================================
+      - name: Refuse without a plan somebody read
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+          SERVER_IP: ${{ inputs.server_ip }}
+        run: |
+          python3 - <<'EOF'
+          import io, json, os, subprocess, sys, zipfile
+          from datetime import datetime, timedelta, timezone
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          typed = [os.environ["SERVER_ID"].strip(), os.environ["SERVER_IP"].strip()]
+
+          def gh(path, binary=False):
+              out = subprocess.run(["gh", "api", f"repos/{repo}/{path}"],
+                                   capture_output=True, check=True).stdout
+              return out if binary else json.loads(out)
+
+          live = [a for a in gh("actions/artifacts?name=plan-receipt&per_page=100")
+                  ["artifacts"] if not a["expired"]]
+          if not live:
+              sys.exit("REFUSING: no plan receipt. Run this workflow with "
+                       f"operation=plan, server_id={typed[0]}, server_ip={typed[1]}, "
+                       "read what it prints, then come back.")
+
+          art = max(live, key=lambda a: a["created_at"])
+          age = datetime.now(timezone.utc) - datetime.fromisoformat(art["created_at"])
+          if age > timedelta(hours=1):
+              sys.exit(f"REFUSING: the newest plan receipt is {age} old. A plan read "
+                       "an hour ago describes a server as it was. Re-run operation=plan.")
+
+          blob = gh(f"actions/artifacts/{art['id']}/zip", binary=True)
+          planned = zipfile.ZipFile(io.BytesIO(blob)).read("plan").decode().split()
+          if planned != typed:
+              sys.exit(f"REFUSING: the plan that was read covered {planned}, this form "
+                       f"says {typed}. Plan the server you are about to change.")
+
+          print(f"plan receipt {art['id']} covers {planned}, read {age} ago.")
+          EOF
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
