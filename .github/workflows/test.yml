@@ -27,6 +27,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: pip install --quiet ansible-core ansible-lint yamllint
+        # --syntax-check resolves module names, so the collection has to be here.
+      - run: ansible-galaxy collection install --force hetzner.hcloud
       - run: ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
       - run: python3 -m compileall -q rotate.py providers.py ansible_adapter.py
       - run: yamllint hcloud_step.yml tests/contract.yml rotation.example.yml || true
