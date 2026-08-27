@@ -334,19 +334,48 @@ jobs:
         with:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
       - name: Find the last transaction
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           # The operator is not asked for a txid. Typing one is a chance to
           # mistype one, and the answer is already in the artifacts: the newest
           # unexpired checkpoint IS the transaction to roll back.
-          ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-                 --jq '[.artifacts[] | select(.name|startswith("rotation-state"))
-                        | select(.expired|not)] | sort_by(.created_at) | last | .id')
-          test -n "$ID" || {
-            echo "No checkpoint artifact left. They expire after 30 days;"
-            echo "past that a rollback is done by hand from the console."
-            exit 1; }
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" > state.zip
-          unzip -qo state.zip -d state/
+          #
+          # urllib + GITHUB_TOKEN. `gh api` exits 1 silently on certain endpoint
+          # combinations inside the runner (the same trap that bit the dns gate),
+          # so we hit the REST API directly. The token is the same one Actions
+          # exposes to every job — no extra secret needed.
+          python3 - <<'EOF'
+          import io, json, os, sys, urllib.request, zipfile
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          h = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json"}
+
+          def get_json(path):
+              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}",
+                                           headers=h)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def get_bytes(path):
+              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}",
+                                           headers=h)
+              with urllib.request.urlopen(req) as r:
+                  return r.read()
+
+          arts = get_json("actions/artifacts?per_page=100")["artifacts"]
+          live = [a for a in arts
+                  if not a["expired"] and a["name"].startswith("rotation-state")]
+          if not live:
+              sys.exit("No checkpoint artifact left. They expire after 30 days; "
+                       "past that a rollback is done by hand from the console.")
+          art = max(live, key=lambda a: a["created_at"])
+          zipfile.ZipFile(io.BytesIO(get_bytes(f"actions/artifacts/{art['id']}/zip"))
+                          ).extractall("state/")
+          print(f"checkpoint {art['name']} ({art['id']}) restored.")
+          EOF
       - name: Prove it is the box you meant
         id: cp
         env:
