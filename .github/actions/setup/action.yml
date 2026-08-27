@@ -20,7 +20,12 @@ runs:
     - shell: bash
       run: |
         pip install --quiet --disable-pip-version-check ansible-core
-        ansible-galaxy collection install hetzner.hcloud
+        # PINNED. 7.0.0 removed the `datacenter` parameter and renamed every
+        # datacenter field to `location`; hcloud_step.yml is written against
+        # that vocabulary. An unpinned install resolved to 7.0.0 while the dev
+        # box had 6.2.1, and the offline suite modelled 6.2.1 — three live
+        # failures in a row, all of them this.
+        ansible-galaxy collection install 'hetzner.hcloud:>=7.0.0,<8.0.0'
         # The collection's own requirements.txt, which ansible-galaxy does NOT
         # install. Without these every hcloud task dies with "Failed to import
         # the required Python library" — found by the first live run, because

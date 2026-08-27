@@ -297,10 +297,12 @@ class HcloudProvider:
                 f"Primary IP {data.get('name')!r} has type {ip_type!r}; only ipv4 is in scope"
             )
 
-        # primary_ip_info says home_location, primary_ip says datacenter, and
-        # both mean datacenter.name. Accepting one name only would read None
+        # 7.x says location; 6.x said home_location from primary_ip_info and
+        # datacenter from primary_ip. Accepting one name only would read None
         # from half the module surface with no error anywhere.
-        datacenter = data.get("datacenter") or data.get("home_location")
+        datacenter = (
+            data.get("location") or data.get("datacenter") or data.get("home_location")
+        )
         if not datacenter:
             raise NonRetryableError(f"Primary IP {data.get('name')!r} has no datacenter")
 
@@ -376,9 +378,9 @@ class HcloudProvider:
     def unassign_ip(self, server_id: int, ip_id: int) -> Server:
         return self._server(self._call("unassign", server_id=int(server_id), ip_id=int(ip_id)))
 
-    def allocate_ip(self, name: str, datacenter: str) -> PrimaryIP:
+    def allocate_ip(self, name: str, location: str) -> PrimaryIP:
         return self._ip(
-            self._call("allocate", ip_name=str(name), datacenter=str(datacenter))
+            self._call("allocate", ip_name=str(name), location=str(location))
         )
 
     def assign_ip(self, server_id: int, ip_name: str) -> Server:

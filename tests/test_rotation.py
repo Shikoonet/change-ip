@@ -234,13 +234,23 @@ class TestIdentity(Base):
         self.assertEqual(ip.assignee_type, "unassigned")
         self.assertFalse(ip.assigned)
 
-    def test_home_location_and_datacenter_are_the_same_field(self):
-        fake = FakeHcloud()
-        provider = HcloudProvider(fake, fingerprint=FINGERPRINT)
-        # primary_ip_info shape (home_location)
-        self.assertEqual(provider.get_primary_ip(DEFAULT_OLD_IP_ID).datacenter, "nbg1-dc3")
-        # primary_ip shape (datacenter)
-        self.assertEqual(provider.protect_ip(DEFAULT_OLD_IP_ID).datacenter, "nbg1-dc3")
+    def test_all_three_spellings_of_the_same_field_read(self):
+        """7.x says `location`; 6.x said `home_location` or `datacenter`.
+
+        The pin makes 7.x the shape that runs, and the fake models 7.x. This
+        keeps the two older spellings readable anyway: an operator with 6.2.1
+        still installed locally gets a working tool, not a normalisation bug
+        surfacing as `has no datacenter` halfway through a swap.
+        """
+        provider = HcloudProvider(FakeHcloud(), fingerprint=FINGERPRINT)
+        self.assertEqual(provider.get_primary_ip(DEFAULT_OLD_IP_ID).datacenter, "nbg1")
+        for spelling in ("location", "home_location", "datacenter"):
+            shaped = HcloudProvider._ip(
+                {"id": 1, "name": "n", "ip": "203.0.113.9", "type": "ipv4",
+                 spelling: "nbg1", "assignee_id": None, "assignee_type": None,
+                 "auto_delete": False}
+            )
+            self.assertEqual(shaped.datacenter, "nbg1", spelling)
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +804,11 @@ class TestConfig(Base):
         rotate.github_summary("done", {"txid": "t", "server": {}})  # must not raise
 
     def test_a_server_payload_without_a_datacenter_still_reads(self):
-        """Found live: a real server came back with `location` and no `datacenter`."""
+        """7.0.0's server_info emits `location` and no `datacenter` at all.
+
+        Found live, against a real server, after three green offline runs: the
+        suite modelled 6.2.1 while CI installed 7.0.0.
+        """
         import providers
 
         srv = providers.HcloudProvider._server(

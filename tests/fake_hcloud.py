@@ -3,18 +3,20 @@
 
 The fake IS the runner: `FakeHcloud()` is callable as `(op, params) -> dict`,
 the same contract providers.HcloudProvider drives in production. That is the
-whole point of the seam — every line of normalisation, error mapping, the
-`home_location`/`datacenter` split and the assignee quirk runs in every test,
-because the only thing replaced is the subprocess.
+whole point of the seam — every line of normalisation, error mapping and the
+assignee quirk runs in every test, because the only thing replaced is the
+subprocess.
 
 It really applies mutations rather than recording intentions, so a test can ask
 the state machine to do something and then look at the resulting world. Three
-things it deliberately mimics from the real modules, read from the installed
-6.2.1 source:
+things it deliberately mimics from the real modules, read from the PINNED
+7.0.0 source:
 
-  * `primary_ip_info` emits `home_location`, `primary_ip` emits `datacenter`.
-    Both spellings appear below on purpose. A fake that normalised them would
-    hide the exact bug providers._ip() exists to prevent.
+  * every datacenter field is called `location`, and a server payload carries
+    no `datacenter` at all. 6.x said `home_location` / `datacenter`; modelling
+    6.x here while CI installed 7.0.0 is what let three live failures through
+    a green suite. The fake tracks the pin, and the pin is in
+    .github/actions/setup — change them together.
   * the `server` module's result carries NO Primary IP id — only
     `ipv4_address`. Only `read_server` correlates the id, because only
     hcloud_step.yml's read_server block makes the second call that finds it.
@@ -42,7 +44,6 @@ class FakeHcloud:
         server_id: int = DEFAULT_SERVER_ID,
         name: str = "Hetzner-DE",
         location: str = "nbg1",
-        datacenter: str = "nbg1-dc3",
         old_ip: str = "46.224.67.245",
         stop_delay: int = 0,
     ):
@@ -51,7 +52,6 @@ class FakeHcloud:
             "name": name,
             "status": "running",
             "location": location,
-            "datacenter": datacenter,
             "ipv4_address": old_ip,
         }
         self.ips: Dict[int, Dict[str, Any]] = {
@@ -60,7 +60,7 @@ class FakeHcloud:
                 "name": "hetzner-de-primary",
                 "ip": old_ip,
                 "type": "ipv4",
-                "home_location": datacenter,
+                "location": location,
                 "assignee_id": server_id,
                 "assignee_type": "server",
                 "auto_delete": True,  # the state the tool must turn OFF first
@@ -173,11 +173,7 @@ class FakeHcloud:
         if ip is None:
             return self._err("No Primary IP matched", "not_found")
         ip["auto_delete"] = False
-        # the `primary_ip` module spells this field `datacenter`, not
-        # `home_location` -- both shapes must survive providers._ip()
-        out = dict(ip)
-        out["datacenter"] = out.pop("home_location")
-        return self._ok(out)
+        return self._ok(dict(ip))
 
     def _op_stop(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._stop_seen += 1
@@ -198,9 +194,7 @@ class FakeHcloud:
         name = params["ip_name"]
         existing = next((ip for ip in self.ips.values() if ip["name"] == name), None)
         if existing is not None:
-            out = dict(existing)
-            out["datacenter"] = out.pop("home_location")
-            return self._ok(out)
+            return self._ok(dict(existing))
         new_id = self._next_ip_id
         self._next_ip_id += 1
         self._next_octet += 1
@@ -209,15 +203,13 @@ class FakeHcloud:
             "name": name,
             "ip": f"91.99.{self._next_octet}.7",
             "type": "ipv4",
-            "home_location": params["datacenter"],
+            "location": params["location"],
             "assignee_id": None,
             "assignee_type": None,
             "auto_delete": False,
         }
         self.ips[new_id] = record
-        out = dict(record)
-        out["datacenter"] = out.pop("home_location")
-        return self._ok(out)
+        return self._ok(dict(record))
 
     def _op_assign(self, params: Dict[str, Any]) -> Dict[str, Any]:
         wanted = next(

@@ -61,8 +61,9 @@
 #     The id is correlated from `primary_ip_info` by `assignee_id` — that is
 #     what the read_server block below is doing, and it is why read_server
 #     makes two calls instead of one.
-#   * `primary_ip_info` calls the datacenter field `home_location` while
-#     `primary_ip` calls the same value `datacenter`. Both names are emitted
+#   * 6.x: `primary_ip_info` says `home_location`, `primary_ip` says
+#     `datacenter`. 7.x: both say `location` and the other two names are gone.
+#     providers._ip() accepts all three. Both shapes were emitted
 #     below; providers.py accepts either.
 #
 # ⚠ NO `ignore_errors:` AND NO `failed_when: false` ANYWHERE IN THIS FILE.
@@ -255,10 +256,14 @@
       when: op == 'allocate'
       block:
 
-        - name: "hcloud | allocate | a new Primary IPv4 in the same datacenter"
+        # `location`, not `datacenter`. hetzner.hcloud 7.0.0 removed the
+        # datacenter parameter entirely — Primary IPs are location-scoped now.
+        # Against 6.x this same task needs `datacenter:`, which is why the
+        # collection version is PINNED and not left to resolve to latest.
+        - name: "hcloud | allocate | a new Primary IPv4 in the same location"
           hetzner.hcloud.primary_ip:
             name: "{{ ip_name }}"
-            datacenter: "{{ datacenter }}"
+            location: "{{ location }}"
             type: ipv4
             auto_delete: false
             state: present

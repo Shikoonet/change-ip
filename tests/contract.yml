@@ -183,6 +183,10 @@
         src: "{{ _step_file }}"
       register: _step_raw
 
+    - name: "ip-rotation | read the composite setup action"
+      ansible.builtin.set_fact:
+        _setup_src: "{{ lookup('file', _repo ~ '/.github/actions/setup/action.yml') }}"
+
     # ⚠ `(?m)` INSTEAD OF split/map/join, AND THE REASON IS NOT WHAT IT LOOKS
     # LIKE. The split/map/join idiom works in no_delete_contract_offline_test.yml
     # and silently did nothing here. Measured 2026-08-26, same input, same
@@ -294,6 +298,65 @@
       loop: "{{ _server_tasks }}"
       loop_control:
         label: "{{ item.keys() | list | join(', ') }}"
+
+    # ---- the collection's vocabulary, which is version-specific ------------
+    # hetzner.hcloud 7.0.0 REMOVED the `datacenter` parameter: Primary IPs are
+    # location-scoped and every field is called `location`. A task still
+    # spelling it `datacenter` fails at allocate time — i.e. with the node
+    # already powered off, in the middle of the swap. This ran green offline
+    # for a day because the dev box had 6.2.1 and CI installed latest.
+    # Parsed, not grepped: the word `datacenter` appears in the comments right
+    # above the task explaining why it must not appear IN the task.
+    - name: "ip-rotation | collect the primary_ip tasks"
+      ansible.builtin.set_fact:
+        _ip_tasks: >-
+          {%- set flat = [] -%}
+          {%- set ips = [] -%}
+          {%- for t in (lookup('file', _step_file) | from_yaml | first)['tasks'] -%}
+          {%-   if t.block is defined -%}
+          {%-     for b in t.block -%}{%- set _ = flat.append(b) -%}{%- endfor -%}
+          {%-   else -%}{%- set _ = flat.append(t) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {%- for t in flat -%}
+          {%-   if 'hetzner.hcloud.primary_ip' in t -%}
+          {%-     set _ = ips.append(t['hetzner.hcloud.primary_ip']) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ ips }}
+
+    - name: "ip-rotation | no primary_ip task uses the parameter 7.x removed"
+      ansible.builtin.assert:
+        that:
+          - "'datacenter' not in item"
+        fail_msg: >-
+          A hetzner.hcloud.primary_ip task names `datacenter`. The pinned
+          collection (>=7.0.0,<8.0.0) has no such parameter — Primary IPs are
+          location-scoped. Use `location:`, or change the pin in
+          .github/actions/setup/action.yml and this rule together.
+        quiet: true
+      loop: "{{ _ip_tasks }}"
+      loop_control:
+        label: "{{ item.keys() | list | join(', ') }}"
+
+    - name: "ip-rotation | the primary_ip tasks were actually found"
+      ansible.builtin.assert:
+        that:
+          - (_ip_tasks | length) >= 1
+        fail_msg: >-
+          No hetzner.hcloud.primary_ip task was parsed, so the rule above
+          inspected nothing. Same invisible-pass trap as the server tasks.
+        quiet: true
+
+    - name: "ip-rotation | the collection version is pinned, not latest"
+      ansible.builtin.assert:
+        that:
+          - "'hetzner.hcloud:>=7.0.0,<8.0.0' in _setup_src"
+        fail_msg: >-
+          .github/actions/setup installs the collection unpinned. The field
+          names this playbook is written against changed in a major bump, so
+          `latest` means a rotation can break between two identical commits.
+        quiet: true
 
     # The numeric id is immutable; a name can be changed by anyone with console
     # access. Every mutation in this file must address the server by id.
