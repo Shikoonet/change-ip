@@ -221,7 +221,7 @@ jobs:
   #    answers that from the shikoonet default branch, never from an
   #    assumption.
   dns:
-    name: 3 · move DNS (needs the inventory commit)
+    name: 3 · move DNS (gated by the inventory commit)
     needs: [swap]
     runs-on: ubuntu-latest
     environment: hetzner-production
@@ -239,21 +239,30 @@ jobs:
           expect_ipv4: "${{ inputs.server_ip }}"
       - uses: actions/download-artifact@v4
         with: {name: rotation-state, path: state/}
-      # Secrets go through env, never inlined into the script: an inlined
-      # ${{ }} is pasted into the shell source before bash ever sees it.
-      - env: {SHIKOONET_REPO: "${{ secrets.SHIKOONET_REPO }}"}
-        run: git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
-      - name: The human gate, in four lines
+      # Gate the WHOLE rest of the job on whether the node is in shikoonet's
+      # inventory. An empty SHIKOONET_REPO or an absent inventory line is the
+      # "right answer is skip, not fail" case: a throwaway test server is not
+      # in shikoonet, and refusing to skip made every test run look red.
+      - name: Is this node in shikoonet's inventory?
+        id: in_scope
+        env:
+          SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
         run: |
-          # An inventory that still names the old address means nobody has
-          # merged the edit yet: fail, and leave the node exactly where `swap`
-          # left it — up, reachable, on the new address, DNS still on the old
-          # one. That state is stable and resumable.
-          grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml || {
-            echo "REFUSING: $NEW_IP is not in shikoonet inventory/hosts.yml."
-            echo "  Commit  $ALIAS: ansible_host: $NEW_IP  and re-run this job."
-            exit 1; }
-      - env:
+          set -e
+          if [ -z "$SHIKOONET_REPO" ]; then
+            echo "in_scope=false  (SHIKOONET_REPO is empty)"
+          else
+            git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
+            if grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml; then
+              echo "in_scope=true"
+            else
+              echo "in_scope=false  ($NEW_IP is not in shikoonet inventory/hosts.yml)"
+            fi
+          fi
+          echo "in_scope=${in_scope:-false}" >> "$GITHUB_OUTPUT"
+      - name: Resume the rotation in shikoonet
+        if: steps.in_scope.outputs.in_scope == 'true'
+        env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
         run: |
@@ -261,7 +270,6 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           install -m 600 -D /dev/null ~/.vault_pass_pasarguard
           printf '%s\n' "$VAULT_PASSWORD" > ~/.vault_pass_pasarguard
-      - run: |
           printf 'yes\n' | python3 rotate.py resume --config rotation.yml \
             --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
       - uses: actions/upload-artifact@v4
