@@ -31,42 +31,31 @@ in `rotation.yml` at that checkout; in CI the `dns` job clones it.
 
 ## CI/CD — the interactive pause became an approval gate
 
-GitHub Actions, in `.github/workflows/`:
+GitHub Actions — **one workflow**, `.github/workflows/run.yml`:
 
 ```
-ci.yml           push / PR    offline suite + lint. No secrets, no cost
-ip-rotate.yml    dispatch(target, server_id, server_name, old_ipv4)
-                   plan  → swap → dns → verify
-                    ↑       ↑      ↑
-                    └───────┴──────┴── environment approval, one per job
-ip-rollback.yml  dispatch(target, txid, server_id, run_id)
+push / PR          offline suite + lint only. No secrets, no cost.
+Run workflow       a dropdown picks the operation:
+  change-ip        1·plan → 2·swap → 3·dns → 4·verify
+                     ↑        ↑       ↑
+                     └────────┴───────┴── environment approval, one per job
+  rollback         refuse-without-txid → fetch checkpoint → roll back
 ```
 
-### Naming, because this is the first flow and not the last
+On push the operation jobs show as *skipped*: they are gated on
+`inputs.operation`, which a push does not have, and `tests/contract.yml`
+asserts that gate as text. So a git push can never reach `swap` no matter what
+else regresses.
 
-The file name is `<subject>-<verb>.yml` and the sidebar name is `<subject> ·
-<what it does to the box>`. The subject prefix is doing the work: the Actions
-sidebar sorts alphabetically, so everything that touches an address stays
-together and a node lifecycle flow added later does not interleave with it.
+### Growing it: new capability = new dropdown choice, not a new file
 
-| file | sidebar | exists |
-|---|---|---|
-| `ci.yml` | `ci · offline checks` | yes |
-| `ip-rotate.yml` | `ip · change old IP to new IP` | yes |
-| `ip-rollback.yml` | `ip · roll back to the old IP` | yes |
-| `node-onboard.yml` | `node · onboard a new box` | not yet |
-| `node-update.yml` | `node · update` | not yet |
-| `node-monitoring.yml` | `node · add to monitoring` | not yet |
-
-Jobs inside a flow are numbered (`1 · plan`, `2 · swap …`) because GitHub draws
-them as a graph with no order of its own, and the order is the whole safety
-argument here — a `swap` that ran before `plan` is a different tool.
-
-Two things a new flow should reuse rather than reinvent:
-`.github/actions/setup` (python + collection + the config secret + the
-does-this-match check), and `rotate.py`'s job-summary table — any state machine
-that calls `github_summary` on transition gets the same readable run summary
-for free.
+Planned next: `node-onboard`, `node-update`, `node-monitoring`. Each is one
+more `operation` choice plus jobs gated `if: inputs.operation == '<it>'` in
+`run.yml`. Two things a new operation should reuse rather than reinvent:
+`.github/actions/setup` (python + collection + the per-target config secret +
+the does-this-match check), and `rotate.py`'s job-summary table — any state
+machine that calls `github_summary` on transition gets the same readable run
+summary for free.
 
 `swap` runs `--until connectivity_ok` and stops exactly where the interactive
 tool asks a human to edit the inventory. It expects **exit 6** — a deliberate
@@ -90,12 +79,13 @@ secret is only readable by a job that has passed that environment's reviewers;
 a repo secret is readable by any workflow on any branch. Masking is not a
 boundary.
 
-`rollback` is a separate workflow rather than a job, because GitHub — unlike
-GitLab — leaves no clickable button on a run that has finished. It takes the
-txid and the `ip · change` run id and pulls that run's checkpoint artifact back
-down. Artifacts expire in 30 days; after that a rollback is a hand job.
+`rollback` is a dispatch choice rather than a button on the old run, because
+GitHub — unlike GitLab — leaves no clickable button on a run that has
+finished. It takes the txid and the change-ip run id and pulls that run's
+checkpoint artifact back down. Artifacts expire in 30 days; after that a
+rollback is a hand job.
 
-See the header of `.github/workflows/ip-rotate.yml` for the secrets it needs.
+See the header of `.github/workflows/run.yml` for the secrets it needs.
 
 ---
 

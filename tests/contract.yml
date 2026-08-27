@@ -119,18 +119,24 @@
       # The human gate the interactive prompt used to be, on GitHub Actions.
       # Three independent halves, because any one of them alone still lets a
       # real rotation happen off a git push:
-      - file: ".github/workflows/ip-rotate.yml"
-        pattern: 'on:\n  workflow_dispatch:'
+      - file: ".github/workflows/run.yml"
+        pattern: 'workflow_dispatch:\n    inputs:'
         why: >-
-          the rotation is dispatched by a person, never by push or schedule
-      - file: ".github/workflows/ip-rotate.yml"
+          the rotation is dispatched by a person filling a form, never bare
+      - file: ".github/workflows/run.yml"
+        pattern: "if: inputs.operation == 'change-ip'"
+        why: >-
+          push and pull_request share this file with the operations, and this
+          gate is what keeps them apart: a push has no inputs, so the mutating
+          chain starts from a job a push can never satisfy
+      - file: ".github/workflows/run.yml"
         pattern: 'environment: hetzner-production'
         why: >-
           the pause. Required reviewers on that environment are what makes the
           run wait for a human between swap and dns — GitHub has no per-job
           manual button, this is it. The protection rule lives in repo
           settings, so this only asserts the job asks for it
-      - file: ".github/workflows/ip-rotate.yml"
+      - file: ".github/workflows/run.yml"
         pattern: 'grep -q -- "\$NEW_IP" /tmp/shikoonet/inventory/hosts.yml'
         why: >-
           `yes` is only ever answered to the inventory prompt after the new

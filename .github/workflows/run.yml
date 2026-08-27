@@ -1,5 +1,16 @@
 # =============================================================================
-# server-ip-rotation — rotate a node's Primary IPv4 at Hetzner.
+# server-ip-rotation — the ONE workflow.
+#
+# Push / PR runs only the offline jobs: unit tests, self-test, the contract,
+# lint. No secrets, no network, no cost. Every operation job is gated on
+# `inputs.operation`, which a push does not have — so a git push can never
+# reach `swap` no matter what else regresses. tests/contract.yml asserts that
+# gate as text.
+#
+# `Run workflow` adds a dropdown: pick the operation, pick the node, answer
+# the identity questions. New capability later (node-onboard, node-update,
+# node-monitoring) = one more `operation` choice + jobs gated on it, in THIS
+# file — not a new workflow.
 #
 # WHAT REPLACED THE INTERACTIVE PROMPT.
 #
@@ -48,11 +59,20 @@
 # only readable by a job that has passed that environment's reviewers. A repo
 # secret is readable by any workflow on any branch. Masking is not a boundary.
 # =============================================================================
-name: ip · change old IP to new IP
+name: server-ip-rotation
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
     inputs:
+      operation:
+        description: 'What to do to the box. change-ip swaps the Primary IPv4 and moves DNS; rollback puts the old address back on a paused/failed transaction.'
+        required: true
+        type: choice
+        options:
+          - change-ip
+          - rollback
       target:
         description: 'Which node. Each one is a separate ROTATION_CONFIG_<TARGET> secret on the environment; adding a datacenter is a secret plus one line here, no code.'
         required: true
@@ -63,25 +83,66 @@ on:
         description: 'Hetzner server id. Must equal server.id in the config — "true" is not a spelling of a specific server. `make ip-rotate-plan` prints it.'
         required: true
       server_name:
-        description: 'Name the node currently has. Checked against the config; a mismatch stops the run before the API is touched. Blank skips the check.'
+        description: 'change-ip: name the node currently has. Checked against the config; a mismatch stops the run before the API is touched. Blank skips the check.'
         required: false
       old_ipv4:
-        description: 'Address the node is on TODAY — the one being burned. Same check, same stop.'
+        description: 'change-ip: address the node is on TODAY — the one being burned. Same check, same stop.'
+        required: false
+      txid:
+        description: 'rollback only: transaction id. The swap job printed it; state/ holds one JSON file per transaction.'
+        required: false
+      run_id:
+        description: 'rollback only: the change-ip run whose checkpoint artifact to restore. Leave empty if state/ is already in this checkout (it is not, normally).'
         required: false
 
 concurrency:
-  # One rotation at a time. Two runs sharing state/ is a resume pointed at the
-  # wrong transaction.
+  # One rotation at a time — across operations too: a rollback racing the
+  # change-ip it is rolling back is two runs sharing state/.
   group: rotate
   cancel-in-progress: false
 
 jobs:
   # ===========================================================================
-  # 1. plan — read-only against the real API. Safe, but it needs the token, so
-  #    it still goes through the environment.
+  # Offline half — runs on every push AND before every operation. Free.
   # ===========================================================================
+  offline:
+    name: unit + self-test + contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install --quiet ansible-core
+      - run: python3 -m unittest discover -s tests -t .
+      - run: python3 rotate.py --self-test
+      - run: ansible-playbook tests/contract.yml
+
+  lint:
+    name: syntax, yamllint, ansible-lint
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install --quiet ansible-core ansible-lint yamllint
+        # --syntax-check resolves module names, so the collection has to be here.
+      - run: ansible-galaxy collection install --force hetzner.hcloud
+      - run: ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
+      - run: python3 -m compileall -q rotate.py providers.py ansible_adapter.py
+      - run: yamllint hcloud_step.yml tests/contract.yml rotation.example.yml || true
+      - run: ansible-lint hcloud_step.yml || true
+
+  # ===========================================================================
+  # operation: change-ip
+  # ===========================================================================
+  # 1. plan — read-only against the real API. Safe, but it needs the token, so
+  #    it still goes through the environment. Needs `offline` first: the tests
+  #    are free, the API is not.
   plan:
     name: 1 · plan (read-only)
+    if: inputs.operation == 'change-ip'
+    needs: [offline]
     runs-on: ubuntu-latest
     environment: hetzner-plan
     env:
@@ -95,7 +156,6 @@ jobs:
           expect_ipv4: "${{ inputs.old_ipv4 }}"
       - run: python3 rotate.py plan --config rotation.yml
 
-  # ===========================================================================
   # 2. swap — THE PROVIDER HALF. Powers the node off, detaches the burned
   #    address, allocates a new one in the same datacenter, attaches it, powers
   #    back on, and waits for TCP on the SSH port.
@@ -104,7 +164,6 @@ jobs:
   #    asks a human to edit the inventory.
   #
   #    ⚠ Between the detach and the start the node has NO public address.
-  # ===========================================================================
   swap:
     name: 2 · swap the address (node is offline in here)
     needs: [plan]
@@ -148,7 +207,6 @@ jobs:
         if: always()
         with: {name: rotation-state, path: state/, retention-days: 30}
 
-  # ===========================================================================
   # 3. dns — the half that already worked. Runs `make ip-change HOST=<alias>`
   #    in a shikoonet checkout, which PATCHes the Cloudflare record in place
   #    and reads it back from the API as a gate.
@@ -157,7 +215,6 @@ jobs:
   #    to ask "did you type the new address into the inventory?" — this job
   #    answers that from the shikoonet default branch, never from an
   #    assumption.
-  # ===========================================================================
   dns:
     name: 3 · move DNS (needs the inventory commit)
     needs: [swap]
@@ -207,9 +264,7 @@ jobs:
         if: always()
         with: {name: rotation-state-final, path: state/, retention-days: 30}
 
-  # ===========================================================================
   # 4. verify — the checkpoint says done, and says so on its own terms.
-  # ===========================================================================
   verify:
     name: 4 · verify the checkpoint says done
     needs: [swap, dns]
@@ -238,3 +293,62 @@ jobs:
       - run: |
           echo "Now run 'make monitoring-doctor' in the shikoonet repo. It is the"
           echo "only thing that notices a node that is up but silently unmonitored."
+
+  # ===========================================================================
+  # operation: rollback — puts the OLD address back.
+  #
+  # Never automatic. GitLab keeps a finished pipeline's manual jobs clickable;
+  # GitHub does not — a run that ended has no button left. So rollback takes
+  # the txid and the run it came from, and pulls that run's checkpoint back
+  # down.
+  #
+  # A node that is up on the new address is not an emergency, and swapping back
+  # does not fix a box that will not boot. Read the checkpoint first:
+  #   gh run download <run_id> -n rotation-state && python3 rotate.py status --txid <txid>
+  #
+  # The NEW address is RETAINED after a rollback. Deleting it is a separate
+  # decision with a separate approval.
+  # ===========================================================================
+  rollback:
+    name: roll back to the old IP
+    if: inputs.operation == 'rollback'
+    needs: [offline]
+    runs-on: ubuntu-latest
+    environment: hetzner-production
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The dropdown cannot make txid required for this choice only, so the
+      # first step is the form check — red before any secret is used.
+      - name: Refuse without a txid
+        run: |
+          test -n "${{ inputs.txid }}" || {
+            echo "operation=rollback needs a txid. The swap job printed it;"
+            echo "it is also the artifact's JSON file name."
+            exit 1; }
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
+      - name: Fetch the checkpoint from the change-ip run
+        if: inputs.run_id != ''
+        run: |
+          # -final first: if dns ran, that is the newer state. Either is a
+          # valid resume point; the wrong one is a rollback of a transaction
+          # that already moved on.
+          gh run download "${{ inputs.run_id }}" -n rotation-state-final -D state/ \
+            || gh run download "${{ inputs.run_id }}" -n rotation-state -D state/
+      - name: Refuse without a checkpoint
+        run: |
+          test -f "state/${{ inputs.txid }}.json" || {
+            echo "No checkpoint for ${{ inputs.txid }}. Pass run_id, or the"
+            echo "artifact has expired (30 days) and this must be done by hand."
+            exit 1; }
+          python3 rotate.py status --config rotation.yml --txid "${{ inputs.txid }}"
+      - run: |
+          python3 rotate.py rollback --config rotation.yml \
+            --txid "${{ inputs.txid }}" --confirm-server-id "${{ inputs.server_id }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-rolledback, path: state/, retention-days: 30}

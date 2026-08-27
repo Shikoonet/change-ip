@@ -44,7 +44,7 @@
 | `hcloud_step.yml` | **تنها فایلی که می‌تواند چیزی را در هتزنر عوض کند.** یک `op` در هر اجرا |
 | `tests/test_rotation.py` | رفتار — ماشین حالت، جدول rollback، resume از هر checkpoint |
 | `tests/contract.yml` | قرارداد — منبع را به‌عنوان **متن** و به‌عنوان **YAML** می‌خواند |
-| `.github/workflows/` | CD روی GitHub Actions؛ گیت انسانی، required reviewer روی environment است |
+| `.github/workflows/run.yml` | تنها workflow: روی push فقط تست آفلاین؛ عملیات‌ها با دراپ‌داون `operation` در dispatch. گیت انسانی، required reviewer روی environment است |
 
 هیچ کلاینت HTTP به هتزنر در پایتون این پروژه نیست — هر فراخوانی ارائه‌دهنده یک ساب‌پروسس
 `ansible-playbook hcloud_step.yml` است.
