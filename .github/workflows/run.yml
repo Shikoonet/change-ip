@@ -368,9 +368,26 @@ jobs:
                   return json.loads(r.read())
 
           def get_bytes(path):
+              # /actions/artifacts/{id}/zip returns 302 to S3; urllib follows the
+              # redirect but strips the Authorization header, and S3 then 401s.
+              # Pass a custom opener that keeps the header across redirects.
               req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}",
                                            headers=h)
-              with urllib.request.urlopen(req) as r:
+              opener = urllib.request.build_opener(
+                  urllib.request.HTTPRedirectHandler(),
+                  # default HTTPRedirectHandler keeps headers, but Python 3.x
+                  # drops Authorization on cross-origin redirect for safety;
+                  # rebuild the request with the same header.
+              )
+              # Re-add headers on redirect by hand:
+              class _KeepAuth(urllib.request.HTTPRedirectHandler):
+                  def http_error_302(self, req, fp, code, msg, headers):
+                      new = urllib.request.HTTPRedirectHandler.http_error_302(
+                          self, req, fp, code, msg, headers)
+                      new.headers.update(h)
+                      return new
+              op = urllib.request.build_opener(_KeepAuth())
+              with op.open(req) as r:
                   return r.read()
 
           arts = get_json("actions/artifacts?per_page=100")["artifacts"]
