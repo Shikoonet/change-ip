@@ -758,6 +758,33 @@ class TestConfig(Base):
         self.assertEqual(loaded["outcome"], "done")
         json.dumps(loaded)  # must stay serialisable
 
+    def test_job_summary_gets_one_row_per_state(self):
+        """The CI table is what a finished run leaves behind once the log scrolls."""
+        path = os.path.join(self.tmp.name, "summary.md")
+        open(path, "w").close()
+        os.environ["GITHUB_STEP_SUMMARY"] = path
+        try:
+            rot = self.build(on_transition=rotate.github_summary)
+            self.full_run(rot)
+        finally:
+            del os.environ["GITHUB_STEP_SUMMARY"]
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("| utc | state |", text)  # header, written once
+        self.assertEqual(text.count("| utc | state |"), 1)
+        for state in ("server_off", "old_ip_unassigned", "new_ip_assigned",
+                      "server_on", "connectivity_ok", "done"):
+            self.assertIn(f"`{state}`", text)
+            self.assertIn(rotate.STATE_LABELS[state], text)
+
+    def test_job_summary_is_a_no_op_off_ci(self):
+        os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        rotate.github_summary("done", {"txid": "t", "server": {}})  # must not raise
+
+    def test_every_reachable_state_has_a_label(self):
+        """A new step without a label would show as a bare identifier in the table."""
+        for step in rotate.STEPS:
+            self.assertIn(step.to, rotate.STATE_LABELS)
+
 
 if __name__ == "__main__":
     unittest.main()

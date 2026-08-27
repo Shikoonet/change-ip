@@ -18,6 +18,12 @@ name: rollback
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: 'Which node — must be the same target the rotate run used.'
+        required: true
+        type: choice
+        options:
+          - HETZNER_DE
       txid:
         description: 'Transaction id. The swap job printed it; state/ holds one JSON file per transaction.'
         required: true
@@ -42,7 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-        with: {rotation_config: "${{ secrets.ROTATION_CONFIG }}"}
+        with:
+          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
       - name: Fetch the checkpoint from the rotate run
         if: inputs.run_id != ''
         run: |

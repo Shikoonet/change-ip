@@ -32,9 +32,12 @@
 #
 #   HCLOUD_TOKEN            the modules read it from the environment
 #                           themselves — it is in no argv.
-#   ROTATION_CONFIG         the contents of rotation.yml. Not committed: it
-#                           pins a real server id and a real project
-#                           fingerprint.
+#   ROTATION_CONFIG_<T>     the contents of rotation.yml for target <T>, one
+#                           secret per node. Not committed: it pins a real
+#                           server id and a real project fingerprint. A second
+#                           datacenter is a second secret plus one line in the
+#                           `target` choice list — no code change, and no way
+#                           for one node's run to read another node's config.
 #   SSH_PRIVATE_KEY         only `dns` needs it (ip-change.yml SSHes the node
 #                           on its new address).
 #   ANSIBLE_VAULT_PASSWORD  shikoonet's vault, for the Cloudflare token.
@@ -50,9 +53,21 @@ name: rotate
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: 'Which node. Each one is a separate ROTATION_CONFIG_<TARGET> secret on the environment; adding a datacenter is a secret plus one line here, no code.'
+        required: true
+        type: choice
+        options:
+          - HETZNER_DE
       server_id:
         description: 'Hetzner server id. Must equal server.id in the config — "true" is not a spelling of a specific server. `make ip-rotate-plan` prints it.'
         required: true
+      server_name:
+        description: 'Name the node currently has. Checked against the config; a mismatch stops the run before the API is touched. Blank skips the check.'
+        required: false
+      old_ipv4:
+        description: 'Address the node is on TODAY — the one being burned. Same check, same stop.'
+        required: false
 
 concurrency:
   # One rotation at a time. Two runs sharing state/ is a resume pointed at the
@@ -73,7 +88,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-        with: {rotation_config: "${{ secrets.ROTATION_CONFIG }}"}
+        with:
+          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
+          expect_name: "${{ inputs.server_name }}"
+          expect_ipv4: "${{ inputs.old_ipv4 }}"
       - run: python3 rotate.py plan --config rotation.yml
 
   # ===========================================================================
@@ -99,7 +117,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-        with: {rotation_config: "${{ secrets.ROTATION_CONFIG }}"}
+        with:
+          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
+          expect_name: "${{ inputs.server_name }}"
+          expect_ipv4: "${{ inputs.old_ipv4 }}"
       - id: run
         run: |
           set +e
@@ -148,7 +169,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-        with: {rotation_config: "${{ secrets.ROTATION_CONFIG }}"}
+        with:
+          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
+          expect_name: "${{ inputs.server_name }}"
+          expect_ipv4: "${{ inputs.old_ipv4 }}"
       - uses: actions/download-artifact@v4
         with: {name: rotation-state, path: state/}
       # Secrets go through env, never inlined into the script: an inlined
@@ -191,7 +215,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-        with: {rotation_config: "${{ secrets.ROTATION_CONFIG }}"}
+        with:
+          rotation_config: "${{ secrets[format('ROTATION_CONFIG_{0}', inputs.target)] }}"
+          expect_name: "${{ inputs.server_name }}"
+          expect_ipv4: "${{ inputs.old_ipv4 }}"
       - uses: actions/download-artifact@v4
         with: {name: rotation-state-final, path: state/}
       - run: python3 rotate.py status --config rotation.yml --txid "$TXID"

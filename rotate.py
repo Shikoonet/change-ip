@@ -155,6 +155,46 @@ STEPS = (
 
 STEP_BY_STATE = {s.frm: s for s in STEPS}
 
+#: One plain sentence per state, for the CI job summary. The Actions log
+#: already streams `[state] step` live; this is the table you can read after
+#: the fact without scrolling a log — which is the only view a run keeps once
+#: it is finished.
+STATE_LABELS = {
+    "server_off": "server powered off",
+    "old_ip_unassigned": "old Primary IP detached (retained, never deleted)",
+    "new_ip_allocated": "new Primary IP allocated in the same datacenter",
+    "new_ip_assigned": "new Primary IP attached to the server",
+    "server_on": "server powered back on",
+    "connectivity_ok": "TCP answered on the new address",
+    "ansible_done": "inventory checked and the DNS record moved",
+    "done": "done — node on the new address, old one unassigned and retained",
+    "rolled_back": "rolled back — the old address is back on the server",
+    "escalated": "escalated — stopped for a human, nothing deleted",
+}
+
+
+def github_summary(state: str, cp: Dict[str, Any]) -> None:
+    """Append one row to GitHub's job summary. A no-op outside Actions.
+
+    Wired to Rotation.on_transition, so it fires on exactly the states the
+    checkpoint reached — including `escalated` and `rolled_back`, which reach
+    it through the same _transition() the happy path uses.
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    ip = (cp.get("new_ip") or {}).get("ip") or (cp.get("old_ip") or {}).get("ip") or ""
+    row = f"| {utcnow()[11:19]} | `{state}` | {STATE_LABELS.get(state, state)} | {ip} |\n"
+    with open(path, "a", encoding="utf-8") as handle:
+        if handle.tell() == 0:
+            handle.write(
+                f"### rotation `{cp['txid']}` — server {cp['server']['id']} "
+                f"({cp['server']['expected_name']}, {cp['server']['expected_location']})\n\n"
+                "| utc | state | what happened | address |\n|---|---|---|---|\n"
+            )
+        handle.write(redact(row))
+
+
 TERMINAL = ("done", "planned", "rolled_back", "escalated")
 
 #: States `--until` may name. Only the two the CD pipeline splits on: everything
@@ -1050,7 +1090,9 @@ def _dispatch(
         repo_dir=_resolve_repo_dir(cfg, config_path),
         config_path=config_path,
         until=getattr(args, "until", None),
-        **(rotation_kwargs or {}),
+        # Every transition also lands in GitHub's job summary. Outside Actions
+        # the hook writes nothing, so this costs a dict lookup on a terminal.
+        **{"on_transition": github_summary, **(rotation_kwargs or {})},
     )
 
     if args.command == "status":
