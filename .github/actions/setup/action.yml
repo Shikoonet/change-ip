@@ -21,6 +21,12 @@ runs:
       run: |
         pip install --quiet --disable-pip-version-check ansible-core
         ansible-galaxy collection install hetzner.hcloud
+        # The collection's own requirements.txt, which ansible-galaxy does NOT
+        # install. Without these every hcloud task dies with "Failed to import
+        # the required Python library" — found by the first live run, because
+        # an offline suite that never calls a module cannot see a module's
+        # missing dependency.
+        pip install --quiet --disable-pip-version-check requests python-dateutil
     - shell: bash
       # rotation.yml is not committed: it pins a real server id and a real
       # project fingerprint. Via env, not inline in the script — an inlined
