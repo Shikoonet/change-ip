@@ -1,0 +1,31 @@
+# ansible-lint config — server-ip-rotation.
+#
+# Rules we deliberately skip:
+#   * name[casing]: project convention is lowercase task names (e.g.
+#     "cloudflare | discover | validate page-1 metadata"). Renaming
+#     hundreds of tasks for a style rule is churn without value.
+#   * schema[meta]: the playbooks do not ship a meta/main.yml (this
+#     is a one-file playbook repo, not a collection).
+#   * fqcn[action-core]: we use ansible.builtin.* explicitly.
+---
+skip_list:
+  - name[casing]
+  - schema[meta]
+  - fqcn[action-core]
+  - role-name
+  - jinja[spacing]
+  - no-handler
+  - no-changed-when
+  # hetzner.hcloud modules read HCLOUD_TOKEN from env; ansible-lint does
+  # not see that and flags every task as missing api_token. The
+  # contract asserts env-based auth; the warning is a false positive.
+  - args[module]
+  # This repo uses long lines by project convention; the rationale is
+  # in .yamllint.yml. ansible-lint shares yamllint's defaults but the
+  # rule is checked at a tighter threshold.
+  - yaml[line-length]
+  # Every playbook in this repo starts with `---` for the YAML
+  # document-start marker. ansible-lint treats that as a fatal
+  # violation; yamllint agrees but only at warning level. Project
+  # convention wins here.
+  - yaml[document-start]

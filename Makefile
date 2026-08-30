@@ -13,12 +13,18 @@ RESET   := \033[0m
 ROTATE        := python3 rotate.py
 ROTATE_CONFIG ?= rotation.yml
 
+# `make lint` runs yamllint and ansible-lint from a project-local venv
+# at .lint-venv/bin/ (created by `make lint-bootstrap`). Override
+# LINT_BIN from the env to point at a different location.
+LINT_BIN ?= $(CURDIR)/.lint-venv/bin
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
 help:
 	@printf "$(YELLOW)server-ip-rotation$(RESET)\n"
 	@printf "  make test                          — offline suite + contract. No network, no cost\n"
+	@printf "  make test-cloudflare-playbook      — runs the real Cloudflare playbook against a local fake API server\n"
 	@printf "  make lint                          — ansible-lint + yamllint + syntax-check\n"
 	@printf "  make ip-rotate-plan                — read everything, change nothing\n"
 	@printf "  make ip-rotate-apply   SERVER_ID=n — do it. SERVER_ID must equal server.id in the config\n"
@@ -26,7 +32,8 @@ help:
 	@printf "  make ip-rotate-resume  TXID=t SERVER_ID=n — continue an interrupted or paused rotation\n"
 	@printf "  make ip-rotate-rollback TXID=t SERVER_ID=n — put the old address back\n"
 	@printf "  make ip-rotate-status  TXID=t      — print a checkpoint\n"
-	@printf "\n  HCLOUD_TOKEN must be exported. It is never passed as an argument.\n"
+	@printf "\n  HCLOUD_TOKEN must be exported for the rotation. It is never passed as an argument.\n"
+	@printf "  CONFIRM must equal HOST exactly. FP comes from the PROVIDER CONSOLE, not the network.\n"
 
 .PHONY: require-server-id
 require-server-id:
@@ -43,12 +50,41 @@ test:
 	python3 rotate.py --self-test
 	ansible-playbook tests/contract.yml
 
+.PHONY: test-cloudflare-playbook
+test-cloudflare-playbook:
+	python3 -m unittest tests.test_cloudflare_playbook -v
+
 .PHONY: lint
 lint:
-	ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
-	-yamllint hcloud_step.yml tests/contract.yml rotation.example.yml
-	-ansible-lint hcloud_step.yml
-	python3 -m compileall -q rotate.py providers.py ansible_adapter.py
+	# Cloudflare workstream lint — the scope of THIS repo's active task.
+	# The Node-onboarding roles / monitoring-doctor.yml are NOT in scope
+	# for this lint run; they live under a separate lint target so a
+	# Milestone-A regression does not block the Cloudflare merge gate.
+	ansible-playbook --syntax-check hcloud_step.yml cloudflare_replace_ip_step.yml tests/contract.yml
+	# cf_record_pages.yml is a task-list file, not a Play. The Play-level
+	# `--syntax-check` cannot consume it; yamllint + ansible-lint below
+	# cover the task shape. The contract tests prove the include flow
+	# actually runs end-to-end.
+	@if [ ! -x "$(LINT_BIN)/yamllint" ]; then \
+	  echo "yamllint missing at $(LINT_BIN)/yamllint — run 'make lint-bootstrap' first."; \
+	  exit 127; \
+	fi
+	@if [ ! -x "$(LINT_BIN)/ansible-lint" ]; then \
+	  echo "ansible-lint missing at $(LINT_BIN)/ansible-lint — run 'make lint-bootstrap' first."; \
+	  exit 127; \
+	fi
+	$(LINT_BIN)/yamllint hcloud_step.yml cloudflare_replace_ip_step.yml cf_record_pages.yml tests/contract.yml rotation.example.yml
+	$(LINT_BIN)/ansible-lint hcloud_step.yml cloudflare_replace_ip_step.yml
+	python3 -m compileall -q rotate.py providers.py ansible_adapter.py cloudflare_adapter.py
+
+.PHONY: lint-bootstrap
+lint-bootstrap:
+	# One-shot setup. Run this once on a fresh machine; subsequent `make
+	# lint` invocations use the project-local venv at .lint-venv/.
+	test -d .lint-venv || python3 -m venv .lint-venv
+	.lint-venv/bin/pip install --quiet --upgrade pip
+	.lint-venv/bin/pip install --quiet yamllint ansible-lint
+	@echo "lint venv ready: .lint-venv/ (yamllint + ansible-lint)"
 
 # -- the rotation -------------------------------------------------------------
 # ⚠ Between `stop` and `start` the node is unreachable and has no public

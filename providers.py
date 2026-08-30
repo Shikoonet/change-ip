@@ -126,6 +126,16 @@ def token_present() -> bool:
     return bool(os.environ.get(TOKEN_ENV, "").strip())
 
 
+CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
+
+
+def cf_token_present() -> bool:
+    """Has the Cloudflare token been exported? Parallel to token_present()
+    but for the env var the cloudflare playbook reads. Kept here so a test
+    can patch one place and rotate.py sees both."""
+    return bool(os.environ.get(CLOUDFLARE_TOKEN_ENV, "").strip())
+
+
 def project_fingerprint() -> str:
     """First 12 hex chars of sha256(HCLOUD_TOKEN).
 

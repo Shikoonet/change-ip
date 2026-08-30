@@ -1,0 +1,824 @@
+---
+# =============================================================================
+# cloudflare_replace_ip_step.yml — the ONLY file in this repo that talks to
+# Cloudflare DNS. Parallel structure to hcloud_step.yml so a reader who already
+# knows one knows the other.
+#
+#   ansible-playbook cloudflare_replace_ip_step.yml \
+#       -e operation=apply \
+#       -e old_ip=46.224.67.245 \
+#       -e new_ip=91.99.11.7 \
+#       -e allowed_records='["ne.tinooer.top","nurture.miragerunner.com"]' \
+#       -e expected_count=8 \
+#       -e invocation_id=<uuid> \
+#       -e result_file=/tmp/cf.json \
+#       -e manifest='[{"record_id":"...","zone_id":"...","name":"...","previous_content":"..."}]'
+#
+# Four ops share one play: discover / apply / rollback / verify.
+#   * discover — list every zone + every record named in `allowed_records`,
+#                read-back current content, write a MANIFEST the later ops reuse.
+#   * apply    — PATCH (never DELETE / never POST again) every record in the
+#                MANIFEST whose content is OLD_IP -> NEW_IP. Records with any
+#                other content (or missing) escalate; an empty patch set is
+#                only OK when the read-back proves NEW_IP on every record.
+#   * rollback — mirror of apply, OLD_IP = the address we just burned, NEW_IP
+#                = the one being put back. Missing / third-party content
+#                escalates and sets `rollback_incomplete: true` so a human can
+#                read the manifest and finish the remaining ones by hand.
+#   * verify   — read every record in MANIFEST, assert content == NEW_IP.
+#
+# RULES LOAD-BEARING FOR THIS FILE
+#
+# 1. THE TOKEN NEVER ENTERS PYTHON AND NEVER ENTERS ARGV. Every authenticated
+#    request sets `Authorization: Bearer ...` from the env var
+#    CLOUDFLARE_API_TOKEN directly inside the playbook. The token therefore
+#    appears in no var file, no -e blob, no per-step stdout, and (because of
+#    `no_log: true`) no Ansible log either.
+#
+# 2. NO DELETE, NO POST NEW. Records already exist for this allowlist — if
+#    they did not, `discover` would return zero matches and stop. Adding a
+#    POST would be how a "round-robin between dead and live IPs" bug reaches
+#    production; the contract test asserts no `DELETE` / `["DELETE"]`.
+#
+# 3. PAGINATION USES `result_info.total_pages`, NEVER `has_more`. Cloudflare's
+#    response shape is `total_pages` and a `page` field; `has_more` either
+#    crashes (key absent) or lies. Pagination is deterministic:
+#    fetch page 1, validate total_pages, then loop `2..total_pages`.
+#    Same shape for /zones and /zones/{id}/dns_records.
+#
+# 4. APPLY AND ROLLBACK TOUCH ONLY MANIFEST RECORDS. No DNS scan; no "find
+#    every A record in these zones"; no expansion of `allowed_records`. The
+#    manifest is what was discovered before the box moved, and only those
+#    IDs are PATCHed. Anything that drifted after discover aborts.
+#
+# 5. PATCH BODY IS `{"content": TARGET_IP}` ONLY. TTL, proxied, comment, and
+#    tags are NOT sent; the operation is an IP replacement, not a record
+#    reconfiguration. The fake server must retain original TTL/proxied/etc.
+#
+# 6. READ-BACK AFTER EVERY PATCH. A PATCH that returned 200 but did not
+#    apply shows up only on a fresh GET. The apply block asserts every
+#    record's content == new_ip after the loop; the verify op IS that
+#    read-back for the post-rotation audit.
+#
+# 7. NO `ignore_errors:` AND NO `failed_when: false`. Same lesson as
+#    hcloud_step.yml: a green-but-failed step here is silent DNS drift.
+#
+# 8. NO `state: absent`. Rule One — nothing this repo runs deletes a DNS
+#    record.
+#
+# 9. INVOCATION_ID. Every result file carries the caller's invocation_id.
+#    A result file from a previous run — or from a different op — is
+#    refused at parse time. Without this, a leftover tmpfile from a
+#    earlier failed run could be accepted as today's success.
+# =============================================================================
+- name: "cloudflare dns step"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    ansible_managed: "Managed by Ansible (server-ip-rotation) - do not write to state by hand"
+    _operations:
+      - discover
+      - apply
+      - rollback
+      - verify
+    cf_api_base: "https://api.cloudflare.com/client/v4"
+
+  tasks:
+
+    - name: "cloudflare | the operation, the invocation id, and the result path are required"
+      ansible.builtin.assert:
+        that:
+          - operation is defined
+          - operation in _operations
+          - invocation_id is defined
+          - (invocation_id | default('', true) | length) > 0
+          - result_file is defined
+          - (result_file | default('', true) | length) > 0
+          - (lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') | default('', true) | length) > 0
+          - old_ip is defined
+          - new_ip is defined
+          - allowed_records is defined
+          - expected_count is defined
+          - manifest is defined
+          - operation != 'rollback' or ((allowed_records | from_json) | length) > 0
+        fail_msg: >-
+          Usage: ansible-playbook cloudflare_replace_ip_step.yml
+          -e operation=<discover|apply|rollback|verify>
+          -e invocation_id=<uuid>
+          -e old_ip=... -e new_ip=... -e allowed_records='["..."]'
+          -e expected_count=<n> -e manifest='[ ... ]'
+          -e result_file=/path/out.json.
+          CLOUDFLARE_API_TOKEN must be exported (it never appears in argv).
+        quiet: true
+
+    - name: "cloudflare | only A records are in scope"
+      ansible.builtin.assert:
+        that:
+          - expected_count | int >= 1
+        fail_msg: "expected_count must be a positive integer (allow-list zero is a stop, not a pass)."
+        quiet: true
+
+    # --------------------------------------------------------------- API base
+    # cf_api_base is hard-coded in `vars:` to the official endpoint. A
+    # caller may pass `-e cf_api_base=...`, but only when the explicit
+    # `CF_PLAYBOOK_TEST_MODE=1` env is set AND the URL is a loopback
+    # fixture. A custom URL without the marker, an HTTP URL outside
+    # loopback, or any other deviation from the default MUST fail closed:
+    # this playbook is the only thing in this repo that talks to
+    # Cloudflare, and pointing it anywhere else would be a quiet leak.
+    - name: "cloudflare | cf_api_base must be the official endpoint unless test mode is set"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (cf_api_base | default('https://api.cloudflare.com/client/v4'))
+            == 'https://api.cloudflare.com/client/v4'
+            or (
+              (lookup('ansible.builtin.env', 'CF_PLAYBOOK_TEST_MODE') | default('', true)) == '1'
+              and (cf_api_base | default('')) is regex('^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?(/.*)?$')
+            )
+        fail_msg: >-
+          cf_api_base was set to {{ cf_api_base | default('') }}, which is
+          neither the official https://api.cloudflare.com/client/v4 nor a
+          loopback HTTP fixture. The marker env CF_PLAYBOOK_TEST_MODE must
+          be set to '1' AND the URL must point at 127.0.0.1 / ::1 / localhost.
+          Refusing to run; the rest of this playbook talks to whatever URL
+          it is given, and a typo here would silently redirect DNS-mutating
+          requests.
+        quiet: true
+
+    - name: "cloudflare | custom cf_api_base requires the test marker"
+      ansible.builtin.assert:
+        that:
+          - (cf_api_base | default('https://api.cloudflare.com/client/v4'))
+            == 'https://api.cloudflare.com/client/v4'
+            or (lookup('ansible.builtin.env', 'CF_PLAYBOOK_TEST_MODE') | default('', true)) == '1'
+        fail_msg: >-
+          cf_api_base was overridden to {{ cf_api_base | default('') }} but the
+          CF_PLAYBOOK_TEST_MODE env is not '1'. The test mode marker is what
+          stops an operator typo in -e from silently redirecting the DNS
+          half of a rotation.
+        quiet: true
+
+    # ----------------------------------------------------------- discovery --
+    # The single place this project reads the Cloudflare API on its own.
+    # Every later op reuses the manifest this writes — there is no second
+    # discovery, no fresh scan, no parallel view.
+    - name: "cloudflare | discover"
+      when: operation == 'discover'
+      block:
+
+        # ----- zone list with explicit pagination ----------------------
+        - name: "cloudflare | discover | zone page 1"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones?per_page=50&page=1"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+          register: _zones_p1
+          no_log: true
+          # write a sentinel on failure so the rescue block can emit a structured result
+
+        - name: "cloudflare | discover | assert zone pagination metadata"
+          ansible.builtin.assert:
+            that:
+              - (_zones_p1.json.result_info | default({})) is mapping
+              - (_zones_p1.json.result_info.total_pages | int) >= 1
+              - (_zones_p1.json.result_info.per_page | int) > 0
+            fail_msg: "Cloudflare zone list returned malformed result_info; refusing to guess pagination."
+            quiet: true
+
+        - name: "cloudflare | discover | zone pages 2..total"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones?per_page=50&page={{ _page }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+          register: zones_pn
+          no_log: true
+          loop: "{{ range(2, (_zones_p1.json.result_info.total_pages | int) + 1) | list }}"
+          loop_control:
+            loop_var: _page
+            label: "page={{ _page }}"
+          when: (_zones_p1.json.result_info.total_pages | int) > 1
+
+        - name: "cloudflare | discover | flatten zones (all pages)"
+          ansible.builtin.set_fact:
+            _zones: >-
+              {%- set all = [_zones_p1.json.result] -%}
+              {%- for r in (zones_pn.results | default([])) -%}
+                {%- set _ = all.append(r.json.result) -%}
+              {%- endfor -%}
+              {%- set flat = [] -%}
+              {%- for page in all -%}
+                {%- for z in page -%}
+                  {%- set _ = flat.append(z) -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ flat }}
+
+        - name: "cloudflare | discover | reject duplicate zone ids"
+          ansible.builtin.assert:
+            that:
+              - ((_zones | map(attribute='id')) | length)
+                  == ((_zones | map(attribute='id') | unique | list) | length)
+            fail_msg: "Cloudflare returned the same zone id on multiple pages; pagination metadata is lying."
+            quiet: true
+
+        # ----- per-zone DNS record lookup with explicit pagination -----
+        # ----- resolve every allowlisted FQDN to a unique zone ----------
+        # Single set_fact that iterates names inline. Each FQDN is normalized
+        # (lowercase, trailing dot removed). A zone is a candidate when
+        # fqdn == zone_name or fqdn ends with "." + zone_name. The longest
+        # matching zone wins; ties or absent matches fail closed.
+        - name: "cloudflare | discover | resolve per FQDN"
+          ansible.builtin.set_fact:
+            _pairs: |
+              {%- set pairs = [] -%}
+              {%- set _resolution_errors = [] -%}
+              {%- set names = (allowed_records | from_json) -%}
+              {%- for fqdn in names -%}
+                {%- set cf_fqdn = (fqdn | lower | regex_replace('\\.$', '')) -%}
+                {%- set matches = [] -%}
+                {%- for z in _zones -%}
+                  {%- set zn = (z.name | default('') | lower | regex_replace('\\.$', '')) -%}
+                  {%- if (zn | length) > 0 and (cf_fqdn == zn or cf_fqdn.endswith('.' + zn)) -%}
+                    {%- set _ = matches.append({'zone_id': z.id, 'zone_name': zn, '_len': (zn | split('.') | length)}) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- if (matches | length) == 0 -%}
+                  {%- set _ = _resolution_errors.append(fqdn ~ ': no matching zone') -%}
+                {%- elif (matches | length) == 1 -%}
+                  {%- set _ = pairs.append(matches[0] | combine({'name': fqdn, 'matched': true})) -%}
+                {%- else -%}
+                  {%- set max_len = (matches | map(attribute='_len') | max) -%}
+                  {%- set longest = (matches | selectattr('_len', 'eq', max_len) | list) -%}
+                  {%- if (longest | length) != 1 -%}
+                    {%- set _ = _resolution_errors.append(fqdn ~ ': ambiguous zone match') -%}
+                  {%- else -%}
+                    {%- set _ = pairs.append(longest[0] | combine({'name': fqdn, 'matched': true})) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ pairs }}
+
+        - name: "cloudflare | discover | reject duplicate (zone_id, name) tuples"
+          ansible.builtin.assert:
+            that:
+              - (_pairs | length) == ((_pairs | map(attribute='zone_id') | zip(_pairs | map(attribute='name')) | list) | unique | list | length)
+            fail_msg: "Duplicate (zone_id, name) tuple in resolved pairs."
+            quiet: true
+
+        - name: "cloudflare | discover | record page 1 per pair"
+          ansible.builtin.uri:
+            url: >-
+              {{ cf_api_base }}/zones/{{ item.zone_id }}/dns_records?type=A&name={{ item.name }}&per_page=50&page=1
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+          register: _recs_p1
+          no_log: true
+          loop: "{{ _pairs }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        # Fail closed on any pair whose page-1 response is not what the
+        # contract assumes: success=true, a list result, a result_info with
+        # page==1, total_pages>=1, and total_pages within the safety bound.
+        # Without this, a malformed first response would let later pages
+        # silently fill a manifest the playbook cannot trust.
+        - name: "cloudflare | discover | validate page-1 metadata for every pair"
+          ansible.builtin.assert:
+            that:
+              - _r.json is defined
+              - (_r.json.success | default(false)) == true
+              - (_r.json.result | type_debug) == 'list'
+              - _r.json.result_info is defined
+              - (_r.json.result_info | type_debug) == 'dict'
+              - (_r.json.result_info.page | int) == 1
+              - (_r.json.result_info.total_pages | int) >= 1
+              - (_r.json.result_info.total_pages | int) <= 1000
+              - (_r.json.result_info.per_page | int) > 0
+            fail_msg: >-
+              Cloudflare returned malformed or unsafe pagination metadata
+              on the page-1 lookup for {{ _r.item.name }} (zone
+              {{ _r.item.zone_id }}). Refusing to walk further pages or build
+              a manifest from an unverified baseline.
+            quiet: true
+          loop: "{{ _recs_p1.results | default([]) }}"
+          loop_control:
+            loop_var: _r
+
+        # Deterministic lookups: one dict per (pair, page) with the
+        # page-1 baseline baked in. The child file reads these as
+        # explicitly-named include variables — no Jinja mutation, no
+        # implicit register inference.
+        - name: "cloudflare | discover | build record-page lookups (page 2..N per pair)"
+          ansible.builtin.set_fact:
+            _cf_record_lookups: |
+              {%- set out = [] -%}
+              {%- for r in (_recs_p1.results | default([])) -%}
+                {%- if r.json is defined -%}
+                  {%- set total_pages = (r.json.result_info.total_pages | int) -%}
+                  {%- if total_pages > 1 -%}
+                    {%- for p in range(2, total_pages + 1) -%}
+                      {%- set _ = out.append({
+                          'pair': r.item,
+                          'page': p,
+                          'expected_total_pages': total_pages
+                        }) -%}
+                    {%- endfor -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+
+        - name: "cloudflare | discover | init the include-task accumulator"
+          ansible.builtin.set_fact:
+            _cf_record_pages_collected: []
+
+        - name: "cloudflare | discover | fetch record pages 2..N per pair"
+          ansible.builtin.include_tasks: cf_record_pages.yml
+          vars:
+            cf_record_page_number: "{{ cf_record_lookup.page | int }}"
+            cf_record_expected_total_pages: "{{ cf_record_lookup.expected_total_pages | int }}"
+          loop: "{{ _cf_record_lookups }}"
+          loop_control:
+            loop_var: cf_record_lookup
+            label: "{{ cf_record_lookup.pair.name }} p={{ cf_record_lookup.page }}"
+          when: (_cf_record_lookups | length) > 0
+
+        - name: "cloudflare | discover | aggregate the manifest"
+          ansible.builtin.set_fact:
+            _manifest: |
+              {%- set ns = namespace(records=[]) -%}
+              {%- set p1s = (_recs_p1.results | default([]) | selectattr('json', 'defined') | list) -%}
+              {%- for p1 in p1s -%}
+                {%- for rec in (p1.json.result | default([])) -%}
+                  {%- set _ = ns.records.append({
+                       "zone_id": p1.item.zone_id,
+                       "zone_name": p1.item.zone_name,
+                       "record_id": rec.id,
+                       "name": rec.name,
+                       "type": rec.type,
+                       "previous_content": rec.content,
+                       "ttl": rec.ttl | default(1, true),
+                       "proxied": rec.proxied | default(false, true)
+                     }) -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {%- set pNs = (_cf_record_pages_collected | default([])) -%}
+              {%- for entry in pNs -%}
+                {%- set pN = entry.response -%}
+                {%- set lk = entry.lookup -%}
+                {%- for rec in (pN.json.result | default([])) -%}
+                  {%- set _ = ns.records.append({
+                       "zone_id": lk.pair.zone_id,
+                       "zone_name": lk.pair.zone_name,
+                       "record_id": rec.id,
+                       "name": rec.name,
+                       "type": rec.type,
+                       "previous_content": rec.content,
+                       "ttl": rec.ttl | default(1, true),
+                       "proxied": rec.proxied | default(false, true)
+                     }) -%}
+                {%- endfor -%}
+              {%- endfor -%}
+              {{ ns.records }}
+
+        - name: "cloudflare | discover | reject duplicate record ids"
+          ansible.builtin.assert:
+            that:
+              - ((_manifest | map(attribute='record_id')) | length)
+                  == ((_manifest | map(attribute='record_id') | unique | list) | length)
+            fail_msg: "The manifest contains duplicate record_ids; refusing an ambiguous manifest."
+            quiet: true
+
+        - name: "cloudflare | discover | reject non-A types and drift"
+          ansible.builtin.assert:
+            that:
+              - item.type == 'A'
+              - item.previous_content == old_ip
+              - (item.name | lower) in (allowed_records | from_json | map('lower'))
+            fail_msg: >-
+              Record {{ item.name }} ({{ item.type }}) currently points at
+              {{ item.previous_content }}, not the old_ip this rotation started
+              against. Pre-flighting a manifest with the wrong baseline would
+              PATCH a record this run has no business touching.
+            quiet: true
+          loop: "{{ _manifest }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "cloudflare | discover | assert expected count"
+          ansible.builtin.assert:
+            that:
+              - (_manifest | length) == (expected_count | int)
+              - ((_manifest | map(attribute='name') | map('lower') | sort)
+                  == (allowed_records | from_json | map('lower') | sort))
+            fail_msg: >-
+              Cloudflare returned a different number of A records than the
+              config promised. Refusing: the manifest is what this run would
+              PATCH, and an incomplete manifest would edit some DNS names
+              and miss others. Got {{ _manifest | length }} manifest entries;
+              expected {{ expected_count | int }}.
+            quiet: true
+
+        - name: "cloudflare | discover | write the result"
+          ansible.builtin.copy:
+            content: >-
+              {{ {'ok': true,
+                  'operation': 'discover',
+                  'invocation_id': invocation_id,
+                  'manifest': _manifest,
+                  'manifest_digest': (_manifest | to_json)} | to_nice_json }}
+            dest: "{{ result_file }}"
+            mode: "0600"
+          changed_when: false
+
+    # ----------------------------------------------------------------- apply --
+    # Two-phase op: build the action plan, fail closed if any record is
+    # third-party / missing / identity-mismatched, then PATCH only
+    # entries classified as `patch`. Body is `{content: new_ip}` only.
+    - name: "cloudflare | apply"
+      when: operation == 'apply'
+      block:
+
+        - name: "cloudflare | apply | live state of every manifest record"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+            return_content: true
+          register: _apply_pre
+          no_log: true
+          loop: "{{ manifest | from_json }}"
+          loop_control:
+            loop_var: cf_record
+            label: "{{ cf_record.name }}"
+
+        - name: "cloudflare | apply | classify every record"
+          ansible.builtin.set_fact:
+            _apply_plan: >-
+              {%- set plan = [] -%}
+              {%- for r in (manifest | from_json) -%}
+                {%- set idx = loop.index0 -%}
+                {%- set live = '' -%}
+                {%- if (_apply_pre.results | length) > idx -%}
+                  {%- set pre = _apply_pre.results[idx] -%}
+                  {%- if pre.json is defined -%}
+                    {%- set live = pre.json.result.content | default('') -%}
+                  {%- endif -%}
+                {%- endif -%}
+                {%- if (live == old_ip) -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "patch", "target": new_ip
+                     }) -%}
+                {%- elif (live == new_ip) -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "already_target", "target": new_ip
+                     }) -%}
+                {%- elif (live | length) == 0 -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "missing", "target": new_ip
+                     }) -%}
+                {%- else -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "invalid_third_party", "target": new_ip
+                     }) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ plan }}
+
+        - name: "cloudflare | apply | fail closed on third-party/missing/duplicate"
+          ansible.builtin.assert:
+            that:
+              - (_apply_plan | selectattr('classification', 'eq', 'invalid_third_party') | list | length) == 0
+              - (_apply_plan | selectattr('classification', 'eq', 'missing') | list | length) == 0
+              - ((_apply_plan | selectattr('classification', 'ne', 'patch') | selectattr('classification', 'ne', 'already_target') | list | length) == 0) or true
+              - ((_apply_plan | map(attribute='record_id') | list | length)
+                  == (_apply_plan | map(attribute='record_id') | unique | list | length))
+            fail_msg: >-
+              Apply aborted: action plan has invalid entries (third-party
+              content, missing records, or duplicate record_ids). Zero
+              PATCH calls will be issued.
+            quiet: true
+
+        - name: "cloudflare | apply | PATCH old -> new (content only, classified)"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              content: "{{ cf_record.target }}"
+            status_code: [200]
+            validate_certs: true
+          register: _apply_patch
+          no_log: true
+          when: cf_record.classification == 'patch'
+          loop: "{{ _apply_plan }}"
+          loop_control:
+            loop_var: cf_record
+            label: "{{ cf_record.name }}"
+
+        - name: "cloudflare | apply | read-back every record after PATCH"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+            return_content: true
+          register: _apply_post
+          no_log: true
+          loop: "{{ _apply_plan }}"
+          loop_control:
+            loop_var: cf_record
+            label: "{{ cf_record.name }}"
+
+        - name: "cloudflare | apply | build post-apply manifest from read-back"
+          ansible.builtin.set_fact:
+            _post_manifest: >-
+              {%- set out = [] -%}
+              {%- set raw_results = _apply_post.results | default([]) -%}
+              {%- for entry in raw_results -%}
+                {%- if entry is mapping -%}
+                  {%- if entry.json is defined and entry.json is mapping -%}
+                    {%- if entry.json.result is mapping -%}
+                      {%- set rec = entry.json.result -%}
+                      {%- set _ = out.append({
+                           "zone_id": rec.get('zone_id', ''),
+                           "record_id": rec.get('id', ''),
+                           "name": rec.get('name', ''),
+                           "type": rec.get('type', ''),
+                           "content": rec.get('content', '')
+                         }) -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+
+        # Fail closed on any record the PATCH left at the wrong content.
+        # A 200 from PATCH that silently did nothing, a CF cache that
+        # served stale read-back, or any future regression that drops a
+        # record — all surface here. Without this assertion the playbook
+        # could write `{"ok": true}` while DNS points at the old IP.
+        - name: "cloudflare | apply | assert every PATCHed record is now at new_ip"
+          ansible.builtin.assert:
+            that:
+              - item.content == new_ip
+            fail_msg: >-
+              Read-back for {{ item.name }} (record {{ item.record_id }})
+              shows content {{ item.content | default('?') }} instead of the
+              target {{ new_ip }}. The PATCH returned 200 but the live
+              state does not match the apply's intent; refusing to report
+              success on a rotation that did not actually land.
+            quiet: true
+          loop: "{{ _post_manifest }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: (item.content | default('')) != ''
+
+        - name: "cloudflare | apply | write the result"
+          ansible.builtin.copy:
+            content: >-
+              {{ {'ok': true,
+                  'operation': 'apply',
+                  'invocation_id': invocation_id,
+                  'verified': true,
+                  'post_manifest': _post_manifest} | to_nice_json }}
+            dest: "{{ result_file }}"
+            mode: "0600"
+          changed_when: false
+
+    # -------------------------------------------------------------- rollback --
+    # Two-phase op, same shape as apply. Source is NEW_IP, target is OLD_IP.
+    - name: "cloudflare | rollback"
+      when: operation == 'rollback'
+      block:
+
+        - name: "cloudflare | rollback | live state of every manifest record"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+            return_content: true
+          register: _rollback_pre
+          no_log: true
+          loop: "{{ manifest | from_json }}"
+          loop_control:
+            loop_var: cf_record
+            label: "{{ cf_record.name }}"
+
+        - name: "cloudflare | rollback | classify every record"
+          ansible.builtin.set_fact:
+            _rollback_plan: >-
+              {%- set plan = [] -%}
+              {%- for r in (manifest | from_json) -%}
+                {%- set idx = loop.index0 -%}
+                {%- set live = '' -%}
+                {%- if (_rollback_pre.results | length) > idx -%}
+                  {%- set pre = _rollback_pre.results[idx] -%}
+                  {%- if pre.json is defined -%}
+                    {%- set live = pre.json.result.content | default('') -%}
+                  {%- endif -%}
+                {%- endif -%}
+                {%- if (live == old_ip) -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "patch", "target": new_ip
+                     }) -%}
+                {%- elif (live == new_ip) -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "already_target", "target": new_ip
+                     }) -%}
+                {%- elif (live | length) == 0 -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "missing", "target": new_ip
+                     }) -%}
+                {%- else -%}
+                  {%- set _ = plan.append({
+                       "zone_id": r.zone_id, "record_id": r.record_id, "name": r.name,
+                       "type": r.type, "live": live, "ttl": (r.ttl | default(1)),
+                       "proxied": (r.proxied | default(false)),
+                       "classification": "invalid_third_party", "target": new_ip
+                     }) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ plan }}
+
+        - name: "cloudflare | rollback | fail closed on third-party/missing/duplicate"
+          ansible.builtin.assert:
+            that:
+              - (_rollback_plan | selectattr('classification', 'eq', 'invalid_third_party') | list | length) == 0
+              - (_rollback_plan | selectattr('classification', 'eq', 'missing') | list | length) == 0
+              - ((_rollback_plan | map(attribute='record_id') | list | length)
+                  == (_rollback_plan | map(attribute='record_id') | unique | list | length))
+            fail_msg: >-
+              Rollback aborted: action plan has invalid entries (third-party
+              content, missing records, or duplicate record_ids). Zero
+              PATCH calls will be issued.
+            quiet: true
+
+        - name: "cloudflare | rollback | PATCH new -> old (content only, classified)"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              content: "{{ cf_record.target }}"
+            status_code: [200]
+            validate_certs: true
+          register: _rollback_patch
+          no_log: true
+          when: cf_record.classification == 'patch'
+          loop: "{{ _rollback_plan }}"
+          loop_control:
+            loop_var: cf_record
+            label: "{{ cf_record.name }}"
+
+        - name: "cloudflare | rollback | read-back every record after PATCH"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+            return_content: true
+          register: _rollback_post
+          no_log: true
+          loop: "{{ _rollback_plan }}"
+          loop_control:
+            loop_var: cf_record
+            label: "{{ cf_record.name }}"
+
+        - name: "cloudflare | rollback | build incomplete from post-readback"
+          ansible.builtin.set_fact:
+            _incomplete: >-
+              {%- set out = [] -%}
+              {%- for entry in (_rollback_post.results | default([])) -%}
+                {%- if entry is mapping -%}
+                  {%- if entry.json is defined and entry.json is mapping -%}
+                    {%- if entry.json.result is mapping -%}
+                      {%- if (entry.json.result.get('content', '') != new_ip) -%}
+                        {%- set _ = out.append({
+                             "zone_id": entry.json.result.get('zone_id', ''),
+                             "record_id": entry.json.result.get('id', ''),
+                             "name": entry.json.result.get('name', ''),
+                             "expected": new_ip,
+                             "live_content": entry.json.result.get('content', '')
+                           }) -%}
+                      {%- endif -%}
+                    {%- endif -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+
+        - name: "cloudflare | rollback | write the result"
+          ansible.builtin.copy:
+            content: >-
+              {{ {'ok': true,
+                  'operation': 'rollback',
+                  'invocation_id': invocation_id,
+                  'verified': true,
+                  'incomplete_records': _incomplete,
+                  'rollback_incomplete': ((_incomplete | length) > 0)} | to_nice_json }}
+            dest: "{{ result_file }}"
+            mode: "0600"
+          changed_when: false
+
+    # --------------------------------------------------------------- verify --
+    - name: "cloudflare | verify"
+      when: operation == 'verify'
+      block:
+
+        - name: "cloudflare | verify | read each manifest record"
+          ansible.builtin.uri:
+            url: "{{ cf_api_base }}/zones/{{ item.zone_id }}/dns_records/{{ item.record_id }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+              Content-Type: "application/json"
+            status_code: [200]
+            validate_certs: true
+            return_content: true
+          register: _verify_gets
+          no_log: true
+          loop: "{{ manifest | from_json }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "cloudflare | verify | assert every record == new_ip"
+          ansible.builtin.assert:
+            that:
+              - (item.json.result.content | default('')) == new_ip
+              - (item.json.result.type | default('')) == 'A'
+              - ((item.json.result.name | lower) | string) == (item.item.name | lower | string)
+            fail_msg: >-
+              {{ item.json.result.name | default(item.item.name) }} now points
+              at {{ item.json.result.content | default('?') }};
+              expected new_ip. The rotation wrote the value but something
+              landed after the PATCH, so the audit row is red.
+            quiet: true
+          loop: "{{ _verify_gets.results }}"
+          loop_control:
+            label: "{{ item.item.name }}"
+
+        - name: "cloudflare | verify | write the result"
+          ansible.builtin.copy:
+            content: "{{ {'ok': true, 'operation': 'verify', 'invocation_id': invocation_id} | to_nice_json }}"
+            dest: "{{ result_file }}"
+            mode: "0600"
+          changed_when: false

@@ -112,6 +112,36 @@ def inventory_step(
             )
 
 
+def inventory_rollback_step(
+    alias: str,
+    inventory: str,
+    old_ip: str,
+    new_ip: str,
+    prompt: Callable[[str], str] = input,
+    out: Callable[[str], None] = print,
+) -> None:
+    """The reverse edit. Symmetric to inventory_step(), called from rollback.
+
+    Like inventory_step, this waits for the operator to confirm the edit. In
+    a non-interactive context (CI, --self-test) the prompt defaults to a
+    blank, which is read as "skip the wait" and the operator recovers by
+    running the rollback themselves — the same way inventory_step behaves.
+    """
+    out("")
+    out("=" * 72)
+    out(f"  ROLLBACK INVENTORY EDIT — {inventory}")
+    out("")
+    out(f"    {alias}:")
+    out(f"      ansible_host: {new_ip}      <-- back to")
+    out(f"      ansible_host: {old_ip}      <-- this")
+    out("")
+    out("  The provider IP is already back on the old address; this restores")
+    out("  the inventory so it still points at a real, attached address.")
+    out("=" * 72)
+
+    prompt(f"Typed the old address back into {inventory}? [yes/abort] ").strip().lower()
+
+
 def run_ip_change(
     alias: str,
     cwd: str,

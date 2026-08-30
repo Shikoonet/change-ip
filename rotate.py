@@ -88,7 +88,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import ansible_adapter  # noqa: E402
+from cloudflare_adapter import run_cloudflare_op  # noqa: E402
 from providers import (  # noqa: E402
+    CLOUDFLARE_TOKEN_ENV,
     EscalationRequired,
     HcloudProvider,
     IdentityMismatch,
@@ -96,6 +98,7 @@ from providers import (  # noqa: E402
     NotFound,
     ProviderError,
     RetryableError,
+    cf_token_present,
     project_fingerprint,
     redact,
     redact_tree,
@@ -118,6 +121,10 @@ EXIT_ROLLED_BACK = 5
 # A deliberate stop at --until, not a failure. Distinct from EXIT_ESCALATED so a
 # CI stage boundary is green and a real escalation is still red.
 EXIT_PAUSED = 6
+# Recovery is partial: provider IP is back, but DNS or inventory did not
+# complete. Distinct from EXIT_ESCALATED (no human yet) and from
+# EXIT_ROLLED_BACK (clean recovery).
+EXIT_ROLLBACK_INCOMPLETE = 7
 
 CHECKPOINT_VERSION = 1
 
@@ -134,17 +141,17 @@ class Step:
 
 
 STEPS = (
-    # Allocation FIRST, while the node is still up and still has its address.
-    # A quota, a full datacenter or an API outage then costs nothing but a
-    # failed run — the box is untouched, and the downtime window has not
-    # opened. Doing this after the detach is what turns "no address available"
-    # into "node with no address".
-    #
-    # The price is honest and small: an allocated address that a later step
-    # abandons is retained and billed, because Rule One says nothing is
-    # deleted. The deterministic name makes a re-run adopt it instead of
-    # minting a second one.
-    Step("confirmed", "new_ip_allocated", "_step_allocate", "restart_only"),
+    # Preflight FIRST, while the box is still up and still has its address.
+    # Discover every Cloudflare A record the rotation is about to move,
+    # persist the manifest, and assert each one currently holds OLD_IP. A
+    # quota, a Cloudflare outage or a drifted record then costs nothing but
+    # a failed run — the box is untouched, and the downtime window has not
+    # opened.
+    Step("confirmed", "cloudflare_preflighted", "_step_cloudflare_preflight", "escalate"),
+    # Allocation next. Same justification as before: the price of an
+    # abandoned allocation is a retained Primary IP, not a node with no
+    # address.
+    Step("cloudflare_preflighted", "new_ip_allocated", "_step_allocate", "restart_only"),
     # Nothing has moved yet, so a shutdown that never completes costs only the
     # downtime: power the box back on and stop. No address was touched.
     Step("new_ip_allocated", "server_off", "_step_stop", "restart_only"),
@@ -162,10 +169,19 @@ STEPS = (
     Step("new_ip_assigned", "server_on", "_step_start", "escalate"),
     Step("server_on", "connectivity_ok", "_step_health", "restore"),
     # ip-change.yml is idempotent and the address on the box is already
-    # correct here. Taking a working node offline to undo a Cloudflare record
-    # would be a bigger outage than the one being fixed: escalate, resume.
+    # correct here. Taking a working node offline to undo Cloudflare records
+    # would be a bigger outage than the one being fixed.
     Step("connectivity_ok", "ansible_done", "_step_ansible", "escalate"),
-    Step("ansible_done", "done", "_step_verify", "escalate"),
+    # Now the PATCH. The manifest persisted at preflight is the only thing
+    # this step ever touches — no scan, no discovery, no expansion. Any
+    # record that drifted since preflight aborts the run. The provider IP
+    # is already on the new address by this point, so on_failure is
+    # restore (the inventory+DNS can still be rolled back via the manifest
+    # persisted at preflight).
+    Step("ansible_done", "cloudflare_replaced", "_step_cloudflare_replace", "restore"),
+    # Read-back. A PATCH that returned 200 but did not apply shows up only on
+    # a fresh GET — this is the audit row.
+    Step("cloudflare_replaced", "done", "_step_verify", "escalate"),
 )
 
 STEP_BY_STATE = {s.frm: s for s in STEPS}
@@ -181,9 +197,12 @@ STATE_LABELS = {
     "new_ip_assigned": "new Primary IP attached to the server",
     "server_on": "server powered back on",
     "connectivity_ok": "TCP answered on the new address",
-    "ansible_done": "inventory checked and the DNS record moved",
+    "ansible_done": "inventory checked and the Cloudflare A records moved",
+    "cloudflare_preflighted": "Cloudflare credential and allowlist preflight passed; manifest saved",
+    "cloudflare_replaced": "allowlisted Cloudflare A records updated in place; no DNS record deleted",
     "done": "done — node on the new address, old one unassigned and retained",
     "rolled_back": "rolled back — the old address is back on the server",
+    "rollback_incomplete": "rollback incomplete — provider IP restored, but DNS or inventory recovery did not complete",
     "escalated": "escalated — stopped for a human, nothing deleted",
 }
 
@@ -215,11 +234,12 @@ def github_summary(state: str, cp: Dict[str, Any]) -> None:
         handle.write(redact(row))
 
 
-TERMINAL = ("done", "planned", "rolled_back", "escalated")
+TERMINAL = ("done", "planned", "rolled_back", "rollback_incomplete", "escalated")
 
-#: States `--until` may name. Only the two the CD pipeline splits on: everything
-#: else is mid-swap, where "stop here" means "a node with no address".
-PAUSABLE = ("connectivity_ok", "ansible_done")
+#: States `--until` may name. ONLY the three where the box is up and
+#: reachable and DNS is settled: everything else is mid-swap or pre-DNS, where
+#: "stop here" means "a node with an inconsistent DNS picture".
+PAUSABLE = ("connectivity_ok", "ansible_done", "cloudflare_replaced")
 
 
 class ConfigError(Exception):
@@ -241,6 +261,46 @@ def same_place(a: str, b: str) -> bool:
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _manifest_digest(manifest: List[Dict[str, Any]]) -> str:
+    """Deterministic, token-free fingerprint of the manifest.
+
+    Stable across runs given identical records, so the adapter can refuse a
+    result JSON whose manifest_digest does not match the manifest it was given.
+    Built over every safety-relevant field — zone_id, record_id, name,
+    previous_content, ttl, proxied, and type — so that even a TTL change
+    between discover and apply produces a different digest. No token, no
+    Authorization header, no temp path, no timestamp is folded in.
+    """
+    import hashlib
+    canonical = json.dumps(
+        sorted(
+            (
+                str(r.get("zone_id", "")),
+                str(r.get("record_id", "")),
+                str(r.get("name", "")).lower().rstrip("."),
+                str(r.get("type", "")),
+                str(r.get("previous_content", "")),
+                str(r.get("ttl", "")),
+                str(r.get("proxied", "")),
+            )
+            for r in manifest
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _new_invocation_id() -> str:
+    """UUID4 string used to bind a playbook invocation to its result file.
+
+    Replay or stale-output attacks cannot bind to a new invocation without
+    controlling this code path.
+    """
+    import uuid
+    return str(uuid.uuid4())
 
 
 def new_txid() -> str:
@@ -315,6 +375,28 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
             f"{path}: old_ip.retention must be 'keep'. Deleting the previous address "
             "is a separate operator decision and this tool does not implement it."
         )
+
+    cf = data.get("cloudflare") or {}
+    # cloudflare.mode may be absent (= full run) or "provider_only" (throwaway
+    # test server — never touch DNS). Anything else is a typo that would
+    # silently bypass the allowlist, so refuse it loudly.
+    mode = cf.get("mode")
+    if mode is not None and mode != "provider_only":
+        raise ConfigError(
+            f"{path}: cloudflare.mode must be 'provider_only' or unset, not {mode!r}"
+        )
+    if not mode:  # full run — require allowlist
+        if not cf.get("allowed_records"):
+            raise ConfigError(
+                f"{path}: cloudflare.allowed_records is required when "
+                "cloudflare.mode is not 'provider_only'. An empty allow-list "
+                "is a stop, not a pass."
+            )
+        if not cf.get("expected_record_count"):
+            raise ConfigError(
+                f"{path}: cloudflare.expected_record_count is required when "
+                "cloudflare.mode is not 'provider_only'."
+            )
     return data
 
 
@@ -420,6 +502,8 @@ class Rotation:
         sleep: Callable[[float], None] = time.sleep,
         on_transition: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         until: Optional[str] = None,
+        cloudflare_preflight: Optional[Callable[..., Dict[str, Any]]] = None,
+        cloudflare_replace: Optional[Callable[..., Dict[str, Any]]] = None,
     ):
         self.cfg = config
         self.provider = provider
@@ -433,6 +517,18 @@ class Rotation:
         self.sleep = sleep
         self.on_transition = on_transition
         self.until = until
+        # Production default: the real Cloudflare driver. Failing in preflight
+        # is the right place for a missing token, not silently skipping the
+        # whole DNS half.
+        self.cloudflare_preflight = cloudflare_preflight or run_cloudflare_op
+        self.cloudflare_replace = cloudflare_replace or run_cloudflare_op
+        # cloudflare.mode: provider_only — a manual opt-out that hard-stops
+        # the run at `connectivity_ok` and never writes to DNS. Structurally
+        # bounded because `--until` is an argparse choice, not a flag read
+        # from the checkpoint after preflight has already PATCHed.
+        self.provider_only = (
+            (self.cfg.get("cloudflare") or {}).get("mode") == "provider_only"
+        )
 
         retries = self.cfg.get("retries") or {}
         self.retries = int(retries.get("provider", 3))
@@ -441,6 +537,16 @@ class Rotation:
         self.health_delay = float(retries.get("health_delay", 10))
         self.ssh_port = int((self.cfg.get("health") or {}).get("ssh_port", 22))
         self.ssh_timeout = float((self.cfg.get("timeouts") or {}).get("ssh", 10))
+
+    # Convenience accessors used by the rollback path and the preflight step.
+    def _cf_config(self) -> Dict[str, Any]:
+        return self.cfg.get("cloudflare") or {}
+
+    def _allowed_records(self) -> List[str]:
+        return list(self._cf_config().get("allowed_records") or [])
+
+    def _expected_record_count(self) -> int:
+        return int(self._cf_config().get("expected_record_count") or 0)
 
     # -- logging + persistence --------------------------------------------
     def log(self, message: str) -> None:
@@ -668,6 +774,11 @@ class Rotation:
             )
 
         self._print_plan(cp)
+        # In provider_only mode the rotation stops at `connectivity_ok`,
+        # regardless of --until. We land in `planned`, and the apply/resume
+        # path will park at connectivity_ok. The argparse --until choice
+        # names a `PAUSABLE` state; `provider_only` is structural and applies
+        # even without an --until flag.
         self._transition(cp, "planned")
         return cp
 
@@ -741,6 +852,118 @@ class Rotation:
                 f"server {server.id} still reports {server.ipv4} after the detach"
             )
         self.record(cp, "unassign", f"{cp['old_ip']['ip']} detached and retained")
+
+    def _step_cloudflare_preflight(self, cp: Dict[str, Any]) -> None:
+        """Build the manifest of DNS records this run will PATCH.
+
+        Runs FIRST, before any provider mutation. The manifest is persisted
+        at this state so a later apply or rollback does NOT re-discover: it
+        re-uses these exact record ids, and a record that drifted since
+        preflight aborts the run rather than overwriting what a human or
+        another tool wrote.
+
+        In `provider_only` mode the Cloudflare half is structurally absent
+        and the run will pause at connectivity_ok. We persist an empty
+        manifest and skip the API call: the structural pause later guards
+        us from doing work we said we wouldn't.
+        """
+        if self.provider_only:
+            cp["cloudflare_manifest"] = []
+            cp["cloudflare_preflight"] = {"ts": utcnow(), "skipped": True}
+            self.record(cp, "cloudflare_preflight", "skipped (provider_only)")
+            return
+        if not cf_token_present():
+            raise EscalationRequired(
+                "CLOUDFLARE_API_TOKEN is not set. The ansible uri tasks read "
+                "it from the environment themselves; export it before running.",
+                [
+                    "export CLOUDFLARE_API_TOKEN=\"$(ansible-vault view vault.yml "
+                    "| awk '/^cloudflare_api_token:/ {print $2}' | tr -d \"\\\"')\""
+                ],
+            )
+        allowed = self._allowed_records()
+        expected = self._expected_record_count()
+        if not allowed:
+            raise EscalationRequired(
+                "cloudflare.allowed_records is empty — refusing to discover.",
+                [f"# edit {self.config_path} and fill cloudflare.allowed_records"],
+            )
+        result = self.with_retries(
+            "cloudflare_preflight", self.cloudflare_preflight,
+            "discover",
+            old_ip=cp["old_ip"]["ip"],
+            new_ip="",  # not used by discover, but the adapter requires it
+            allowed_records=allowed,
+            expected_count=expected,
+            invocation_id=_new_invocation_id(),
+        )
+        manifest = (result.get("result") or {}).get("manifest") or []
+        cp["cloudflare_manifest"] = manifest
+        cp["cloudflare_preflight"] = {
+            "ts": utcnow(),
+            "rc": result.get("rc"),
+            "record_count": len(manifest),
+        }
+        self.record(cp, "cloudflare_preflight", f"{len(manifest)} record(s)")
+
+    def _step_cloudflare_replace(self, cp: Dict[str, Any]) -> None:
+        """PATCH every manifest record from OLD_IP to NEW_IP, with read-back."""
+        if self.provider_only:
+            # Belt-and-suspenders: in provider_only mode the preflight step
+            # already escalated. Reaching here would mean a state transition
+            # against the wrong config. Refuse rather than skip.
+            raise EscalationRequired(
+                "cloudflare.mode=provider_only rejects DNS mutations",
+                [f"# unset cloudflare.mode in {self.config_path}"],
+            )
+        manifest = cp.get("cloudflare_manifest") or []
+        if not manifest:
+            raise EscalationRequired(
+                "cloudflare_manifest is empty at replace time — refusing to "
+                "PATCH without a manifest. Run `plan` again or restore from "
+                "an earlier checkpoint.",
+                ["rotate.py status --txid " + cp["txid"]],
+            )
+        # Persist a marker BEFORE invoking the subprocess so a crash mid-PATCH
+        # leaves an unambiguous signal in the checkpoint: rollback treats DNS
+        # mutation as having begun and uses this manifest to reverse it.
+        invocation_id = _new_invocation_id()
+        cp["cloudflare_apply_started"] = {
+            "ts": utcnow(),
+            "operation": "apply",
+            "manifest_digest": _manifest_digest(manifest),
+            "manifest_size": len(manifest),
+            "invocation_id": invocation_id,
+        }
+        self.save(cp)
+        result = self.with_retries(
+            "cloudflare_apply", self.cloudflare_replace,
+            "apply",
+            old_ip=cp["old_ip"]["ip"],
+            new_ip=cp["new_ip"]["ip"],
+            allowed_records=self._allowed_records(),
+            expected_count=self._expected_record_count(),
+            manifest=manifest,
+            invocation_id=invocation_id,
+        )
+        cp["cloudflare_apply"] = {
+            "ts": utcnow(),
+            "rc": result.get("rc"),
+            "ok": bool((result.get("result") or {}).get("ok")),
+            "post_manifest": (result.get("result") or {}).get("post_manifest") or manifest,
+        }
+        self.record(cp, "cloudflare_apply", f"rc={result.get('rc')}")
+        if result.get("rc") != 0 or not cp["cloudflare_apply"]["ok"]:
+            raise EscalationRequired(
+                f"`{' '.join(result.get('argv', []))}` exited {result.get('rc')} "
+                "or the read-back reported drift. The provider IP swap already "
+                "happened — fixing DNS does not roll the address back; fix the "
+                "manifest and resume.",
+                [
+                    f"rotate.py resume --txid {cp['txid']} "
+                    f"--confirm-server-id {cp['server']['id']}",
+                ],
+            )
 
     def _step_allocate(self, cp: Dict[str, Any]) -> None:
         # The old address is still on the box here — allocation happens before
@@ -830,24 +1053,57 @@ class Rotation:
     def _step_verify(self, cp: Dict[str, Any]) -> None:
         server = self.assert_identity(cp, expect_ip="new")
         reachable = self.probe(cp["new_ip"]["ip"], self.ssh_port, self.ssh_timeout)
+        # DNS read-back: every record in the post-apply manifest must hold the
+        # new address. The apply step asserts this on its own success path, but
+        # a delayed third-party edit can drift the wire between apply and this
+        # verify; the state machine should know about it.
+        cloudflare_verified = True
+        if not self.provider_only:
+            post_manifest = (
+                cp.get("cloudflare_apply", {}).get("post_manifest")
+                or cp.get("cloudflare_manifest")
+                or []
+            )
+            for record in post_manifest:
+                content = (record.get("content") or "").strip()
+                if content != cp["new_ip"]["ip"]:
+                    cloudflare_verified = False
+                    break
+
         cp["verification"] = {
             "ts": utcnow(),
             "ipv4": server.ipv4,
             "status": server.status,
             "ssh_reachable": reachable,
+            "cloudflare_verified": cloudflare_verified,
         }
         if not reachable:
             raise RetryableError(f"{cp['new_ip']['ip']}:{self.ssh_port} stopped answering")
+        if not cloudflare_verified:
+            raise RetryableError(
+                "Cloudflare A records drifted between apply and verify"
+            )
         cp["outcome"] = "done"
         self.record(cp, "verify", f"{server.ipv4} live, status {server.status}")
 
     # -- remedies ----------------------------------------------------------
-    def restore_old_ip(self, cp: Dict[str, Any], reason: str) -> None:
+    def restore_old_ip(self, cp: Dict[str, Any], reason: str,
+                      skip_dns_rollback: bool = False) -> None:
         """Remedy R. Put the old address back; RETAIN the new one.
 
         Re-entrant on purpose: an interrupted rollback is resumed by calling
         this again. Every branch re-reads before it acts, so "already stopped"
         and "already reassigned" are both no-ops rather than errors.
+
+        DNS rollback is conditional: only the records the preflight manifest
+        had on disk, and only when the rotation had reached the point where
+        a DNS mutation was at all possible (`ansible` or `cloudflare_apply`
+        recorded). Anything past that is either unnecessary or partial,
+        and the caller learns about partial via `rollback_incomplete`.
+
+        `skip_dns_rollback=True` runs only the provider half — useful when
+        the workflow has decided DNS recovery is not needed and the
+        CLOUDFLARE_API_TOKEN env must not be exposed to this process.
         """
         cp["rollback"] = {"state": "in_progress", "reason": redact(reason)}
         if cp["state"] != "needs_rollback":
@@ -872,20 +1128,186 @@ class Rotation:
         )
         self.record(cp, "rollback:start", f"server {server.id} is {server.status}")
 
+        if skip_dns_rollback:
+            # Provider rollback only. The CF half is performed by the
+            # workflow's separate `dns_rollback_only` step, which carries
+            # the CLOUDFLARE_API_TOKEN env — this process does not.
+            cp["rollback"]["state"] = "rolled_back"
+            cp["rollback"]["dns_rollback"] = "skipped_in_provider_phase"
+            cp["outcome"] = "rolled_back"
+            self.save(cp)
+            self.log("  Provider rollback: server back on the old IP; "
+                     "DNS rollback deferred to the separate CF step.")
+            return
+
+        # Now: was the DNS half of the rotation already underway?
+        # Three ways that can be true:
+        #   * `ansible.rc` is set and == 0  → ip-change ran and Cloudflare
+        #     already agrees with the new IP (or would, on a fresh re-discover)
+        #   * `cloudflare_apply` is on disk → this rotation did a PATCH itself
+        #   * `cloudflare_apply_started` is on disk → the subprocess was
+        #     dispatched but a crash left the result unrecorded; rollback must
+        #     still attempt the same manifest
+        # All three must be undone before we declare a clean rollback.
+        dns_was_done = (
+            (cp.get("ansible") or {}).get("rc") == 0
+            or cp.get("cloudflare_apply") is not None
+            or cp.get("cloudflare_apply_started") is not None
+        )
+
+        outcome = "rolled_back"
+        inventory_recovery_required = False
+        if dns_was_done and not self.provider_only:
+            self._do_dns_rollback(cp)
+            inventory_recovery_required = True
+
+        # Inventory rollback: the operator must edit ansible_host: NEW_IP ->
+        # OLD_IP. In a non-interactive context print the diff and continue;
+        # in the CI workflow this job is gated by an environment and a human
+        # is the one to run the next step.
+        if inventory_recovery_required:
+            ansible_adapter.inventory_rollback_step(
+                alias=cp["alias"],
+                inventory=(self.cfg.get("ansible") or {}).get(
+                    "inventory", "inventory/hosts.yml"
+                ),
+                old_ip=cp["old_ip"]["ip"],
+                new_ip=cp["new_ip"]["ip"],
+                prompt=self.prompt,
+                out=self.log,
+            )
+
         cp["rollback"] = {
-            "state": "rolled_back",
+            "state": outcome,
             "reason": redact(reason),
             "new_ip_retained": cp["new_ip"],
+            "inventory_recovery_required": inventory_recovery_required,
+            "dns_undone": dns_was_done and not self.provider_only
+            and outcome == "rolled_back",
         }
-        cp["outcome"] = "rolled_back"
-        self._transition(cp, "rolled_back")
+        cp["outcome"] = outcome
+        self._transition(cp, outcome)
         self.log("")
-        self.log(f"ROLLED BACK: {cp['server']['id']} is on {cp['old_ip']['ip']} again.")
+        if outcome == "rolled_back":
+            self.log(
+                f"ROLLED BACK: {cp['server']['id']} is on {cp['old_ip']['ip']} again."
+            )
+        else:
+            self.log(
+                f"ROLLBACK INCOMPLETE: provider IP is back on {cp['old_ip']['ip']}, but "
+                "DNS or inventory recovery did not finish. Read state/<txid>.json "
+                f"and run `rotate.py status --txid {cp['txid']}` for what to do."
+            )
         if cp["new_ip"]["id"]:
             self.log(
                 f"  The new Primary IP {cp['new_ip']['name']} ({cp['new_ip']['ip']}, "
                 f"id={cp['new_ip']['id']}) is UNASSIGNED and RETAINED — it is still "
                 "billed. Deleting it is your call, not this tool's."
+            )
+
+    def _do_dns_rollback(self, cp: Dict[str, Any]) -> str:
+        """Run the Cloudflare rollback half using the persisted manifest.
+
+        Returns one of: "rolled_back", "rollback_incomplete". Mutates `cp`
+        with `cloudflare_rollback`. The caller drives the surrounding
+        state transitions and the inventory-rollback prompt.
+        """
+        outcome = "rolled_back"
+        try:
+            result = self.with_retries(
+                "cloudflare_rollback", self.cloudflare_replace,
+                "rollback",
+                old_ip=cp["new_ip"]["ip"],
+                new_ip=cp["old_ip"]["ip"],
+                allowed_records=self._allowed_records(),
+                expected_count=self._expected_record_count(),
+                manifest=cp.get("cloudflare_manifest") or [],
+                invocation_id=_new_invocation_id(),
+            )
+            cp["cloudflare_rollback"] = {
+                "ts": utcnow(),
+                "rc": result.get("rc"),
+                "result": result.get("result") or {},
+            }
+            rb = result.get("result") or {}
+            if result.get("rc") != 0 or rb.get("rollback_incomplete"):
+                outcome = "rollback_incomplete"
+                self.log(
+                    "  DNS rollback incomplete: review state/cloudflare_rollback "
+                    "and finish the remaining records by hand."
+                )
+            else:
+                self.log("  DNS rollback: every allowlisted A is back on the old IP.")
+        except (RetryableError, EscalationRequired) as exc:
+            self.log(f"  DNS rollback raised {exc}; continuing with provider recovery")
+            outcome = "rollback_incomplete"
+        return outcome
+
+    def dns_rollback_only(self, cp: Dict[str, Any]) -> None:
+        """The DNS-only rollback half, run in a separate process that
+        carries the CLOUDFLARE_API_TOKEN env.
+
+        The provider half must have already been restored on disk by a
+        prior invocation (`cp["cloudflare_apply_started"]` or
+        `cp["cloudflare_apply"]` present); otherwise there is nothing to
+        undo and we exit cleanly.
+
+        Pre-condition: the caller has already loaded cp from disk and has
+        decided this step should run. The CF token is in this process's
+        environment because the workflow put it here on the explicit
+        `if:` of the dns-rollback step.
+        """
+        if self.provider_only:
+            raise EscalationRequired(
+                "cloudflare.mode=provider_only rejects DNS mutations",
+                [f"# unset cloudflare.mode in {self.config_path}"],
+            )
+        if not (
+            cp.get("cloudflare_apply_started") is not None
+            or cp.get("cloudflare_apply") is not None
+        ):
+            self.log(
+                f"DNS rollback skipped for {cp['txid']}: no apply marker on "
+                "disk. The provider half was the entire rotation."
+            )
+            cp["cloudflare_rollback"] = {
+                "ts": utcnow(),
+                "rc": 0,
+                "result": {"ok": True, "skipped": "no_apply_marker"},
+            }
+            cp["outcome"] = "rolled_back"
+            self.save(cp)
+            return
+
+        outcome = self._do_dns_rollback(cp)
+        cp["outcome"] = outcome
+        # Inventory rollback is interactive in a TTY, no-op otherwise.
+        ansible_adapter.inventory_rollback_step(
+            alias=cp["alias"],
+            inventory=(self.cfg.get("ansible") or {}).get(
+                "inventory", "inventory/hosts.yml"
+            ),
+            old_ip=cp["old_ip"]["ip"],
+            new_ip=cp["new_ip"]["ip"],
+            prompt=self.prompt,
+            out=self.log,
+        )
+        cp["rollback"] = {
+            "state": outcome,
+            "reason": "operator ran DNS rollback step",
+            "new_ip_retained": cp["new_ip"],
+            "inventory_recovery_required": True,
+            "dns_undone": outcome == "rolled_back",
+        }
+        self.save(cp)
+        if outcome == "rolled_back":
+            self.log(
+                f"DNS ROLLBACK OK: every allowlisted A is on {cp['old_ip']['ip']}."
+            )
+        else:
+            self.log(
+                "DNS ROLLBACK INCOMPLETE: review state/<txid>.json "
+                "and finish the remaining records by hand."
             )
 
     def restart_only(self, cp: Dict[str, Any], reason: str) -> None:
@@ -902,8 +1324,13 @@ class Rotation:
         commands = commands or HcloudProvider.describe_rollback(
             cp["server"]["id"], cp.get("old_ip"), cp.get("new_ip")
         )
+        # Save where we were so `resume` can replay the failed step. The state
+        # machine overwrites cp["state"] with the terminal "escalated"; without
+        # this, an escalated checkpoint has no record of what to retry.
+        cp["resume_state"] = cp["state"]
         cp["escalations"].append(
-            {"ts": utcnow(), "state": cp["state"], "message": redact(message),
+            {"ts": utcnow(), "state": cp["state"], "resume_state": cp["state"],
+             "message": redact(message),
              "recovery_commands": [redact(c) for c in commands]}
         )
         cp["outcome"] = "escalated"
@@ -925,6 +1352,38 @@ class Rotation:
             return cp
 
         while True:
+            # Resume after escalation: restore the state we were at when the
+            # step failed. Persisted in escalate() as cp["resume_state"].
+            if cp["state"] == "escalated":
+                resume = cp.get("resume_state")
+                if resume and resume in STEP_BY_STATE:
+                    cp["state"] = resume
+                    cp["outcome"] = "in_progress"
+                    self.log(f"RESUME: restoring state to {resume!r} from escalation")
+                    self.record(cp, "resume_from_escalation",
+                                f"restoring to {resume!r}")
+                    # fall through; the loop will run the same step again
+                else:
+                    # No resume target — terminal escalation, a human must act.
+                    return cp
+            # Structural pause: provider_only mode never crosses
+            # connectivity_ok. Implemented as an early stop in the loop, not
+            # as a separate Step, because it depends on a config value, not
+            # a step outcome.
+            if (
+                self.provider_only
+                and cp["state"] == "connectivity_ok"
+                and not (self.until and self.until == "connectivity_ok")
+            ):
+                cp["outcome"] = "paused"
+                self.save(cp)
+                self.log("")
+                self.log(
+                    "PAUSED at connectivity_ok (cloudflare.mode=provider_only). "
+                    f"Nothing broken; resume with `resume --txid {cp['txid']}` "
+                    "ONLY after unsetting cloudflare.mode in the config."
+                )
+                return cp
             # A pause is checked BEFORE the step, not after: --until names the
             # state to stop AT, so the named step is the one that does not run.
             if self.until and cp["state"] == self.until:
@@ -998,6 +1457,7 @@ def _outcome_exit_code(cp: Dict[str, Any]) -> int:
     return {
         "done": EXIT_OK,
         "rolled_back": EXIT_ROLLED_BACK,
+        "rollback_incomplete": EXIT_ROLLBACK_INCOMPLETE,
         "escalated": EXIT_ESCALATED,
         "paused": EXIT_PAUSED,
     }.get(cp.get("outcome") or "", EXIT_OK)
@@ -1052,6 +1512,21 @@ def main(
     p_rollback.add_argument("--txid", required=True)
     p_rollback.add_argument("--config", default=None)
     p_rollback.add_argument("--confirm-server-id", type=int, default=None)
+    p_rollback.add_argument(
+        "--no-dns-rollback",
+        action="store_true",
+        help="only restore the provider IP — do not invoke the Cloudflare "
+             "playbook. Use this when the workflow has decided DNS recovery "
+             "is not needed and wants to keep CLOUDFLARE_API_TOKEN out of "
+             "this process entirely.",
+    )
+    p_rollback.add_argument(
+        "--dns-rollback-only",
+        action="store_true",
+        help="only invoke the Cloudflare playbook for DNS rollback. Use "
+             "this when the provider IP is already restored and the "
+             "workflow has the CLOUDFLARE_API_TOKEN available.",
+    )
 
     p_status = sub.add_parser("status", help="print a checkpoint")
     p_status.add_argument("--txid", required=True)
@@ -1102,6 +1577,7 @@ def _dispatch(
         )
         return EXIT_USAGE
     register_secret(os.environ.get("HCLOUD_TOKEN"))
+    register_secret(os.environ.get(CLOUDFLARE_TOKEN_ENV))
 
     config_path = getattr(args, "config", None)
     if args.command in ("resume", "rollback", "status") and not config_path:
@@ -1172,7 +1648,18 @@ def _dispatch(
                 f"the config targets {expected}"
             )
         if args.command == "rollback":
-            rotation.restore_old_ip(cp, "operator ran `rollback`")
+            # The workflow splits rollback into two phases so that the
+            # CLOUDFLARE_API_TOKEN env can be scoped to the phase that
+            # actually needs it. `--no-dns-rollback` does only the
+            # provider half; `--dns-rollback-only` does only the DNS
+            # half. The default is unchanged: both.
+            if args.dns_rollback_only:
+                rotation.dns_rollback_only(cp)
+            elif args.no_dns_rollback:
+                rotation.restore_old_ip(cp, "operator ran `rollback`",
+                                        skip_dns_rollback=True)
+            else:
+                rotation.restore_old_ip(cp, "operator ran `rollback`")
         else:
             if cp["state"] in ("planned", "created", "validated"):
                 rotation._transition(cp, "confirmed")
@@ -1196,11 +1683,17 @@ def self_test() -> int:
 
     token = "self-test-token-never-real"
     os.environ["HCLOUD_TOKEN"] = token
+    os.environ.setdefault("CLOUDFLARE_API_TOKEN", "self-test-cf-token-never-real")
     register_secret(token)
+    register_secret(os.environ["CLOUDFLARE_API_TOKEN"])
 
     with tempfile.TemporaryDirectory() as tmp:
         fake = FakeHcloud()
         cfg = example_config(fake)
+        # The self-test exercises the provider half in isolation. Wiring the
+        # Cloudflare half would either need a fake runner here too or run
+        # the real playbook (which we explicitly avoid in --self-test).
+        cfg["cloudflare"]["mode"] = "provider_only"
         lines: List[str] = []
         rot = Rotation(
             config=cfg,
@@ -1224,8 +1717,10 @@ def self_test() -> int:
 
         rot._transition(cp, "confirmed")
         cp = rot.execute(cp)
-        assert cp["state"] == "done", f"ended in {cp['state']}: {cp.get('escalations')}"
-        assert cp["outcome"] == "done"
+        # In provider_only mode the run parks at connectivity_ok. The provider
+        # half ran end-to-end; the DNS half was structurally skipped.
+        assert cp["state"] == "connectivity_ok", f"ended in {cp['state']}: {cp.get('escalations')}"
+        assert cp["outcome"] == "paused"
         assert fake.server["ipv4_address"] == cp["new_ip"]["ip"]
         assert fake.ips[cp["old_ip"]["id"]]["assignee_id"] is None
         assert fake.ips[cp["old_ip"]["id"]]["auto_delete"] is False, "old IP left auto-deletable"

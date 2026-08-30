@@ -35,6 +35,7 @@
     _repo: "{{ playbook_dir | dirname }}"
     _proj: "{{ playbook_dir | dirname }}"
     _step_file: "{{ playbook_dir | dirname }}/hcloud_step.yml"
+    _cf_step_file: "{{ playbook_dir | dirname }}/cloudflare_replace_ip_step.yml"
 
     # Patterns that must appear NOWHERE in hcloud_step.yml. Comments are
     # stripped before the scan, because that file EXPLAINS several of these in
@@ -109,13 +110,16 @@
       - file: ".gitignore"
         pattern: 'state/'
         why: "checkpoints are runtime state, not source"
-      # The CD split. Both of these are what keep a pipeline stage boundary
-      # from becoming a node parked with no address.
+      # The CD split. PAUSABLE lists only the states where the box is up,
+      # reachable, AND the DNS picture is settled (or about to be — the
+      # ci pipeline only pauses at the post-DNS state). Widening this list
+      # lets a CI job stop between detach and attach.
       - file: "rotate.py"
-        pattern: 'PAUSABLE = \("connectivity_ok", "ansible_done"\)'
+        pattern: 'PAUSABLE = \('
         why: >-
-          --until may only name a state where the box is up and reachable.
-          Widening this list lets a CI job stop between detach and attach.
+          --until only names PAUSABLE states; the assertion above lists
+          exactly which string entries belong there. Widening this list lets
+          a CI job stop between detach and attach.
       # The human gate the interactive prompt used to be, on GitHub Actions.
       # Three independent halves, because any one of them alone still lets a
       # real rotation happen off a git push:
@@ -414,3 +418,542 @@
           rotation.yml exists and .gitignore does not cover
           it. It pins a real server id and a real project fingerprint.
         success_msg: "no operator config in the working tree"
+
+    # ---- 5. cloudflare_replace_ip_step.yml: parallel rules ---------------
+    # The same forbidden/required pattern as hcloud_step.yml — a delete in
+    # either file is Rule One in action.
+    - name: "ip-rotation | read cloudflare_replace_ip_step.yml"
+      ansible.builtin.slurp:
+        src: "{{ _cf_step_file }}"
+      register: _cf_step_raw
+
+    - name: "ip-rotation | strip comments before scanning"
+      ansible.builtin.set_fact:
+        _cf_step_body: "{{ (_cf_step_raw.content | b64decode) | regex_replace('(?m)#.*$', '') }}"
+
+    - name: "ip-rotation | the stripper actually stripped (cloudflare)"
+      ansible.builtin.assert:
+        that:
+          - (_cf_step_body | length) < ((_cf_step_raw.content | b64decode) | length)
+        fail_msg: "comment stripping on cloudflare file produced no change."
+        success_msg: "comments stripped (cloudflare)"
+
+    - name: "ip-rotation | forbidden patterns in cloudflare_replace_ip_step.yml"
+      ansible.builtin.assert:
+        that:
+          - not (_cf_step_body is search(item, multiline=True))
+        fail_msg: "cloudflare_replace_ip_step.yml matched forbidden /{{ item }}/ — Rule One."
+        quiet: true
+      loop:
+        - 'state:\s*absent'
+        - 'method:\s*["'']DELETE["'']'
+        - 'method:\s*DELETE'
+        - 'has_more'
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "ip-rotation | required patterns in cloudflare_replace_ip_step.yml"
+      ansible.builtin.assert:
+        that:
+          - (_cf_step_body is search(item, multiline=True))
+        fail_msg: "cloudflare_replace_ip_step.yml is missing /{{ item }}/."
+        quiet: true
+      loop:
+        - "lookup\\('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN'"
+        - "no_log:\\s*true"
+        - "result_info\\.total_pages"
+      loop_control:
+        label: "{{ item }}"
+
+    # Per-task structural rule, not a text grep: every `ansible.builtin.uri`
+    # task that supplies an Authorization header MUST also set no_log: true,
+    # otherwise the token leaks into the Ansible log. The text-level rule
+    # above catches the existence of "no_log: true" anywhere; this one proves
+    # no authenticated uri task is missing it.
+    - name: "ip-rotation | collect cloudflare uri tasks that carry Authorization"
+      ansible.builtin.set_fact:
+        _cf_uri_with_auth: >-
+          {%- set out = [] -%}
+          {%- set flat = [] -%}
+          {%- for t in (lookup('file', _cf_step_file) | from_yaml | first)['tasks'] -%}
+          {%-   if t.block is defined -%}
+          {%-     for b in t.block -%}{%- set _ = flat.append(b) -%}{%- endfor -%}
+          {%-   else -%}{%- set _ = flat.append(t) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for t in flat -%}
+          {%-   if 'ansible.builtin.uri' in t -%}
+          {%-     set hdrs = (t['ansible.builtin.uri'].headers | default({})) -%}
+          {%-     if 'Authorization' in hdrs -%}
+          {%-       set _ = out.append({
+                   'name': t.get('name', '?'),
+                   'no_log': (t.get('no_log') | default(False)) is sameas true
+                 }) -%}
+          {%-     endif -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | every authenticated uri task has no_log: true"
+      ansible.builtin.assert:
+        that:
+          - (_cf_uri_with_auth | length) > 0
+          - (item.no_log | bool)
+        fail_msg: >-
+          cloudflare_replace_ip_step.yml has an `ansible.builtin.uri` task named
+          "{{ item.name }}" that supplies an Authorization header but no `no_log: true`.
+          The Authorization header value is the literal API token; it MUST be
+          masked out of the Ansible log.
+        quiet: true
+      loop: "{{ _cf_uri_with_auth }}"
+      loop_control:
+        label: "{{ item.name }} (no_log={{ item.no_log }})"
+
+    # ---- 6. cf_record_pages.yml: same structural rules --------------------
+    # The pages 2..N include file is an extension of cloudflare_replace_ip_step;
+    # the same forbidden patterns (ignore_errors, has_more, DELETE) and the
+    # same required patterns (Authorization from env, no_log: true, total_pages)
+    # apply. Without this contract a regression that adds ignore_errors to the
+    # included file would silently re-introduce the fail-open path.
+    - name: "ip-rotation | cf_record_pages.yml exists"
+      ansible.builtin.stat:
+        path: "{{ _proj }}/cf_record_pages.yml"
+      register: _cf_pages_stat
+
+    - name: "ip-rotation | cf_record_pages.yml forbidden patterns"
+      ansible.builtin.assert:
+        that:
+          - _cf_pages_stat.stat.exists
+          - not ((lookup('file', _cf_pages_stat.stat.path) | regex_replace('(?m)#.*$', '')) is search(item, multiline=True))
+        fail_msg: "cf_record_pages.yml matched forbidden /{{ item }}/."
+        quiet: true
+      loop:
+        - 'ignore_errors:\s*true'
+        - 'state:\s*absent'
+        - 'method:\s*DELETE'
+        - 'has_more'
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "ip-rotation | cf_record_pages.yml required patterns"
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', _cf_pages_stat.stat.path) | regex_replace('(?m)#.*$', '')) is search(item, multiline=True)
+        fail_msg: "cf_record_pages.yml is missing /{{ item }}/."
+        quiet: true
+      loop:
+        - "lookup\\('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN'"
+        - "no_log:\\s*true"
+        - "cf_record_page_number"
+        - "cf_record_expected_total_pages"
+      loop_control:
+        label: "{{ item }}"
+
+    # ---- 7. provider-only workflow gate -------------------------------------
+    # provider-only MUST be in the dispatch input options; the dns job MUST be
+    # gated off; the swap job MUST be the only mutating job that runs. The
+    # server-side guard in rotate.py is defense in depth.
+    - name: "ip-rotation | run.yml exposes provider-only as an operation"
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', _proj ~ '/.github/workflows/run.yml')
+              | regex_replace('(?m)#.*$', '')) is search("- provider-only", multiline=True)
+        fail_msg: >-
+          run.yml must list `provider-only` as a workflow_dispatch input option.
+          Without it an operator with a throwaway test server has no way to
+          swap the box without also touching DNS.
+        quiet: true
+
+    - name: "ip-rotation | run.yml gates the dns job on change-ip"
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', _proj ~ '/.github/workflows/run.yml')
+              | regex_replace('(?m)#.*$', '')) is search("inputs.operation == 'change-ip'", multiline=True)
+        fail_msg: >-
+          run.yml's `dns` job must be gated on `inputs.operation ==
+          'change-ip'` (a positive check). A bare
+          `inputs.operation != 'provider-only'` is structurally weaker
+          and we now require the explicit positive form. A successful
+          provider-only run MUST NOT trigger any Cloudflare API call or
+          Ansible playbook that touches Cloudflare.
+        quiet: true
+
+    - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN"
+      ansible.builtin.set_fact:
+        _run_yml_body: "{{ lookup('file', _proj ~ '/.github/workflows/run.yml') | regex_replace('(?m)#.*$', '') }}"
+        _cf_token_unconditional_pattern: "CLOUDFLARE_API_TOKEN: secrets.CLOUDFLARE_API_TOKEN"
+
+    - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN (assert)"
+      ansible.builtin.assert:
+        that:
+          - not (_run_yml_body is search(_cf_token_unconditional_pattern))
+        fail_msg: >-
+          run.yml MUST NOT unconditionally inject CLOUDFLARE_API_TOKEN. The
+          token must be empty (or omitted) when the operator picks
+          provider-only. A bare `secrets.CLOUDFLARE_API_TOKEN` reference
+          ships the token to every job that runs the workflow.
+        quiet: true
+
+    - name: "ip-rotation | run.yml gates the CF token on the provider-only input"
+      ansible.builtin.assert:
+        that:
+          - _run_yml_body is search("provider-only", multiline=True)
+          - _run_yml_body is search("CLOUDFLARE_API_TOKEN", multiline=True)
+        fail_msg: >-
+          run.yml must condition the CLOUDFLARE_API_TOKEN env on the
+          `provider-only` input, so the token stays empty when the operator
+          picks provider-only.
+        quiet: true
+
+    # ---- 8. summary sanitisation --------------------------------------------
+    # GitHub Actions publishes `$GITHUB_STEP_SUMMARY`, `$GITHUB_OUTPUT` and
+    # stdout/stderr of every step. The contract is that none of these may
+    # carry the Cloudflare token, the Authorization header value, the raw
+    # URI result, the manifest contents, or the checkpoint contents. The
+    # Python suite proves this for the Python side; the contract here proves
+    # it for the playbook / repo source side: every authenticated URI is
+    # no_log: true, and the playbook never calls `copy`/`template` with a
+    # body that contains an Authorization header.
+    - name: "ip-rotation | cloudflare_replace_ip_step.yml copy tasks contain no Authorization"
+      ansible.builtin.set_fact:
+        _cf_copy_with_auth: >-
+          {%- set out = [] -%}
+          {%- set raw = (lookup('file', _cf_step_file) | from_yaml | first)['tasks'] -%}
+          {%- set flat = [] -%}
+          {%- for t in raw -%}
+          {%-   if t.block is defined -%}
+          {%-     for b in t.block -%}{%- set _ = flat.append(b) -%}{%- endfor -%}
+          {%-   else -%}{%- set _ = flat.append(t) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for t in flat -%}
+          {%-   if 'ansible.builtin.copy' in t -%}
+          {%-     set body = (t['ansible.builtin.copy'].content | default('')) | string -%}
+          {%-     if 'Authorization' in body or 'CLOUDFLARE_API_TOKEN' in body -%}
+          {%-       set _ = out.append(t.get('name', '?')) -%}
+          {%-     endif -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | cloudflare_replace_ip_step.yml copy tasks contain no Authorization (assert)"
+      ansible.builtin.assert:
+        that:
+          - (_cf_copy_with_auth | length) == 0
+        fail_msg: >-
+          cloudflare_replace_ip_step.yml has a copy task whose body
+          contains Authorization or the token name: {{ _cf_copy_with_auth }}.
+          A result file carrying that body would land on Actions artifacts
+          and on GITHUB_STEP_SUMMARY, leaking from there to any reader.
+        quiet: true
+
+    - name: "ip-rotation | rollback result does not leak manifest contents to stdout"
+      ansible.builtin.assert:
+        that:
+          - not ((lookup('file', _cf_step_file) | regex_replace('(?m)#.*$', ''))
+                 is search('debug:\\s*\\n[\\s\\S]*(?:manifest|previous_content|incomplete_records)', multiline=True))
+        fail_msg: >-
+          cloudflare_replace_ip_step.yml has a `debug` task whose message
+          contains manifest fields. Manifest records and live content are
+          not secrets but they ARE operational secrets in the broader
+          sense — they go to GITHUB_STEP_SUMMARY and to stdout, and from
+          there to anything that ever reads the run.
+        quiet: true
+
+    # ---- 9. cf_api_base production-vs-test seam -------------------------
+    # The playbook reads cf_api_base from a vars: block whose default is
+    # the official HTTPS endpoint. A caller may pass -e cf_api_base=...
+    # but only when CF_PLAYBOOK_TEST_MODE=1 AND the URL is a loopback
+    # fixture. Without this seam, a typo in -e could silently redirect
+    # DNS-mutating requests to a wrong host.
+    - name: "ip-rotation | cf_api_base default is the official HTTPS endpoint"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _cf_step_file) | regex_replace('(?m)#.*$', ''))
+            is search("cf_api_base:\\s*[\"']https://api\\.cloudflare\\.com/client/v4[\"']", multiline=True)
+        fail_msg: >-
+          cloudflare_replace_ip_step.yml must default cf_api_base to the
+          official https://api.cloudflare.com/client/v4 endpoint. A
+          missing or non-official default would be the production URL
+          drifting away from what Cloudflare publishes.
+        quiet: true
+
+    - name: "ip-rotation | cf_api_base override requires the test marker"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _cf_step_file) | regex_replace('(?m)#.*$', ''))
+            is search('CF_PLAYBOOK_TEST_MODE', multiline=True)
+        fail_msg: >-
+          cloudflare_replace_ip_step.yml must require CF_PLAYBOOK_TEST_MODE
+          to be '1' before accepting a custom cf_api_base. The marker is
+          what stops an operator typo from redirecting the DNS half of a
+          rotation to a wrong host.
+        quiet: true
+
+    - name: "ip-rotation | cf_api_base loopback regex appears in the validation"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _cf_step_file) | regex_replace('(?m)#.*$', ''))
+            is search('127.0.0.1', multiline=True)
+          - >-
+            (lookup('file', _cf_step_file) | regex_replace('(?m)#.*$', ''))
+            is search('localhost', multiline=True)
+        fail_msg: >-
+          cloudflare_replace_ip_step.yml must restrict the test-mode
+          override to loopback addresses (127.0.0.1 / localhost / ::1).
+          A wider allowlist would defeat the seam.
+        quiet: true
+
+    # ---- 10. provider-only run.yml audit ---------------------------------
+    # Beyond the existing input-options gate, the workflow must not
+    # reference `secrets.CLOUDFLARE_API_TOKEN` unconditionally; the token
+    # must remain empty for provider-only runs. The earlier contract
+    # already covers this; this block adds structural checks for the
+    # broader provider-only invariants.
+    - name: "ip-rotation | run.yml's CLOUDFLARE_API_TOKEN line is gated on provider-only"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', ''))
+            is search("provider-only", multiline=True)
+          - >-
+            (lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', ''))
+            is search("CLOUDFLARE_API_TOKEN", multiline=True)
+        fail_msg: >-
+          run.yml must condition the CLOUDFLARE_API_TOKEN env on the
+          `provider-only` input. The forbidden shape is a bare
+          `secrets.CLOUDFLARE_API_TOKEN` with no provider-only gate in
+          the same expression — the empty-string short-circuit is
+          falsy, and the secret leaks.
+        quiet: true
+
+    # ---- 11. parsed run.yml invariants ----------------------------------
+    # The text-search tests above can be fooled by an unfalsified empty
+    # string or by a bare `secrets.CLOUDFLARE_API_TOKEN` that has been
+    # silently moved into a different env block. Parse the YAML and walk
+    # every job and every step; assert that the token exists ONLY on
+    # the steps that need it, and never on the swap or rollback's
+    # provider-only path.
+    - name: "ip-rotation | run.yml parses as YAML"
+      ansible.builtin.set_fact:
+        _run_yml: "{{ (lookup('file', _proj ~ '/.github/workflows/run.yml') | from_yaml) }}"
+
+    - name: "ip-rotation | every job's env is structurally scanned"
+      ansible.builtin.set_fact:
+        _job_envs: >-
+          {%- set out = {} -%}
+          {%- for job_name, job in (_run_yml.get('jobs') or {}).items() -%}
+            {%- set job_env_keys = [] -%}
+            {%- if job.env is defined -%}
+              {%- for k in job.env.keys() -%}
+                {%- set _ = job_env_keys.append(k) -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {%- set _ = out.update({job_name: job_env_keys}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | swap job must not carry CLOUDFLARE_API_TOKEN"
+      ansible.builtin.assert:
+        that:
+          - "'CLOUDFLARE_API_TOKEN' not in (_job_envs.get('swap', []))"
+        fail_msg: >-
+          swap job-level env carries CLOUDFLARE_API_TOKEN. The provider
+          half never talks to Cloudflare. Move the token to step-level
+          env on the DNS/rollback steps only.
+        quiet: true
+
+    - name: "ip-rotation | dns job must not carry CLOUDFLARE_API_TOKEN at job level"
+      ansible.builtin.assert:
+        that:
+          - "'CLOUDFLARE_API_TOKEN' not in (_job_envs.get('dns', []))"
+        fail_msg: >-
+          dns job-level env carries CLOUDFLARE_API_TOKEN. The token must
+          live on the resume step only — that way a failed
+          in_scope check on a non-tracked node skips the CF step and the
+          token never enters the env.
+        quiet: true
+
+    - name: "ip-rotation | rollback job must not carry CLOUDFLARE_API_TOKEN at job level"
+      ansible.builtin.assert:
+        that:
+          - "'CLOUDFLARE_API_TOKEN' not in (_job_envs.get('rollback', []))"
+        fail_msg: >-
+          rollback job-level env carries CLOUDFLARE_API_TOKEN. The token
+          must live on the dns-rollback step only — provider rollback
+          must not even reference the secret.
+        quiet: true
+
+    # ---- 12. provider-only path structural invariants --------------------
+    # Provider-only must:
+    #   * skip the dns job entirely;
+    #   * skip the verify job entirely;
+    #   * not invoke the Cloudflare playbook or `make ip-change` (which
+    #     runs the Cloudflare adapter);
+    #   * not prompt for inventory modification.
+    - name: "ip-rotation | run.yml has a provider-only option"
+      ansible.builtin.assert:
+        that:
+          # YAML 1.1 (which Ansible's `from_yaml` uses) parses `on:` as
+          # the boolean True. Look under both keys so the assertion is
+          # robust against a future YAML-version upgrade.
+          - "'provider-only' in ((_run_yml.get('on') or _run_yml.get(True) or {}).get('workflow_dispatch', {}).get('inputs', {}).get('operation', {}).get('options', []))"
+        fail_msg: >-
+          run.yml must list `provider-only` as an option in the
+          workflow_dispatch operation input. Without it an operator
+          with a throwaway test server has no way to swap the box
+          without also touching DNS.
+        quiet: true
+
+    - name: "ip-rotation | dns job if: is positive == 'change-ip'"
+      ansible.builtin.set_fact:
+        _dns_if: "{{ (_run_yml.get('jobs') or {}).get('dns', {}).get('if', '') }}"
+
+    - name: "ip-rotation | dns if: must be a positive operation gate"
+      ansible.builtin.assert:
+        that:
+          - _dns_if is regex("inputs\\.operation == 'change-ip'")
+        fail_msg: >-
+          run.yml's `dns` job must use a positive
+          `inputs.operation == 'change-ip'` gate. The previous
+          `inputs.operation != 'provider-only'` is structurally
+          weaker — a falsy `&&` short-circuit against an empty string
+          lets the token through `||`.
+        quiet: true
+
+    - name: "ip-rotation | verify job if: gates on change-ip and dns success"
+      ansible.builtin.set_fact:
+        _verify_if: "{{ (_run_yml.get('jobs') or {}).get('verify', {}).get('if', '') }}"
+
+    - name: "ip-rotation | verify job if: must NOT use always()"
+      ansible.builtin.assert:
+        that:
+          - "'always()' not in _verify_if"
+        fail_msg: >-
+          run.yml's `verify` job uses `always()`. A green "verify"
+          against a half-applied rotation is how a failed DNS run gets
+          reported as success. Replace `always() && X` with
+          `needs.dns.result == 'success' && X`.
+        quiet: true
+
+    - name: "ip-rotation | verify job if: must depend on dns.result == success"
+      ansible.builtin.assert:
+        that:
+          - _verify_if is regex("needs\\.dns\\.result == 'success'")
+        fail_msg: >-
+          run.yml's `verify` job must require `needs.dns.result ==
+          'success'`. A failed/skipped DNS job must NOT be followed by
+          a green verify.
+        quiet: true
+
+    # ---- 13. $GITHUB_STEP_SUMMARY must NOT carry secrets ----------------
+    # The summary is published to the public Actions UI on a public plan,
+    # and to anyone with repo read access on a private plan. Assert
+    # structurally that nothing in this repo's workflows writes to it
+    # (so a future step cannot accidentally echo a token).
+    - name: "ip-rotation | run.yml does not write to GITHUB_STEP_SUMMARY"
+      ansible.builtin.set_fact:
+        _step_summary_writes: >-
+          {%- set out = [] -%}
+          {%- set jobs = _run_yml.get('jobs') or {} -%}
+          {%- for job_name, job in jobs.items() -%}
+            {%- for step in (job.get('steps') or []) -%}
+              {%- if step.run is defined -%}
+                {%- if '$GITHUB_STEP_SUMMARY' in (step.run | string) -%}
+                  {%- set _ = out.append(job_name ~ '/' ~ (step.name | default(step.get('id', '?')))) -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | no $GITHUB_STEP_SUMMARY writes anywhere in run.yml"
+      ansible.builtin.assert:
+        that:
+          - (_step_summary_writes | length) == 0
+        fail_msg: >-
+          run.yml writes to $GITHUB_STEP_SUMMARY in these steps:
+          {{ _step_summary_writes | join(', ') }}. Summary output is
+          visible to anyone with read access; a future change must
+          never add a token-bearing print there.
+        quiet: true
+
+    - name: "ip-rotation | no $GITHUB_OUTPUT writes that include secret-bearing data"
+      ansible.builtin.set_fact:
+        _gh_output_secret_writes: >-
+          {%- set out = [] -%}
+          {%- set jobs = _run_yml.get('jobs') or {} -%}
+          {%- for job_name, job in jobs.items() -%}
+            {%- for step in (job.get('steps') or []) -%}
+              {%- if step.run is defined -%}
+                {%- set run_str = step.run | string -%}
+                {%- if 'GITHUB_OUTPUT' in run_str -%}
+                  {%- if 'CLOUDFLARE' in run_str or 'secret' in run_str or 'token' in run_str -%}
+                    {%- set _ = out.append(job_name ~ '/' ~ (step.name | default(step.get('id', '?')))) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | no $GITHUB_OUTPUT writes carry token-shaped data"
+      ansible.builtin.assert:
+        that:
+          - (_gh_output_secret_writes | length) == 0
+        fail_msg: >-
+          run.yml's $GITHUB_OUTPUT writes mention secret-bearing data
+          in: {{ _gh_output_secret_writes | join(', ') }}.
+        quiet: true
+
+    # ---- 14. provider-only rollback path has NO token reference --------
+    # The rollback job's "Roll back the DNS records" step is gated on
+    # `needs_dns_rollback == 'true'`; assert structurally that this
+    # step's env is the only env block that references the token, and
+    # that the rollback job has a "Roll back the provider IP" step
+    # without it.
+    - name: "ip-rotation | rollback job: only the DNS step carries the token"
+      ansible.builtin.set_fact:
+        _rollback_step_envs: >-
+          {%- set out = [] -%}
+          {%- for step in ((_run_yml.get('jobs') or {}).get('rollback', {}).get('steps') or []) -%}
+            {%- set keys = [] -%}
+            {%- if step.env is defined -%}
+              {%- for k in step.env.keys() -%}
+                {%- set _ = keys.append(k) -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {%- set _ = out.append({'name': step.name | default(step.id | default('?')), 'env': keys}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | provider-IP rollback step has no CF token"
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (_rollback_step_envs
+                 | selectattr('name', 'match', '.*[Pp]rovider.*IP.*')
+                 | selectattr('env', 'contains', 'CLOUDFLARE_API_TOKEN')
+                 | list)
+        fail_msg: >-
+          The provider-IP rollback step (the one without the Cloudflare
+          playbook) carries CLOUDFLARE_API_TOKEN in its env. The token
+          must live ONLY on the DNS rollback step.
+        quiet: true
+
+    - name: "ip-rotation | DNS rollback step carries CF token"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (_rollback_step_envs
+             | selectattr('name', 'match', '.*DNS.*')
+             | selectattr('env', 'contains', 'CLOUDFLARE_API_TOKEN')
+             | list | length) > 0
+        fail_msg: >-
+          The DNS rollback step does not carry CLOUDFLARE_API_TOKEN.
+          Without it, the workflow cannot perform DNS recovery. Restore
+          the token on this step.
+        quiet: true

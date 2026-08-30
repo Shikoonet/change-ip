@@ -77,6 +77,21 @@ old_ip:
   # and RETAINED — it is still billed, and removing it is your call.
   retention: keep
 
+cloudflare:
+  # All A records this rotation is allowed to move, by FQDN. Exactly the
+  # ones the preflight discovers in the MANIFEST; apply and rollback touch
+  # nothing else. Empty allow-list is a stop, not a pass.
+  allowed_records:
+    - "Hetzner-DE.tinooer.top"
+    - "nurture.miragerunner.com"
+  # expected_record_count guards the discover step. If Cloudflare returns
+  # fewer matches, the run aborts BEFORE any provider mutation.
+  expected_record_count: 8
+  # mode: provider_only skips the DNS half entirely and pauses at
+  # connectivity_ok. For throwaway test servers that are not in the DNS
+  # allow-list. Anything else is a typo and validate_config rejects it.
+  mode: null   # full run (or "provider_only" to skip DNS)
+
 health:
   ssh_port: 22
 

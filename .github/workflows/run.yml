@@ -88,12 +88,13 @@ on:
         options:
           - plan
           - change-ip
+          - provider-only
           - rollback
       server_id:
         description: 'Server id — the number in the Hetzner console URL. Must equal server.id in the config.'
         required: true
       server_ip:
-        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on.'
+        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip.'
         required: true
 
 concurrency:
@@ -101,6 +102,22 @@ concurrency:
   # change-ip it is rolling back is two runs sharing state/.
   group: rotate
   cancel-in-progress: false
+
+# provider_only is a structural firewall: when the operator picks
+# `provider-only` (a throwaway test server, or any case where DNS is
+# handled out of band), this workflow MUST reach `connectivity_ok` and
+# stop. It MUST NOT invoke `ip_change`, MUST NOT prompt for the
+# inventory edit, MUST NOT run the Cloudflare playbook, and MUST NOT
+# receive the Cloudflare token. The defense-in-depth server-side guard
+# in rotate.py also enforces this — refusing the rotation up-front
+# rather than half-completing it.
+#
+# The provider-rollback workflow path stays available: an operator who
+# wants the old address back can still dispatch `rollback`. That
+# operation has TWO steps: the provider half (no Cloudflare token) and,
+# if DNS recovery is required, the Cloudflare half (token present only
+# on that step). Provider-only never references the Cloudflare token at
+# any job or step.
 
 # The default GITHUB_TOKEN has no scope on artifacts. The rollback job reads
 # rotation-state artifacts from earlier runs; granting only `actions: read` and
@@ -142,10 +159,10 @@ jobs:
       - run: pip install --quiet ansible-core ansible-lint yamllint
         # --syntax-check resolves module names, so the collection has to be here.
       - run: ansible-galaxy collection install --force 'hetzner.hcloud:>=7.0.0,<8.0.0'
-      - run: ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
-      - run: python3 -m compileall -q rotate.py providers.py ansible_adapter.py
-      - run: yamllint hcloud_step.yml tests/contract.yml rotation.example.yml || true
-      - run: ansible-lint hcloud_step.yml || true
+      - run: ansible-playbook --syntax-check hcloud_step.yml cloudflare_replace_ip_step.yml tests/contract.yml
+      - run: python3 -m compileall -q rotate.py providers.py ansible_adapter.py cloudflare_adapter.py
+      - run: yamllint hcloud_step.yml cloudflare_replace_ip_step.yml tests/contract.yml rotation.example.yml || true
+      - run: ansible-lint hcloud_step.yml cloudflare_replace_ip_step.yml || true
 
   # ===========================================================================
   # operation: change-ip
@@ -177,9 +194,21 @@ jobs:
   #    asks a human to edit the inventory.
   #
   #    ⚠ Between the detach and the start the node has NO public address.
+  #
+  #    Provider-only path: same job, no DNS downstream. The Cloudflare
+  #    playbook is never invoked; the `dns` job below is gated off by its
+  #    own `if:` on `inputs.operation != 'provider-only'`.
+  #
+  #    SECRET SCOPE: the job-level env carries ONLY HCLOUD_TOKEN. The
+  #    CLOUDFLARE_API_TOKEN env is defined at the step that actually needs
+  #    it (the dns job, or the rollback DNS step) and is NEVER inherited
+  #    by the swap job or by provider-only runs. A bare
+  #    `${{ condition && '' || secret }}` ternary is FORBIDDEN — empty
+  #    strings are falsy in GitHub Actions expressions, and the secret
+  #    leaks through `||`.
   swap:
     name: 2 · swap the address (node is offline in here)
-    if: inputs.operation == 'change-ip'
+    if: inputs.operation == 'change-ip' || inputs.operation == 'provider-only'
     runs-on: ubuntu-latest
     environment: hetzner-production
     outputs:
@@ -189,6 +218,9 @@ jobs:
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       GH_TOKEN: ${{ github.token }}
+      # CLOUDFLARE_API_TOKEN is intentionally absent here. The provider
+      # half never talks to Cloudflare; the token lives on the dns job
+      # only.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -196,6 +228,11 @@ jobs:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
           expect_ipv4: "${{ inputs.server_ip }}"
       - id: run
+        env:
+          # The provider-only flag is a literal '1' or '0' string, never
+          # an empty string — the previous `${{ cond && '1' || '' }}`
+          # pattern is forbidden by the same expression-falsy rule.
+          ROTATION_PROVIDER_ONLY: ${{ inputs.operation == 'provider-only' && '1' || '0' }}
         run: |
           set +e
           python3 rotate.py apply --config rotation.yml \
@@ -231,6 +268,7 @@ jobs:
   dns:
     name: 3 · move DNS (gated by the inventory commit)
     needs: [swap]
+    if: inputs.operation == 'change-ip'  # explicit, no falsy-ternary negation
     runs-on: ubuntu-latest
     environment: hetzner-production
     env:
@@ -239,6 +277,10 @@ jobs:
       NEW_IP: ${{ needs.swap.outputs.new_ip }}
       ALIAS: ${{ needs.swap.outputs.alias }}
       ANSIBLE_HOST_KEY_CHECKING: 'False'
+      # CLOUDFLARE_API_TOKEN is NOT in this job-level env. It is set ONLY
+      # on the step that actually invokes the Cloudflare playbook. That
+      # step's `if:` already guarantees the token never reaches a run that
+      # did not pass the inventory gate.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -273,6 +315,15 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          # The Cloudflare token lives ONLY on this step. It is present
+          # in the env only when:
+          #   1. inputs.operation == 'change-ip' (the job-level `if:`
+          #      gates off provider-only entirely)
+          #   2. AND the in_scope step confirmed this is a real rotation
+          #      (the step-level `if:` gates off throwaway test servers)
+          # Both gates are positive (`==`) so a broken token never
+          # reaches the env via a falsy short-circuit.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_ed25519
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
@@ -285,9 +336,14 @@ jobs:
         with: {name: rotation-state-final, path: state/, retention-days: 30}
 
   # 4. verify — the checkpoint says done, and says so on its own terms.
+  # verify is gated on (a) operation == change-ip (NOT provider-only, NOT
+  # a failed/skipped DNS) and (b) dns succeeded. Running after a failed
+  # dns with `always()` would have meant a green "verify" against a
+  # half-applied rotation; the gate below fixes that.
   verify:
     name: 4 · verify the checkpoint says done
     needs: [swap, dns]
+    if: inputs.operation == 'change-ip' && needs.dns.result == 'success'
     runs-on: ubuntu-latest
     # No mutating access — just reads the artifact and the config. Sits on
     # hetzner-plan because that's where ROTATION_CONFIG lives; without an
@@ -342,6 +398,11 @@ jobs:
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       GH_TOKEN: ${{ github.token }}
+      # CLOUDFLARE_API_TOKEN is intentionally absent at the job level.
+      # The DNS rollback step below carries it ONLY when the checkpoint
+      # indicates DNS recovery is required. A provider rollback that
+      # never touched Cloudflare skips that step entirely, and the
+      # token never enters this process.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -424,10 +485,44 @@ jobs:
           print(f"txid={txid}")
           EOF
       - run: python3 rotate.py status --config rotation.yml --txid "${{ steps.cp.outputs.txid }}"
-      - run: |
+      # Provider half only — no Cloudflare token. The DNS step below is
+      # gated on the checkpoint showing DNS recovery is required.
+      - name: Roll back the provider IP
+        run: |
           python3 rotate.py rollback --config rotation.yml \
             --txid "${{ steps.cp.outputs.txid }}" \
-            --confirm-server-id "${{ inputs.server_id }}"
+            --confirm-server-id "${{ inputs.server_id }}" \
+            --no-dns-rollback
+      # Decide from the checkpoint whether DNS recovery is required. This
+      # is a positive check (==) on a real field; no falsy-ternary trick.
+      - name: Decide whether DNS rollback is required
+        id: need_dns
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json
+          files = sorted(glob.glob("state/*.json"), key=os.path.getmtime)
+          cp = json.load(open(files[-1]))
+          needs_dns = (
+              cp.get("cloudflare_apply_started") is not None
+              or cp.get("cloudflare_apply") is not None
+              or ((cp.get("ansible") or {}).get("rc") == 0)
+          )
+          print(f"needs_dns_rollback={'true' if needs_dns else 'false'}")
+          EOF
+      # The DNS rollback step. CLOUDFLARE_API_TOKEN lives ONLY here.
+      # The gate is a positive == on the previous step's output. When
+      # the previous step set needs_dns_rollback=false, this step is
+      # skipped, the token is never exported, and the env block is
+      # never evaluated against `secrets.CLOUDFLARE_API_TOKEN`.
+      - name: Roll back the DNS records
+        if: steps.need_dns.outputs.needs_dns_rollback == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python3 rotate.py rollback --config rotation.yml \
+            --txid "${{ steps.cp.outputs.txid }}" \
+            --confirm-server-id "${{ inputs.server_id }}" \
+            --dns-rollback-only
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state-rolledback, path: state/, retention-days: 30}
