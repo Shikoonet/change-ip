@@ -158,6 +158,32 @@ operator ادامه می‌دهد با خواندن checkpoint و پاک‌کر�
 **قاعده‌ی عمومی: وقتی یک گیت انسانی باید از اتوماسیون جان سالم به در ببرد، prompt را با چکی
 جایگزین کنید که اتوماسیون بتواند رویش شکست بخورد. هرگز با یک فرض.**
 
+## سکرت‌ها و environmentها (قبل از اولین dispatch)
+
+سکرت‌های workflow در `.github/workflows/run.yml` مستند شده‌اند؛ اینجا فقط چک‌لیست
+است برای قبل از اولین `workflow_dispatch` زنده.
+
+| نام | scope | استفاده |
+|---|---|---|
+| `HCLOUD_TOKEN` | env `hetzner-plan`، `hetzner-production` | فراخوانی hcloud در plan / swap / dns / verify / rollback |
+| `ROTATION_CONFIG` | env `hetzner-plan`، `hetzner-production` | محتوای `rotation.yml` (paste **بدون** `---` ابتدایی؛ Actions هر خط را مستقل ماسک می‌کند) |
+| `SHIKOONET_REPO` | repo | URL با توکن فقط‌خواندنی، clone در جاب `dns` |
+| `SSH_PRIVATE_KEY` | repo | فقط استپ `Resume the rotation in shikoonet` (جاب `dns`) |
+| `ANSIBLE_VAULT_PASSWORD` | repo | vault شیکونِت، همان استپ |
+| `CLOUDFLARE_API_TOKEN` | repo | فقط استپ‌هایی که playbook Cloudflare را اجرا می‌کنند؛ گیت مثبت `==` مانع نشت توکن به provider-only می‌شود |
+
+environmentها:
+- `hetzner-plan` — جاب‌های `plan` و `verify` (فقط‌خواندنی)
+- `hetzner-production` — جاب‌های `swap`، `dns`، `rollback` با required reviewer
+
+```bash
+gh secret list --repo Shikoonet/change-ip            # 5 سکرت repo-level
+gh api repos/Shikoonet/change-ip/environments        # 2 environment با reviewer
+```
+
+`HCLOUD_TOKEN` و `ROTATION_CONFIG` روی **environment** باشند نه روی repo — یک سکرت
+repo-wide برای هر جابی روی هر برنچی قابل‌خواندن است. ماسک یک مرز نیست.
+
 ## قراردادها
 
 - هر رفتار جدید یک تست در `tests/test_rotation.py` می‌گیرد. `FakeHcloud` جای
