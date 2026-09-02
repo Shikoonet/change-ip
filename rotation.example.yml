@@ -22,16 +22,70 @@ provider: hcloud
 # Leave empty to skip the check (only reasonable before the very first plan).
 project_fingerprint: ""
 
+# === Provider selection =================================================
+# Two providers ship in this repo:
+#
+#   provider: hcloud        — Hetzner Cloud. The original flow. stop/detach/
+#                             attach/start around a server power-cycle.
+#                             `old_ip.retention` keeps the burned address;
+#                             nothing is deleted by this tool.
+#
+#   provider: dataforest    — DataForest Seed. Two-phase cutover: the Seed
+#                             keeps both addresses throughout, NEW_IP is
+#                             bound at runtime + persistently, and OLD_IP
+#                             release is a separate explicit `finalize`
+#                             command (point of no return — DataForest
+#                             does not guarantee reacquisition of a
+#                             released IPv4).
+#
+# The state machine, the checkpoint format, the Cloudflare half, and the
+# `make ip-change HOST=<alias>` half are shared. The provider-specific
+# keys below are required when provider=dataforest and ignored otherwise.
+# =============================================================================
+
 server:
-  # The IMMUTABLE numeric id, read once from the Hetzner Cloud console
-  # (Servers -> the server -> the number in the URL). Not the name: a name can
-  # be changed by anyone with console access, an id cannot.
+  # For provider=hcloud, the IMMUTABLE numeric id, read once from the
+  # Hetzner Cloud console (Servers -> the server -> the number in the URL).
+  # Not the name: a name can be changed by anyone with console access, an
+  # id cannot.
+  #
+  # For provider=dataforest, the IMMUTABLE Seed UUID. Display names are
+  # not used as identity; if the Seed's display name does not match
+  # `seed.expected_name` the run stops before any mutation.
   id: 0
-  # What a fresh read must say before ANY mutation. All four are compared
-  # before every mutating step, not just at the start.
+  # What a fresh read must say before ANY mutation. The id is the immuta-
+  # ble identity; the expected_* values are what every identity assert
+  # compares against.
   expected_name: "Hetzner-DE"
   expected_ipv4: "203.0.113.10"
   expected_location: "nbg1"
+
+# DataForest-specific section. Required when provider=dataforest.
+seed:
+  expected_name: "seed-default"
+  expected_location: "fra1"
+  # Optional. If present, must match the Seed's project.
+  expected_project: "default"
+  # Any address on the Seed beyond OLD_IP that is allowed without
+  # failing preflight. Empty by default — a third address is a stop.
+  allow_extra_addresses: []
+
+# Guest network configuration. Required when provider=dataforest.
+guest:
+  # One of: netplan, systemd-networkd, networkmanager, ifupdown.
+  # Anything else is fail-closed.
+  network_manager: "netplan"
+  # The primary interface on the Seed. Strict-validated; no shell injection.
+  interface: "eth0"
+  # Regex the SSH host key returned by `ssh-keyscan NEW_IP` must match.
+  # The pattern is matched against the full keyscan stdout.
+  expected_host_key_pattern: "^[^ ]+ ssh-ed25519"
+  # Optional explicit gateway. Default: derive from OLD_IP's existing
+  # ipv4 entry on the Seed. Refuse if neither is set.
+  gateway: ""
+  # TCP probes to run on NEW_IP after configure_guest. Each entry:
+  # {name: str, port: int, timeout: int (seconds)}
+  service_probes: []
 
 ansible:
   # The inventory alias. It is what `make ip-change HOST=<alias>` receives and
@@ -94,6 +148,20 @@ cloudflare:
 
 health:
   ssh_port: 22
+
+# Finalize configuration. Required when provider=dataforest; ignored
+# otherwise. `finalize` releases OLD_IP from the Seed — DataForest does
+# not guarantee reacquisition of a released address.
+finalize:
+  # Must be `true`. False means "I want the tool to silently fail rather
+  # than take a point-of-no-return action", which is not what the
+  # explicit `finalize` subcommand is for.
+  acknowledge_no_reacquire: true
+  # PTR policy at finalize time. DataForest exposes PTR metadata but
+  # does not document an API to set a replacement PTR. The default is
+  # `require_match`: if OLD_IP has a PTR and NEW_IP does not, finalize
+  # refuses. `allow_no_ptr` accepts NEW_IP without a PTR.
+  ptr_policy: "require_match"
 
 # Checkpoints, relative to this file. Gitignored except for .gitkeep.
 state_dir: "state"

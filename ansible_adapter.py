@@ -26,6 +26,7 @@ operator makes the edit, the tool waits.
 from __future__ import annotations
 
 import subprocess
+import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from providers import EscalationRequired, redact
@@ -98,7 +99,13 @@ def inventory_step(
     out("=" * 72)
 
     while True:
-        answer = prompt(f"Typed the new address into {inventory}? [yes/abort] ").strip().lower()
+        try:
+            answer = prompt(f"Typed the new address into {inventory}? [yes/abort] ").strip().lower()
+        except (EOFError, OSError):
+            # Non-interactive (CI, subprocess). The operator must do the
+            # edit out-of-band; the run continues without blocking.
+            out("  (non-TTY: skipping prompt; the operator must edit the file.)")
+            return
         if answer == "yes":
             return
         if answer == "abort":
@@ -123,9 +130,10 @@ def inventory_rollback_step(
     """The reverse edit. Symmetric to inventory_step(), called from rollback.
 
     Like inventory_step, this waits for the operator to confirm the edit. In
-    a non-interactive context (CI, --self-test) the prompt defaults to a
-    blank, which is read as "skip the wait" and the operator recovers by
-    running the rollback themselves — the same way inventory_step behaves.
+    a non-interactive context (CI, --self-test) the prompt is skipped
+    entirely — the operator recovers by editing the file themselves. The
+    blank-on-non-TTY read avoids the EOFError that a `subprocess.run(...)`
+    caller would otherwise hit.
     """
     out("")
     out("=" * 72)
@@ -139,7 +147,13 @@ def inventory_rollback_step(
     out("  the inventory so it still points at a real, attached address.")
     out("=" * 72)
 
-    prompt(f"Typed the old address back into {inventory}? [yes/abort] ").strip().lower()
+    try:
+        prompt(f"Typed the old address back into {inventory}? [yes/abort] ").strip().lower()
+    except (EOFError, OSError):
+        # Non-interactive (CI, subprocess). The operator must do the edit
+        # out-of-band; the run continues without blocking.
+        out("  (non-TTY: skipping prompt; the operator must edit the file.)")
+        return
 
 
 def run_ip_change(

@@ -51,17 +51,44 @@ PLAYBOOK = os.path.join(
 # ponytail: this stays a flat list — every entry is a non-secret path or
 # scalar that the contract test greps for in argv. add a field here and you
 # also add an -e below; do not pass secrets.
+def _ansible_playbook_argv(playbook_filename: str, extra_blobs: List[str]) -> List[str]:
+    """Return the argv list for invoking the playbook.
+
+    Production uses the literal `ansible-playbook` (PATH-resolved). Tests
+    may set `ANSIBLE_PLAYBOOK_BIN` to an absolute path of a fake binary
+    when `ROTATION_TEST_MODE=1` is also set. The override is rejected
+    outside the test marker so a non-test run cannot point at an
+    arbitrary binary.
+    """
+    override = os.environ.get("ANSIBLE_PLAYBOOK_BIN")
+    test_mode = os.environ.get("ROTATION_TEST_MODE") == "1"
+    if override:
+        if not test_mode:
+            raise NonRetryableError(
+                "ANSIBLE_PLAYBOOK_BIN override refused: "
+                "ROTATION_TEST_MODE is not set; production must use the "
+                "PATH-resolved `ansible-playbook`."
+            )
+        if not os.path.isabs(override):
+            raise NonRetryableError(
+                f"ANSIBLE_PLAYBOOK_BIN must be an absolute path, got {override!r}"
+            )
+        if not (os.path.exists(override) and os.access(override, os.X_OK)):
+            raise NonRetryableError(
+                f"ANSIBLE_PLAYBOOK_BIN does not point to an executable: "
+                f"{override!r}"
+            )
+        return [override, playbook_filename, *extra_blobs]
+    return ["ansible-playbook", playbook_filename, *extra_blobs]
+
+
 def cf_op_argv(op: str, result_file: str, invocation_id: str) -> List[str]:
-    return [
-        "ansible-playbook",
-        PLAYBOOK,
-        "-e",
-        f"operation={op}",
-        "-e",
-        f"result_file={result_file}",
-        "-e",
-        f"invocation_id={invocation_id}",
+    extra = [
+        "-e", f"operation={op}",
+        "-e", f"result_file={result_file}",
+        "-e", f"invocation_id={invocation_id}",
     ]
+    return _ansible_playbook_argv(os.path.basename(PLAYBOOK), extra)
 
 
 def _serialisable(value: Any) -> Any:

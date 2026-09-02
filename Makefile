@@ -25,11 +25,14 @@ help:
 	@printf "$(YELLOW)server-ip-rotation$(RESET)\n"
 	@printf "  make test                          — offline suite + contract. No network, no cost\n"
 	@printf "  make test-cloudflare-playbook      — runs the real Cloudflare playbook against a local fake API server\n"
+	@printf "  make test-dataforest               — DataForest-only behavioural suite (fake HTTP server)\n"
+	@printf "  make test-provider-all             — both provider suites\n"
 	@printf "  make lint                          — ansible-lint + yamllint + syntax-check\n"
 	@printf "  make ip-rotate-plan                — read everything, change nothing\n"
 	@printf "  make ip-rotate-apply   SERVER_ID=n — do it. SERVER_ID must equal server.id in the config\n"
 	@printf "  make ip-rotate-swap    SERVER_ID=n — the provider half only, stops before the inventory edit\n"
 	@printf "  make ip-rotate-resume  TXID=t SERVER_ID=n — continue an interrupted or paused rotation\n"
+	@printf "  make ip-rotate-finalize TXID=t SERVER_ID=n — DataForest only: release OLD_IP (point of no return)\n"
 	@printf "  make ip-rotate-rollback TXID=t SERVER_ID=n — put the old address back\n"
 	@printf "  make ip-rotate-status  TXID=t      — print a checkpoint\n"
 	@printf "\n  HCLOUD_TOKEN must be exported for the rotation. It is never passed as an argument.\n"
@@ -54,13 +57,38 @@ test:
 test-cloudflare-playbook:
 	python3 -m unittest tests.test_cloudflare_playbook -v
 
+.PHONY: test-dataforest
+test-dataforest:
+	python3 -m unittest tests.test_dataforest -v
+
+.PHONY: test-dataforest-playbook
+test-dataforest-playbook:
+	# Actually invokes `ansible-playbook dataforest_step.yml` against a
+	# temp tree of fake system binaries — no /etc touched, no real
+	# network. Syntax-check alone is insufficient: this proves every
+	# manager path (netplan, systemd-networkd, networkmanager, ifupdown),
+	# every op (detect/configure/verify/remove/restore), and every
+	# failure mode the playbook can produce.
+	python3 -m unittest tests.test_dataforest_playbook -v
+
+.PHONY: test-provider-all
+# Provider-only suites. NOTE: this target deliberately does NOT
+# include `make test` — that target already discovers ALL test files
+# (test_dataforest + test_dataforest_playbook + contract + self-test)
+# under `python3 -m unittest discover -s tests -t .`. Running both
+# would double-count every suite. Final reports should state:
+#   unique discovered tests = the count from `make test`
+#   repeated executions      = `make test-provider-all` re-runs the two
+#                              provider suites a second time on top.
+test-provider-all: test-dataforest test-dataforest-playbook
+
 .PHONY: lint
 lint:
 	# Cloudflare workstream lint — the scope of THIS repo's active task.
 	# The Node-onboarding roles / monitoring-doctor.yml are NOT in scope
 	# for this lint run; they live under a separate lint target so a
 	# Milestone-A regression does not block the Cloudflare merge gate.
-	ansible-playbook --syntax-check hcloud_step.yml cloudflare_replace_ip_step.yml tests/contract.yml
+	ansible-playbook --syntax-check hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml tests/contract.yml
 	# cf_record_pages.yml is a task-list file, not a Play. The Play-level
 	# `--syntax-check` cannot consume it; yamllint + ansible-lint below
 	# cover the task shape. The contract tests prove the include flow
@@ -73,9 +101,9 @@ lint:
 	  echo "ansible-lint missing at $(LINT_BIN)/ansible-lint — run 'make lint-bootstrap' first."; \
 	  exit 127; \
 	fi
-	$(LINT_BIN)/yamllint hcloud_step.yml cloudflare_replace_ip_step.yml cf_record_pages.yml tests/contract.yml rotation.example.yml
-	$(LINT_BIN)/ansible-lint hcloud_step.yml cloudflare_replace_ip_step.yml
-	python3 -m compileall -q rotate.py providers.py ansible_adapter.py cloudflare_adapter.py
+	$(LINT_BIN)/yamllint -c .yamllint.yml hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml cf_record_pages.yml tests/contract.yml rotation.example.yml
+	$(LINT_BIN)/ansible-lint hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml
+	python3 -m compileall -q rotate.py providers.py ansible_adapter.py cloudflare_adapter.py dataforest_adapter.py dataforest_guest_adapter.py
 
 .PHONY: lint-bootstrap
 lint-bootstrap:
@@ -107,6 +135,12 @@ ip-rotate-swap: require-server-id
 .PHONY: ip-rotate-resume
 ip-rotate-resume: require-txid require-server-id
 	$(ROTATE) resume --config $(ROTATE_CONFIG) --txid $(TXID) --confirm-server-id $(SERVER_ID)
+
+# DataForest only: releases OLD_IP from the Seed. Point of no return —
+# DataForest does not guarantee reacquisition of a released IPv4.
+.PHONY: ip-rotate-finalize
+ip-rotate-finalize: require-txid require-server-id
+	$(ROTATE) finalize --config $(ROTATE_CONFIG) --txid $(TXID) --confirm-server-id $(SERVER_ID)
 
 .PHONY: ip-rotate-rollback
 ip-rotate-rollback: require-txid require-server-id

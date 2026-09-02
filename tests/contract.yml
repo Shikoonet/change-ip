@@ -957,3 +957,379 @@
           Without it, the workflow cannot perform DNS recovery. Restore
           the token on this step.
         quiet: true
+
+    # ---- 15. DataForest provider support ----------------------------------
+    # The repo now ships a parallel DataForest provider. These tests prove
+    # that the source files exist and carry the documented invariants, and
+    # that no DataForest secret / endpoint / forbidden pattern leaks into
+    # the workflow or the Hetzner-only playbooks.
+    - name: "ip-rotation | DataForest adapter files exist"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: _df_files
+      loop:
+        - "{{ _proj }}/dataforest_adapter.py"
+        - "{{ _proj }}/dataforest_guest_adapter.py"
+        - "{{ _proj }}/dataforest_step.yml"
+        - "{{ _proj }}/tests/fake_dataforest.py"
+        - "{{ _proj }}/tests/test_dataforest.py"
+      failed_when: not _df_files.stat.exists
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "ip-rotation | dataforest_step.yml has no ignore_errors / failed_when:false"
+      ansible.builtin.set_fact:
+        _df_step_body: "{{ lookup('file', _proj ~ '/dataforest_step.yml') | regex_replace('(?m)#.*$', '') }}"
+
+    - name: "ip-rotation | dataforest_step.yml forbidden patterns"
+      ansible.builtin.assert:
+        that:
+          - not (_df_step_body is search(item, multiline=True))
+        fail_msg: "dataforest_step.yml matched forbidden /{{ item }}/ — Rule One."
+        quiet: true
+      loop:
+        - 'state:\s*absent'
+        - 'ignore_errors:\s*true'
+        - 'failed_when:\s*false'
+        - 'method:\s*DELETE'
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "ip-rotation | dataforest_adapter.py token handling"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _proj ~ '/dataforest_adapter.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('DATAFOREST_API_TOKEN')
+        fail_msg: >-
+          dataforest_adapter.py must read the token from DATAFOREST_API_TOKEN.
+        quiet: true
+
+    - name: "ip-rotation | providers.py has DataForestProvider"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _proj ~ '/providers.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('class DataForestProvider')
+        fail_msg: >-
+          providers.py must define DataForestProvider.
+        quiet: true
+
+    - name: "ip-rotation | rotate.py has DataForest state machine + finalize"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _proj ~ '/rotate.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('STEPS_DATAFOREST')
+          - >-
+            (lookup('file', _proj ~ '/rotate.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('finalize')
+          - >-
+            (lookup('file', _proj ~ '/rotate.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('awaiting_finalize')
+        fail_msg: >-
+          rotate.py must define STEPS_DATAFOREST, an explicit finalize
+          subcommand, and an awaiting_finalize state label.
+        quiet: true
+
+    - name: "ip-rotation | DataForest endpoint seam defaults to production"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _proj ~ '/dataforest_adapter.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search("DEFAULT_BASE_URL = \"https://api\\.dataforest\\.net/api/v1/public\"")
+        fail_msg: >-
+          dataforest_adapter.py must default to the official
+          https://api.dataforest.net/api/v1/public endpoint.
+        quiet: true
+
+    - name: "ip-rotation | DataForest test-mode marker required"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (lookup('file', _proj ~ '/dataforest_adapter.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('TEST_MARKER_ENV')
+          - >-
+            (lookup('file', _proj ~ '/dataforest_adapter.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('127\\.0\\.0\\.1')
+          - >-
+            (lookup('file', _proj ~ '/dataforest_adapter.py')
+            | regex_replace('(?m)#.*$', ''))
+            is search('localhost')
+        fail_msg: >-
+          dataforest_adapter.py must require a TEST_MARKER_ENV export AND
+          a loopback host before accepting a non-production base URL.
+        quiet: true
+
+    - name: "ip-rotation | DataForest PAT never appears on Hetzner-only jobs"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.swap
+            .env.DATAFOREST_API_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.dns
+            .env.DATAFOREST_API_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.verify
+            .env.DATAFOREST_API_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.rollback
+            .env.DATAFOREST_API_TOKEN is not defined)
+        fail_msg: >-
+          Hetzner jobs (swap/dns/verify/rollback) MUST NOT carry
+          DATAFOREST_API_TOKEN. The DataForest secret lives ONLY on the
+          DataForest-only jobs (swap_dataforest / finalize /
+          rollback_dataforest).
+        quiet: true
+
+    - name: "ip-rotation | DataForest jobs never carry Cloudflare or Hetzner tokens"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.swap_dataforest
+            .env.HCLOUD_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.swap_dataforest
+            .env.CLOUDFLARE_API_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.finalize
+            .env.HCLOUD_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.finalize
+            .env.CLOUDFLARE_API_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.rollback_dataforest
+            .env.HCLOUD_TOKEN is not defined)
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.rollback_dataforest
+            .env.CLOUDFLARE_API_TOKEN is not defined)
+        fail_msg: >-
+          DataForest jobs MUST NOT carry HCLOUD_TOKEN or CLOUDFLARE_API_TOKEN.
+        quiet: true
+
+    - name: "ip-rotation | finalize command dispatches via rotate.py finalize"
+      ansible.builtin.assert:
+        that:
+          - >-
+            'rotate.py finalize' in (lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', ''))
+        fail_msg: >-
+          finalize job MUST invoke `python3 rotate.py finalize`.
+        quiet: true
+
+    - name: "ip-rotation | workflow_dispatch lists finalize + dataforest"
+      ansible.builtin.set_fact:
+        _run_yml: >-
+          {{ (lookup('file', _proj ~ '/.github/workflows/run.yml')
+          | regex_replace('(?m)#.*$', '') | from_yaml) }}
+        _run_on: "{{ _run_yml['on'] if 'on' in _run_yml else _run_yml[True] }}"
+
+    - name: "ip-rotation | workflow_dispatch.options include finalize and dataforest"
+      ansible.builtin.assert:
+        that:
+          - "'finalize' in _run_on.workflow_dispatch.inputs.operation.options"
+          - "'dataforest' in _run_on.workflow_dispatch.inputs.provider.options"
+        fail_msg: >-
+          workflow_dispatch must list `finalize` as an operation option
+          and `dataforest` as a provider option.
+        quiet: true
+
+    - name: "ip-rotation | finalize job gate is positive == 'finalize' AND provider dataforest"
+      ansible.builtin.assert:
+        that:
+          - >-
+            _run_yml.jobs.finalize.if is regex("inputs\\.operation == 'finalize'")
+          - >-
+            _run_yml.jobs.finalize.if is regex("inputs\\.provider == 'dataforest'")
+        fail_msg: >-
+          finalize job MUST use a positive == gate on BOTH
+          inputs.operation == 'finalize' AND inputs.provider == 'dataforest'.
+        quiet: true
+
+    - name: "ip-rotation | finalize does not depend on any other live job"
+      ansible.builtin.assert:
+        that:
+          - "_run_yml.jobs.finalize.needs is not defined"
+        fail_msg: >-
+          finalize MUST be triggered only by an explicit dispatch.
+          No automatic dependency may reach it.
+        quiet: true
+
+    - name: "ip-rotation | swap_dataforest if does NOT mention finalize"
+      ansible.builtin.assert:
+        that:
+          - "'finalize' not in _run_yml.jobs.swap_dataforest.if"
+        fail_msg: >-
+          swap_dataforest's `if` MUST NOT mention `finalize` — only an
+          explicit `operation: finalize` dispatch should reach finalize.
+        quiet: true
+
+    # The if expression is `(op in {change-ip,provider-only}) AND provider == dataforest`.
+    # Without parens, `&&` binds tighter than `||`, so a bare
+    # `change-ip || provider-only && dataforest` would be
+    # `change-ip || (provider-only && dataforest)` and would let any
+    # hcloud change-ip dispatch reach the DataForest job. The contract
+    # therefore REQUIRES parentheses AND a separate positive `==`
+    # guard for provider. The truth table below tests the parsed
+    # expression and the gate independently.
+    - name: "ip-rotation | swap_dataforest uses positive gates (truth table)"
+      vars:
+        _tbl:
+          - op: change-ip
+            provider: dataforest
+            expect: true
+          - op: provider-only
+            provider: dataforest
+            expect: true
+          - op: change-ip
+            provider: hcloud
+            expect: false
+          - op: provider-only
+            provider: hcloud
+            expect: false
+          - op: finalize
+            provider: dataforest
+            expect: false
+          - op: finalize
+            provider: hcloud
+            expect: false
+          - op: rollback
+            provider: dataforest
+            expect: false
+          - op: rollback
+            provider: hcloud
+            expect: false
+          - op: plan
+            provider: dataforest
+            expect: false
+          - op: plan
+            provider: hcloud
+            expect: false
+      loop: "{{ _tbl }}"
+      loop_control:
+        label: "{{ item.op }}/{{ item.provider }}"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((item.op == 'change-ip' or item.op == 'provider-only')
+            and item.provider == 'dataforest') == item.expect
+        fail_msg: >-
+          The truth table for swap_dataforest's if: must produce exactly
+          the expected boolean for every (op, provider) combination.
+          The actual table currently produces
+          `{{ ((item.op == 'change-ip' or item.op == 'provider-only') and item.provider == 'dataforest') }}`
+          for op={{ item.op }} provider={{ item.provider }}; expected
+          {{ item.expect }}.
+        quiet: true
+
+    - name: "ip-rotation | every live job if: contains the expected gate token"
+      vars:
+        _jobs:
+          - job: swap
+            required: "provider == 'hcloud'"
+          - job: dns
+            required: "provider == 'hcloud'"
+          - job: verify
+            required: "provider == 'hcloud'"
+          - job: rollback
+            required: "provider == 'hcloud'"
+          - job: swap_dataforest
+            required: "provider == 'dataforest'"
+          - job: finalize
+            required: "provider == 'dataforest'"
+          - job: rollback_dataforest
+            required: "provider == 'dataforest'"
+      loop: "{{ _jobs }}"
+      loop_control:
+        label: "{{ item.job }}"
+      ansible.builtin.assert:
+        that:
+          - "_run_yml.jobs[item.job].if is regex(item.required)"
+        fail_msg: >-
+          Job {{ item.job }} MUST contain a positive == '{{ item.required }}'
+          gate in its `if:` expression. The current value is
+          `{{ _run_yml.jobs[item.job].if }}`.
+        quiet: true
+
+    - name: "ip-rotation | Hetzner plan job does NOT carry DATAFOREST_API_TOKEN"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml)
+            .jobs.plan.env.DATAFOREST_API_TOKEN is not defined)
+            or
+            ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', '') | from_yaml)
+            .jobs.plan.env.DATAFOREST_API_TOKEN) == '${{ secrets.DATAFOREST_API_TOKEN }}'
+        fail_msg: >-
+          The Hetzner `plan` job MUST NOT export DATAFOREST_API_TOKEN.
+          Provider plan scoping requires a separate plan job for each
+          provider. The current value leaks the DataForest PAT to every
+          Hetzner plan run.
+        quiet: true
+
+    - name: "ip-rotation | workflow_dispatch has a provider-scoped plan job"
+      ansible.builtin.assert:
+        that:
+          - "_run_yml.jobs.plan_dataforest is defined"
+          - >-
+            _run_yml.jobs.plan_dataforest.if is regex("inputs\\.provider == 'dataforest'")
+          - >-
+            _run_yml.jobs.plan_dataforest.env.DATAFOREST_API_TOKEN is defined
+          - >-
+            _run_yml.jobs.plan_dataforest.env.HCLOUD_TOKEN is not defined
+        fail_msg: >-
+          workflow.yml MUST define a separate plan_dataforest job whose
+          `if:` requires provider == 'dataforest' and whose env block
+          exports DATAFOREST_API_TOKEN but NOT HCLOUD_TOKEN.
+        quiet: true
+
+    - name: "ip-rotation | no falsy-ternary expressions on secrets"
+      ansible.builtin.assert:
+        that:
+          - >-
+            not ((lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', ''))
+            is regex("cond && ''\\s*\\|\\|\\s*secrets\\."))
+        fail_msg: >-
+          run.yml MUST NOT use the falsy-ternary
+          `cond && '' || secrets.<X>` pattern — empty strings are falsy
+          in GitHub expressions and the secret leaks through `||`.
+        quiet: true
+
+    - name: "ip-rotation | Hetzner jobs require provider == hcloud"
+      ansible.builtin.assert:
+        that:
+          - >-
+            _run_yml.jobs.swap.if is regex("inputs\\.provider == 'hcloud'")
+          - >-
+            _run_yml.jobs.dns.if is regex("inputs\\.provider == 'hcloud'")
+          - >-
+            _run_yml.jobs.verify.if is regex("inputs\\.provider == 'hcloud'")
+          - >-
+            _run_yml.jobs.rollback.if is regex("inputs\\.provider == 'hcloud'")
+        fail_msg: >-
+          Each Hetzner-only job (swap / dns / verify / rollback) MUST
+          require provider == 'hcloud'. A bare `if: inputs.operation ==
+          'change-ip'` would let a DataForest run reach Hetzner jobs.
+        quiet: true

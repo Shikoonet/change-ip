@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""A fake `ansible-playbook` binary for the offline test harness.
+
+The real `run_cloudflare_op` shells out to `ansible-playbook
+cloudflare_replace_ip_step.yml -e op=<op> -e result_file=<path> ...`
+and the real dataforest guest adapter shells out to
+`ansible-playbook dataforest_step.yml -e op=<op> -e step_out=<path> ...`.
+
+Both paths are routed here in tests. The fake detects the playbook
+filename and dispatches the request to an in-process model that lives
+in `$ROTATION_FAKE_STATE` (a JSON file). The file's structure is:
+
+  {
+    "dataforest": {<dataforest state>},
+    "cloudflare": {<cloudflare state>}
+  }
+
+A separate `CALLS` log is appended to `$ROTATION_FAKE_CALLS_LOG` (newline
+JSONL) so tests can assert the exact ordered event sequence.
+
+Production never sets `ANSIBLE_PLAYBOOK_BIN`, and tests always set it
+to this file's absolute path with `ROTATION_TEST_MODE=1`. The adapters
+reject any override without the test marker, so this binary cannot be
+invoked from a production run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+HERE = Path(__file__).resolve().parent
+
+
+def _parse_e_flags(argv: List[str]) -> Dict[str, str]:
+    """Parse `-e key=value` and `-e '{json}'` arguments."""
+    out: Dict[str, str] = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-e" and i + 1 < len(argv):
+            val = argv[i + 1]
+            try:
+                obj = json.loads(val)
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        out[k] = str(v)
+                else:
+                    pass
+            except (json.JSONDecodeError, ValueError):
+                if "=" in val:
+                    k, v = val.split("=", 1)
+                    out[k.strip()] = v.strip()
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _load_state() -> Dict[str, Any]:
+    state_path = os.environ.get("ROTATION_FAKE_STATE", "/tmp/rotation_fake_state.json")
+    if not os.path.exists(state_path):
+        return {"dataforest": {"addresses": ["203.0.113.10/32"]},
+                "cloudflare": {"records": []}}
+    try:
+        with open(state_path) as fh:
+            return json.loads(fh.read() or "{}")
+    except (OSError, ValueError):
+        return {"dataforest": {"addresses": ["203.0.113.10/32"]},
+                "cloudflare": {"records": []}}
+
+
+def _save_state(state: Dict[str, Any]) -> None:
+    state_path = os.environ.get("ROTATION_FAKE_STATE", "/tmp/rotation_fake_state.json")
+    tmp = state_path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(json.dumps(state))
+    os.replace(tmp, state_path)
+
+
+def _log_call(record: Dict[str, Any]) -> None:
+    log_path = os.environ.get("ROTATION_FAKE_CALLS_LOG", "/tmp/rotation_fake_calls.log")
+    try:
+        with open(log_path, "a") as fh:
+            fh.write(json.dumps({"ts": time.time(), **record}) + "\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Cloudflare playbook handlers
+# --------------------------------------------------------------------------
+def _ensure_cf_records(state: Dict[str, Any], old_ip: str) -> None:
+    if state.get("cloudflare", {}).get("records"):
+        return
+    z = ["zone-aaaa", "zone-bbbb", "zone-cccc", "zone-dddd"]
+    names = [("alpha", "tinooer.top"), ("bravo", "miragerunner.com"),
+             ("charlie", "palfora.ir"), ("delta", "shikoonet.xyz"),
+             ("echo", "tinooer.top"), ("foxtrot", "miragerunner.com"),
+             ("golf", "palfora.ir"), ("hotel", "shikoonet.xyz")]
+    cf = state.setdefault("cloudflare", {})
+    cf["records"] = []
+    for i, (n, dom) in enumerate(names):
+        cf["records"].append({
+            "zone_id": z[i % len(z)],
+            "record_id": f"rec-{i:05d}",
+            "name": f"ne.{dom}",
+            "content": old_ip,
+            "ttl": 1,
+            "proxied": False,
+        })
+
+
+def _cf_find(records: List[Dict[str, Any]], wanted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for rec in records:
+        if (rec["zone_id"] == wanted.get("zone_id")
+                and rec["record_id"] == wanted.get("record_id")):
+            return rec
+    return None
+
+
+def _cf_op_discover(state: Dict[str, Any], old_ip: str) -> Dict[str, Any]:
+    manifest = []
+    for rec in state["cloudflare"]["records"]:
+        if rec["content"] != old_ip:
+            continue
+        manifest.append({
+            "zone_id": rec["zone_id"], "record_id": rec["record_id"],
+            "name": rec["name"], "previous_content": rec["content"],
+            "ttl": rec.get("ttl", 1), "proxied": rec.get("proxied", False),
+        })
+    return {"ok": True, "rc": 0, "result": {"ok": True, "operation": "discover",
+                                              "manifest": manifest}}
+
+
+def _cf_op_apply(state: Dict[str, Any], manifest: List[Dict[str, Any]],
+                 old_ip: str, new_ip: str) -> Dict[str, Any]:
+    post = []
+    patches = 0
+    for wanted in manifest or []:
+        rec = _cf_find(state["cloudflare"]["records"], wanted)
+        if rec is None:
+            return {"ok": False, "error": "record not found",
+                    "error_kind": "not_found"}
+        if rec["content"] == new_ip:
+            pass
+        elif rec["content"] == old_ip:
+            rec["content"] = new_ip
+            patches += 1
+        else:
+            return {"ok": False, "error": "drift", "error_kind": "validation"}
+        post.append({"zone_id": rec["zone_id"], "record_id": rec["record_id"],
+                     "name": rec["name"], "content": rec["content"]})
+    return {"ok": True, "rc": 0, "result": {"ok": True, "operation": "apply",
+                                              "post_manifest": post,
+                                              "patches": patches}}
+
+
+def _cf_op_rollback(state: Dict[str, Any], manifest: List[Dict[str, Any]],
+                    old_ip: str, new_ip: str) -> Dict[str, Any]:
+    incomplete = []
+    for wanted in manifest or []:
+        rec = _cf_find(state["cloudflare"]["records"], wanted)
+        if rec is None:
+            incomplete.append({"name": wanted.get("name"), "reason": "missing"})
+            continue
+        if rec["content"] == old_ip:
+            pass
+        elif rec["content"] == new_ip:
+            rec["content"] = old_ip
+        else:
+            incomplete.append({"name": rec["name"], "content": rec["content"],
+                                "expected": old_ip})
+    return {"ok": True, "rc": 0, "result": {"ok": not incomplete,
+                                              "operation": "rollback",
+                                              "incomplete_records": incomplete,
+                                              "rollback_incomplete": bool(incomplete)}}
+
+
+def _cf_op_verify(state: Dict[str, Any], manifest: List[Dict[str, Any]],
+                  new_ip: str) -> Dict[str, Any]:
+    for wanted in manifest or []:
+        rec = _cf_find(state["cloudflare"]["records"], wanted)
+        if rec is None or rec["content"] != new_ip:
+            return {"ok": False, "error": "drift", "error_kind": "validation"}
+    return {"ok": True, "rc": 0, "result": {"ok": True, "operation": "verify"}}
+
+
+# --------------------------------------------------------------------------
+# DataForest playbook handlers
+# --------------------------------------------------------------------------
+def _df_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return state.setdefault("dataforest", {
+        "addresses": ["203.0.113.10/32"],
+        "applied": False,
+    })
+
+
+_DEFAULT_DF_CONFIG = {
+    "network_manager": "netplan",
+    "interface": "eth0",
+    "expected_host_key_pattern": r"^[^ ]+ ssh-ed25519",
+    "ssh_keyscan_timeout": 2,
+    "gateway": "203.0.113.1",
+    "service_probes": [],
+    "backup_files": [],
+    "expected_checksums": {},
+}
+
+
+def _df_op_detect(state: Dict[str, Any], ifname: str) -> Dict[str, Any]:
+    return {"ok": True, "rc": 0, "result": {"ok": True,
+        "operation": "detect_network_manager",
+        "network_manager": _DEFAULT_DF_CONFIG["network_manager"],
+        "addresses": state["dataforest"]["addresses"],
+        "routes": ["default via 203.0.113.1"]}}
+
+
+def _df_op_configure(state: Dict[str, Any], ifname: str, new_addr: str,
+                     gateway: str) -> Dict[str, Any]:
+    s = state["dataforest"]
+    if not s.get("applied"):
+        s["addresses"] = [a for a in s["addresses"] if "203.0.113.10" not in a]
+    s["addresses"].append(new_addr)
+    s["applied"] = True
+    return {"ok": True, "rc": 0, "result": {"ok": True,
+        "operation": "configure_guest",
+        "addresses": list(s["addresses"]),
+        "routes": ["default via " + gateway]}}
+
+
+def _df_op_verify(state: Dict[str, Any], ifname: str, old_addr: str,
+                  new_addr: str, pattern: str, gateway: str,
+                  timeout: int, probes: List[str]) -> Dict[str, Any]:
+    s = state["dataforest"]
+    if new_addr not in s["addresses"]:
+        return {"ok": False, "error": "new_addr not bound",
+                "error_kind": "validation"}
+    return {"ok": True, "rc": 0, "result": {"ok": True,
+        "operation": "verify_guest",
+        "addresses": list(s["addresses"]),
+        "routes": ["default via " + gateway]}}
+
+
+def _df_op_remove(state: Dict[str, Any], ifname: str, address: str) -> Dict[str, Any]:
+    s = state["dataforest"]
+    s["addresses"] = [a for a in s["addresses"] if address not in a]
+    return {"ok": True, "rc": 0, "result": {"ok": True,
+        "operation": "remove_guest_address", "addresses": list(s["addresses"])}}
+
+
+def _df_op_restore(state: Dict[str, Any], ifname: str, new_addr: str,
+                    old_addr: str) -> Dict[str, Any]:
+    s = state["dataforest"]
+    if new_addr in s["addresses"]:
+        s["addresses"] = [a for a in s["addresses"] if new_addr not in a]
+    s["addresses"].append(old_addr)
+    return {"ok": True, "rc": 0, "result": {"ok": True,
+        "operation": "restore_guest", "addresses": list(s["addresses"])}}
+
+
+# --------------------------------------------------------------------------
+# Dispatch
+# --------------------------------------------------------------------------
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv:
+        sys.stderr.write("fake ansible-playbook: no args\n")
+        return 2
+
+    state = _load_state()
+    flags = _parse_e_flags(argv)
+    playbook = Path(argv[0]).name
+
+    op = flags.get("op") or flags.get("operation")
+    invocation_id = flags.get("invocation_id", "")
+    out_path = flags.get("result_file") or flags.get("step_out")
+
+    if playbook == "cloudflare_replace_ip_step.yml":
+        old_ip = (flags.get("old_ip") or "").strip()
+        new_ip = (flags.get("new_ip") or "").strip()
+        try:
+            manifest = json.loads(flags.get("manifest", "[]"))
+        except (json.JSONDecodeError, ValueError):
+            manifest = []
+        _ensure_cf_records(state, old_ip or "198.51.100.10")
+        ops = {
+            "discover": lambda: _cf_op_discover(state, old_ip),
+            "apply": lambda: _cf_op_apply(state, manifest, old_ip, new_ip),
+            "rollback": lambda: _cf_op_rollback(state, manifest, old_ip, new_ip),
+            "verify": lambda: _cf_op_verify(state, manifest, new_ip),
+        }
+        inner = ops.get(op, lambda: {"ok": False, "error": f"unknown op {op}",
+                                       "error_kind": "validation"})()
+        # cloudflare_adapter.run_cloudflare_op returns the parsed result
+        # file as `result`, and rotate.py reads `manifest` /
+        # `post_manifest` / `rollback_incomplete` from it directly. The
+        # real playbook writes those FLAT alongside `operation`, `ok` and
+        # `invocation_id` (see the "write the result" tasks), so the fake
+        # must too — a nested `result` key would read back as empty.
+        result = {
+            "operation": op,
+            "ok": inner.get("ok", True),
+            "invocation_id": invocation_id,
+            **(inner.get("result") or {}),
+        }
+        if not inner.get("ok", True):
+            result["error"] = inner.get("error")
+            result["error_kind"] = inner.get("error_kind")
+        state.setdefault("cloudflare", {}).setdefault("op_count", {})
+        state["cloudflare"]["op_count"][op or "unknown"] = (
+            state["cloudflare"]["op_count"].get(op or "unknown", 0) + 1)
+        _save_state(state)
+        _log_call({"playbook": playbook, "op": op, "old_ip": old_ip,
+                    "new_ip": new_ip, "invocation_id": invocation_id})
+        if out_path:
+            Path(out_path).write_text(json.dumps(result))
+        return 0
+
+    if playbook == "dataforest_step.yml":
+        ifname = flags.get("interface", "eth0")
+        if op == "detect_network_manager":
+            r = _df_op_detect(state, ifname)
+        elif op == "configure_guest":
+            new_addr = flags.get("new_address", "")
+            gateway = flags.get("gateway", "203.0.113.1")
+            r = _df_op_configure(state, ifname, new_addr, gateway)
+        elif op == "verify_guest":
+            r = _df_op_verify(state, ifname,
+                              flags.get("old_address", ""),
+                              flags.get("new_address", ""),
+                              flags.get("expected_host_key_pattern",
+                                        r"^[^ ]+ ssh-ed25519"),
+                              flags.get("gateway", "203.0.113.1"),
+                              int(flags.get("ssh_keyscan_timeout", 2)),
+                              json.loads(flags.get("service_probes", "[]")))
+        elif op == "remove_guest_address":
+            r = _df_op_remove(state, ifname, flags.get("old_address", ""))
+        elif op == "restore_guest":
+            r = _df_op_restore(state, ifname,
+                                flags.get("new_address", ""),
+                                flags.get("old_address", ""))
+        else:
+            r = {"ok": False, "error": f"unknown op {op}",
+                 "error_kind": "validation"}
+        _save_state(state)
+        _log_call({"playbook": playbook, "op": op, "ifname": ifname,
+                    "invocation_id": invocation_id})
+        if out_path:
+            # The dataforest guest adapter reads the file and returns
+            # {"rc":0,"result":<file>,"argv":...}. The rotation reads
+            # result["network_manager"] etc. from <file>. So we must
+            # write the INNER result dict (network_manager at top
+            # level), not the outer envelope.
+            Path(out_path).write_text(json.dumps(r["result"]))
+        return 0
+
+    sys.stderr.write(f"fake ansible-playbook: unknown playbook {argv[0]!r}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -127,6 +127,7 @@ def token_present() -> bool:
 
 
 CLOUDFLARE_TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
+DATAFOREST_TOKEN_ENV = "DATAFOREST_API_TOKEN"
 
 
 def cf_token_present() -> bool:
@@ -134,6 +135,10 @@ def cf_token_present() -> bool:
     but for the env var the cloudflare playbook reads. Kept here so a test
     can patch one place and rotate.py sees both."""
     return bool(os.environ.get(CLOUDFLARE_TOKEN_ENV, "").strip())
+
+
+def dataforest_token_present() -> bool:
+    return bool(os.environ.get(DATAFOREST_TOKEN_ENV, "").strip())
 
 
 def project_fingerprint() -> str:
@@ -431,3 +436,220 @@ class HcloudProvider:
             "# removing it is a separate, explicitly approved decision.",
         ]
         return lines
+
+
+# --------------------------------------------------------------------------
+# DataForest domain types and provider
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Seed:
+    """A DataForest Seed — the resource the rotation mutates.
+
+    Surfaced exactly the way `dataforest_adapter.validate_*` shapes it.
+    No raw API dict ever escapes.
+
+    Field naming matches the documented schema:
+      * `state`   — the Seed lifecycle state (running / stopped / unknown /
+                    processing / suspended / error / deleted)
+      * `ipv4`    — list of IPResponse-shaped entries
+      * `active_action` — current in-flight action, or None
+      * `is_clone_source` — bool
+      * `available_actions` — list of op-type strings the Seed permits
+    """
+    id: str
+    name: str
+    project: Optional[str]
+    location: Optional[str]
+    state: str
+    ipv4: List[Dict[str, Any]]
+    active_action: Optional[Dict[str, Any]]
+    is_clone_source: bool
+    available_actions: List[str]
+
+    # The states the rotation accepts. `running` and `stopped` are both
+    # OK — the Seed does not need to be powered on for IPv4 manipulation,
+    # only for guest network configuration, which runs against the local
+    # control node (NOT the Seed) per the documented separation.
+    ACCEPTED_STATES = frozenset({"running", "stopped"})
+    REJECTED_STATES = frozenset({"unknown", "processing", "suspended",
+                                 "error", "deleted"})
+
+    def addresses(self) -> List[str]:
+        out: List[str] = []
+        for entry in self.ipv4:
+            addr = entry.get("address") if isinstance(entry, dict) else None
+            if isinstance(addr, str) and addr.strip():
+                out.append(addr.strip())
+        return out
+
+    def primary_address(self) -> Optional[str]:
+        for entry in self.ipv4:
+            if isinstance(entry, dict) and entry.get("primary_ip"):
+                addr = entry.get("address")
+                if isinstance(addr, str) and addr.strip():
+                    return addr.strip()
+        # Fallback: first entry — but only when none claims primary.
+        for entry in self.ipv4:
+            if isinstance(entry, dict):
+                addr = entry.get("address")
+                if isinstance(addr, str) and addr.strip():
+                    return addr.strip()
+        return None
+
+    def accepts(self, op_type: str) -> bool:
+        """True when `op_type` is in the Seed's available_actions list.
+
+        `available_actions` is the documented per-Seed allowlist; a Seed
+        whose published list does NOT contain `seed.add-ipv4` cannot
+        receive an add request even if `state == running`.
+        """
+        return op_type in (self.available_actions or [])
+
+
+@dataclass(frozen=True)
+class Team:
+    """The team account the PAT is scoped to."""
+    id: str
+    status: str
+    resource_limits: Dict[str, Any]
+
+
+class DataForestProvider:
+    """The DataForest side of a rotation.
+
+    Compared to `HcloudProvider`:
+      * no power-cycle (the Seed keeps both addresses throughout);
+      * allocation is gated by `team.resource_limits.max_ipv4_per_seed`
+        rather than a Hetzner console quota;
+      * the Seed's `active_action` must be empty before any mutation,
+        and a crash after POST must reconcile through read-only calls;
+      * removal of the old address is gated by an explicit `finalize`
+        command — the apply/resume path stops at `awaiting_finalize`.
+
+    The provider never speaks to the network itself; the adapter does.
+    That keeps the constructor injectable: tests construct the provider
+    against a fake HTTP server, production against api.dataforest.net.
+    """
+
+    def __init__(self, adapter: Any):
+        self._adapter = adapter
+
+    # -- reads -------------------------------------------------------------
+    def get_team(self) -> Team:
+        body = self._adapter.get_team()
+        return _normalise_team(body)
+
+    def get_seed(self, seed_id: str) -> Seed:
+        body = self._adapter.get_seed(seed_id)
+        return _normalise_seed(body)
+
+    def get_active_action(self, seed_id: str) -> Optional[Dict[str, Any]]:
+        """The Seed's `active_action`, or None. No polling here."""
+        seed = self.get_seed(seed_id)
+        return seed.active_action
+
+    def get_action(self, seed_id: str, action_id: str) -> Dict[str, Any]:
+        return self._adapter.get_action(seed_id, action_id)
+
+    def list_actions(self, seed_id: str) -> List[Dict[str, Any]]:
+        body = self._adapter.list_seed_actions(seed_id)
+        out: List[Dict[str, Any]] = []
+        for key in ("actions", "data", "items"):
+            items = body.get(key)
+            if isinstance(items, list):
+                out = items  # type: ignore[assignment]
+                break
+        return [a for a in out if isinstance(a, dict)]
+
+    # -- mutations ---------------------------------------------------------
+    def allocate_ipv4(self, seed_id: str) -> Dict[str, Any]:
+        """POST seed.add-ipv4. Returns the action record (status, action_id).
+
+        The caller polls for completion and then re-reads the Seed to
+        discover the new address by set difference.
+        """
+        _, body = self._adapter.post_action(seed_id, {"type": "seed.add-ipv4"})
+        return body
+
+    def remove_ipv4(self, seed_id: str, address: str) -> Dict[str, Any]:
+        """POST seed.remove-ipv4 with the EXACT persisted OLD_IP.
+
+        Selecting the address from list position or "primary_ip" inference
+        would be the wrong call: the spec says use the persisted old_ip,
+        nothing else.
+        """
+        _, body = self._adapter.post_action(
+            seed_id, {"type": "seed.remove-ipv4", "address": address}
+        )
+        return body
+
+    # -- escalation help ---------------------------------------------------
+    @staticmethod
+    def describe_rollback(seed_id: str, old_ip: Dict[str, Any], new_ip: Dict[str, Any]) -> List[str]:
+        old_addr = (old_ip or {}).get("ip") or "<old>"
+        new_addr = (new_ip or {}).get("ip") or "<new>"
+        return [
+            f"# seed {seed_id}: NEW_IP {new_addr} is on the Seed; release it ONLY via",
+            "# rotate.py finalize --txid <txid> --config <rotation.yml>",
+            "# or via the documented DataForest API. Re-acquisition is not",
+            "# guaranteed: this is the point-of-no-return.",
+            f"# DNS rollback still has to point back at {old_addr};",
+            "# rotate.py rollback --txid <txid> --dns-rollback-only",
+        ]
+
+
+# --------------------------------------------------------------------------
+# DataForest normalisers — strict on shape, tolerant on unknown fields
+# --------------------------------------------------------------------------
+def _normalise_team(body: Dict[str, Any]) -> Team:
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    rid = str(data.get("id") or "")
+    if not rid:
+        raise NonRetryableError("dataforest team response missing 'id'")
+    status = str(data.get("status") or "")
+    if not status:
+        raise NonRetryableError("dataforest team response missing 'status'")
+    limits = data.get("resource_limits") or {}
+    if not isinstance(limits, dict):
+        limits = {}
+    return Team(id=rid, status=status, resource_limits=limits)
+
+
+def _normalise_seed(body: Dict[str, Any]) -> Seed:
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    sid = str(data.get("id") or "")
+    if not sid:
+        raise NonRetryableError("dataforest seed response missing 'id'")
+    name = str(data.get("name") or "")
+    state = str(data.get("state") or "")
+    if not name:
+        raise NonRetryableError(f"dataforest seed {sid} response missing 'name'")
+    if not state:
+        raise NonRetryableError(f"dataforest seed {sid} response missing 'state'")
+    project = data.get("project") or data.get("project_id")
+    location = data.get("location") or data.get("home_location") or data.get("datacenter")
+    ipv4_raw = data.get("ipv4") or []
+    if not isinstance(ipv4_raw, list):
+        raise NonRetryableError(f"dataforest seed {sid} ipv4 field is not a list")
+    ipv4 = [e for e in ipv4_raw if isinstance(e, dict)]
+    active = data.get("active_action")
+    if active is not None and not isinstance(active, dict):
+        active = None
+    clone = bool(data.get("is_clone_source", False))
+    avail_raw = data.get("available_actions") or []
+    if not isinstance(avail_raw, list):
+        raise NonRetryableError(
+            f"dataforest seed {sid} available_actions is not a list"
+        )
+    available = [str(a) for a in avail_raw if isinstance(a, str) and a.strip()]
+    return Seed(
+        id=sid,
+        name=name,
+        project=str(project) if isinstance(project, str) else None,
+        location=str(location) if isinstance(location, str) else None,
+        state=state,
+        ipv4=ipv4,
+        active_action=active,
+        is_clone_source=clone,
+        available_actions=available,
+    )
