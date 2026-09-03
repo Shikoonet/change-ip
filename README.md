@@ -1,7 +1,20 @@
 # server-ip-rotation
 
 Replace a fleet node's public IPv4 **at the provider**, with a checkpoint and a
-way back. First and only provider: Hetzner Cloud.
+way back. Two providers ship in this repo:
+
+  * **Hetzner Cloud** — the original flow. `stop / detach / attach / start`
+    around a server power-cycle. The burned address is RETAINED, never
+    deleted by this tool.
+  * **DataForest Seed** — a two-phase cutover: the Seed keeps both
+    addresses throughout; NEW_IP is bound at runtime + persistently; the
+    release of OLD_IP is a separate explicit `finalize` command (point of
+    no return — DataForest does not guarantee reacquisition of a
+    released IPv4).
+
+Provider is selected in `rotation.yml` (`provider: hcloud` or
+`provider: dataforest`). The state machine, the checkpoint format, the
+Cloudflare half, and the `make ip-change HOST=<alias>` half are shared.
 
 > ⚠ **This has never been run against a real server.** It was written
 > 2026-08-26 with a full offline test suite and **zero live API calls**. In this

@@ -1,0 +1,39 @@
+# yamllint config — server-ip-rotation.
+#
+# This repo deliberately uses long lines for several reasons:
+#
+#   * Single-line fail_msg / success_msg text reads better in stack
+#     traces than a folded block.
+#   * Contract tests inspect specific text patterns; reflowing a
+#     line-break onto the next line can break a pattern that was meant
+#     to be one regex token.
+#   * Inline JSON-encoded blobs in `-e` arguments are easier to read
+#     when not arbitrarily broken at column 80.
+#
+# The defaults below DO still enforce real correctness rules:
+# trailing spaces, duplicate keys, indentation consistency, etc.
+#
+# ansible-lint mandates a few overrides — without these, every
+# inventory/key file trips its profile:basic set.
+---
+extends: default
+rules:
+  line-length:
+    max: 200
+    level: warning
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+    require-starting-space: true
+  truthy:
+    check-keys: false
+  braces:
+    max-spaces-inside: 1
+  brackets:
+    max-spaces-inside: 1
+  # ansible-lint compatibility: ansible-lint does its own comments check
+  # and rejects comments-indentation. Disable yamllint's stricter one.
+  comments-indentation: false
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true

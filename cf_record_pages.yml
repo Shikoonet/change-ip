@@ -1,0 +1,63 @@
+---
+# =============================================================================
+# cf_record_pages.yml — included by cloudflare_replace_ip_step.yml's discover
+# block to fetch DNS-record pages 2..N for each (zone_id, name) pair whose
+# page-1 response had total_pages > 1. The including block builds a list of
+# explicit lookups; this file fetches one page per invocation and validates
+# the response against the page-1 baseline.
+#
+# Three named include variables are bound here, all derived purely from the
+# loop var passed in by the calling block:
+#
+#   cf_record_lookup               — {pair: {...}, page: N, expected_total_pages: M}
+#   cf_record_page_number          — N (the page this iteration fetches)
+#   cf_record_expected_total_pages — M (the total_pages from page 1)
+#
+# Both the URI and the assert read these vars; nothing else. No set_fact,
+# no implicit register-state inference, no shared mutable state.
+# =============================================================================
+- name: "cf_record_pages | fetch page N for a record"
+  ansible.builtin.uri:
+    url: >-
+      {{ cf_api_base }}/zones/{{ cf_record_lookup.pair.zone_id }}/dns_records?type=A&name={{ cf_record_lookup.pair.name }}&per_page=50&page={{ cf_record_page_number }}
+    method: GET
+    headers:
+      Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
+      Content-Type: "application/json"
+    status_code: [200]
+    validate_certs: true
+  register: _cf_record_page_response
+  no_log: true
+
+# ponytail: a `register` on the URI is overwritten on every include-task
+# iteration (host-scoped, last-write-wins), so we explicitly append into a
+# host-level accumulator the parent initialised. This is the smallest
+# structured-collect idiom Ansible offers without writing a callback plugin.
+- name: "cf_record_pages | collect this iteration's response"
+  ansible.builtin.set_fact:
+    _cf_record_pages_collected: "{{ (_cf_record_pages_collected | default([])) + [{'lookup': cf_record_lookup, 'response': _cf_record_page_response}] }}"
+
+# Fail closed on every kind of inconsistency: missing fields, wrong page
+# number returned, total_pages drifted, page out of bounds, or a non-list
+# result. A bad pagination contract here means the manifest this file feeds
+# is built on guessed data; refuse rather than guess.
+- name: "cf_record_pages | validate response against the page-1 baseline"
+  ansible.builtin.assert:
+    that:
+      - _cf_record_page_response.json is defined
+      - (_cf_record_page_response.json.success | default(false)) == true
+      - _cf_record_page_response.json.result is defined
+      - (_cf_record_page_response.json.result | type_debug) == 'list'
+      - _cf_record_page_response.json.result_info is defined
+      - (_cf_record_page_response.json.result_info | type_debug) == 'dict'
+      - (_cf_record_page_response.json.result_info.page | int) == cf_record_page_number | int
+      - (_cf_record_page_response.json.result_info.total_pages | int) == cf_record_expected_total_pages | int
+      - (_cf_record_page_response.json.result_info.per_page | int) > 0
+      - (_cf_record_page_response.json.result_info.total_pages | int) >= cf_record_page_number | int
+      - (_cf_record_page_response.json.result_info.total_pages | int) <= 1000
+    fail_msg: >-
+      Cloudflare returned inconsistent pagination metadata on page
+      {{ cf_record_page_number }} for {{ cf_record_lookup.pair.name }}:
+      the API is not honouring total_pages, returned the wrong page, or the
+      result is malformed. The manifest this file feeds cannot be trusted.
+    quiet: true

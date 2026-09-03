@@ -77,8 +77,10 @@
 name: server-ip-rotation
 
 on:
-  push:
-  pull_request:
+  # Live operations only. The offline CI (push + pull_request) is
+  # the dedicated `ci.yml` workflow; this file MUST NOT carry a
+  # push or pull_request trigger so a code push can never reach
+  # the live mutation jobs.
   workflow_dispatch:
     inputs:
       operation:
@@ -88,19 +90,50 @@ on:
         options:
           - plan
           - change-ip
+          - provider-only
           - rollback
+          - finalize
+      provider:
+        description: 'Provider. hcloud is the original Hetzner Cloud path; dataforest is the new two-phase Seed flow.'
+        required: true
+        type: choice
+        default: hcloud
+        options:
+          - hcloud
+          - dataforest
       server_id:
-        description: 'Server id — the number in the Hetzner console URL. Must equal server.id in the config.'
+        description: 'Hetzner server id OR DataForest Seed UUID. Must equal server.id in the config.'
         required: true
       server_ip:
-        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on.'
+        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip.'
         required: true
 
 concurrency:
-  # One rotation at a time — across operations too: a rollback racing the
-  # change-ip it is rolling back is two runs sharing state/.
-  group: rotate
+  # Live operations only. `cancel-in-progress: false` is mandatory:
+  # cancelling a mid-mutation run would interrupt a powered-off node
+  # and leave DNS in a half-patched state. Live operations are
+  # dispatched by a human; the cancel is the human's `gh run cancel`.
+  # The discriminator is `inputs.server` (change-ip / provider-only)
+  # OR `inputs.txid` (rollback / finalize), so two different
+  # operations on the same node never share the lock.
+  group: rotation-${{ inputs.server_id || inputs.txid }}
   cancel-in-progress: false
+
+# provider_only is a structural firewall: when the operator picks
+# `provider-only` (a throwaway test server, or any case where DNS is
+# handled out of band), this workflow MUST reach `connectivity_ok` and
+# stop. It MUST NOT invoke `ip_change`, MUST NOT prompt for the
+# inventory edit, MUST NOT run the Cloudflare playbook, and MUST NOT
+# receive the Cloudflare token. The defense-in-depth server-side guard
+# in rotate.py also enforces this — refusing the rotation up-front
+# rather than half-completing it.
+#
+# The provider-rollback workflow path stays available: an operator who
+# wants the old address back can still dispatch `rollback`. That
+# operation has TWO steps: the provider half (no Cloudflare token) and,
+# if DNS recovery is required, the Cloudflare half (token present only
+# on that step). Provider-only never references the Cloudflare token at
+# any job or step.
 
 # The default GITHUB_TOKEN has no scope on artifacts. The rollback job reads
 # rotation-state artifacts from earlier runs; granting only `actions: read` and
@@ -112,55 +145,42 @@ permissions:
 
 jobs:
   # ===========================================================================
-  # Offline half — the merge-request gate. Push and PR only: these belong to
-  # the code review, not in front of a live operation. An operator dispatching
-  # a rotation is acting on a commit that already passed them, and 40s of
-  # unit tests between a decision and a powered-off node buys nothing.
-  # ===========================================================================
-  offline:
-    name: unit + self-test + contract
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
-      - run: pip install --quiet ansible-core
-      - run: python3 -m unittest discover -s tests -t .
-      - run: python3 rotate.py --self-test
-      - run: ansible-playbook tests/contract.yml
-
-  lint:
-    name: syntax, yamllint, ansible-lint
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
-      - run: pip install --quiet ansible-core ansible-lint yamllint
-        # --syntax-check resolves module names, so the collection has to be here.
-      - run: ansible-galaxy collection install --force 'hetzner.hcloud:>=7.0.0,<8.0.0'
-      - run: ansible-playbook --syntax-check hcloud_step.yml tests/contract.yml
-      - run: python3 -m compileall -q rotate.py providers.py ansible_adapter.py
-      - run: yamllint hcloud_step.yml tests/contract.yml rotation.example.yml || true
-      - run: ansible-lint hcloud_step.yml || true
-
-  # ===========================================================================
   # operation: change-ip
   # ===========================================================================
   # 1. plan — read-only against the real API. Safe, but it needs the token, so
   #    it still goes through an environment. `operation: plan` stops here: it
   #    is the dry run, and on a config that has never been used it is the only
   #    honest first move.
+  # Two provider-scoped plan jobs. Each carries ONLY its provider's
+  # token — Hetzner plan never sees DATAFOREST_API_TOKEN, DataForest
+  # plan never sees HCLOUD_TOKEN. The Python `plan` command performs
+  # only GETs (read-only); the operator's intent is captured by the
+  # provider field on the dispatch form, not by which token is loaded.
   plan:
-    name: 1 · plan (read-only)
-    if: inputs.operation == 'plan'
+    name: 1 · plan (Hetzner, read-only)
+    if: inputs.operation == 'plan' && inputs.provider == 'hcloud'
     runs-on: ubuntu-latest
     environment: hetzner-plan
+    timeout-minutes: 30
     env:
+      # HCLOUD_TOKEN only. The DataForest PAT is NOT in this env block.
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - run: python3 rotate.py plan --config rotation.yml
+
+  plan_dataforest:
+    name: 1 · plan (DataForest, read-only)
+    if: inputs.operation == 'plan' && inputs.provider == 'dataforest'
+    runs-on: ubuntu-latest
+    environment: dataforest-production
+    timeout-minutes: 30
+    env:
+      DATAFOREST_API_TOKEN: ${{ secrets.DATAFOREST_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -177,11 +197,25 @@ jobs:
   #    asks a human to edit the inventory.
   #
   #    ⚠ Between the detach and the start the node has NO public address.
+  #
+  #    Provider-only path: same job, no DNS downstream. The Cloudflare
+  #    playbook is never invoked; the `dns` job below is gated off by its
+  #    own `if:` on `inputs.operation != 'provider-only'`.
+  #
+  #    SECRET SCOPE: the job-level env carries ONLY HCLOUD_TOKEN. The
+  #    CLOUDFLARE_API_TOKEN env is defined at the step that actually needs
+  #    it (the dns job, or the rollback DNS step) and is NEVER inherited
+  #    by the swap job or by provider-only runs. A bare
+  #    `${{ condition && '' || secret }}` ternary is FORBIDDEN — empty
+  #    strings are falsy in GitHub Actions expressions, and the secret
+  #    leaks through `||`.
   swap:
     name: 2 · swap the address (node is offline in here)
-    if: inputs.operation == 'change-ip'
+    if: (inputs.operation == 'change-ip' || inputs.operation == 'provider-only')
+        && inputs.provider == 'hcloud'
     runs-on: ubuntu-latest
     environment: hetzner-production
+    timeout-minutes: 30
     outputs:
       txid: ${{ steps.run.outputs.txid }}
       new_ip: ${{ steps.run.outputs.new_ip }}
@@ -189,6 +223,9 @@ jobs:
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       GH_TOKEN: ${{ github.token }}
+      # CLOUDFLARE_API_TOKEN is intentionally absent here. The provider
+      # half never talks to Cloudflare; the token lives on the dns job
+      # only.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -196,6 +233,11 @@ jobs:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
           expect_ipv4: "${{ inputs.server_ip }}"
       - id: run
+        env:
+          # The provider-only flag is a literal '1' or '0' string, never
+          # an empty string — the previous `${{ cond && '1' || '' }}`
+          # pattern is forbidden by the same expression-falsy rule.
+          ROTATION_PROVIDER_ONLY: ${{ inputs.operation == 'provider-only' && '1' || '0' }}
         run: |
           set +e
           python3 rotate.py apply --config rotation.yml \
@@ -218,27 +260,267 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: rotation-state, path: state/, retention-days: 30}
+        with: {name: rotation-state, path: state/, retention-days: 3}
+
+  # 2'. DataForest swap — the Seed keeps BOTH addresses throughout. The
+  #     apply path runs in FOUR separate jobs, each with only the token
+  #     its stage requires. A single subprocess carrying both tokens is
+  #     the contradiction this rewrite exists to remove.
+  #
+  #     Stage | Subprocess                       | Token
+  #     ──────┼──────────────────────────────────┼─────────────────────
+  #     2a    | apply --until new_ip_allocated   | DATAFOREST only
+  #     2b    | resume --until guest_configured  | DATAFOREST only
+  #     2c    | resume --until guest_verified    | DATAFOREST only
+  #     2d    | resume --until cloudflare_prefl. | CLOUDFLARE only
+  #     2e    | resume --until ansible_done      | CLOUDFLARE only
+  #     2f    | resume --until cloudflare_replaced | CLOUDFLARE only
+  #     2g    | resume --until awaiting_finalize | CLOUDFLARE only
+  #
+  #     The CLI refuses (EXIT_USAGE) if the wrong token is in scope, so
+  #     a leaked CLOUDFLARE_API_TOKEN on a provider stage fails loudly
+  #     instead of silently mixing secrets. This is enforced by the
+  #     --until gate in rotate.py: provider/guest --until names MUST run
+  #     WITHOUT CLOUDFLARE_API_TOKEN in env; DNS --until names MUST run
+  #     WITH it. The token-presence assertion is a hard fail.
+  swap_dataforest:
+    name: 2a · DataForest provider preflight + allocate (DF token only)
+    if: (inputs.operation == 'change-ip' || inputs.operation == 'provider-only')
+        && inputs.provider == 'dataforest'
+    runs-on: ubuntu-latest
+    environment: dataforest-production
+    timeout-minutes: 30
+    outputs:
+      txid: ${{ steps.run.outputs.txid }}
+      new_ip: ${{ steps.run.outputs.new_ip }}
+      alias: ${{ steps.run.outputs.alias }}
+    env:
+      DATAFOREST_API_TOKEN: ${{ secrets.DATAFOREST_API_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      # CLOUDFLARE_API_TOKEN intentionally absent. The CLI refuses to
+      # advance a provider stage with the CF token in scope.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - id: run
+        run: |
+          set +e
+          python3 rotate.py apply --config rotation.yml \
+            --confirm-server-id "${{ inputs.server_id }}" \
+            --until new_ip_allocated
+          rc=$?
+          set -e
+          # 6 = paused at --until (expected end). Green on purpose:
+          # a normal stage boundary showing red is how a real
+          # escalation stops being noticed.
+          # 5 = rolled_back: the tool already put the old address
+          # back. Red on purpose — nothing changed, but somebody has
+          # to read why.
+          test "$rc" -eq 6 || exit "$rc"
+
+          TXID=$(ls -t state/*.json | head -1 | xargs -n1 basename | sed 's/\.json$//')
+          python3 rotate.py status --config rotation.yml --txid "$TXID"
+          {
+            echo "txid=$TXID"
+            echo "new_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['new_ip']['ip'])")"
+            echo "alias=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['ansible']['host_alias'])")"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state, path: state/, retention-days: 3}
+
+  swap_dataforest_guest:
+    name: 2b-c · DataForest guest configure + verify (no provider token)
+    if: (inputs.operation == 'change-ip' || inputs.operation == 'provider-only')
+        && inputs.provider == 'dataforest'
+    needs: [swap_dataforest]
+    runs-on: ubuntu-latest
+    # GUEST STAGE: no environment, no provider token. The job is
+    # token-free; the rotation's identity check at this stage
+    # consumes the digest-bound `dataforest_identity_ok` marker
+    # persisted by the previous job, NOT a fresh Seed read.
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - uses: actions/download-artifact@v4
+        with: {name: rotation-state, path: state/}
+      - name: 2b · configure guest (no provider token; identity marker only)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state guest_configured \
+            --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+            --label "2b.configure_guest" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --until guest_configured
+      - name: 2c · verify guest (no provider token; identity marker only)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state guest_verified \
+            --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+            --label "2c.verify_guest" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --until guest_verified
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-guest, path: state/, retention-days: 3}
+
+  swap_dataforest_dns:
+    name: 2d-g · DataForest DNS preflight + Ansible + PATCH + await finalize (CF tokens only)
+    if: inputs.operation == 'change-ip' && inputs.provider == 'dataforest'
+    # swap_dataforest_dns reads `needs.swap_dataforest.outputs.{txid,new_ip,alias}`
+    # in the in_scope gate and every resume stage. The swap_dataforest_guest
+    # job does NOT export those outputs — only swap_dataforest does. Without
+    # this dependency GitHub substitutes an empty string for every
+    # `needs.swap_dataforest.outputs.*` reference, rotate.py resume runs
+    # with --txid "" and the gate reads empty NEW_IP/ALIAS, and the
+    # DataForest DNS stages silently skip. (actionlint flags the same.)
+    needs: [swap_dataforest, swap_dataforest_guest]
+    runs-on: ubuntu-latest
+    environment: cloudflare-production
+    timeout-minutes: 30
+    env:
+      # Two-account Cloudflare is the only DNS path. No legacy
+      # CLOUDFLARE_API_TOKEN is exported: an account-A token is NEVER
+      # aliased to the legacy variable, and account B is never aliased
+      # to A. The per-account playbook call selects exactly one token
+      # through token_env; the adapter scrubs the others from the
+      # child env so a process for one account cannot read the other.
+      CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+      CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+      GH_TOKEN: ${{ github.token }}
+      ANSIBLE_HOST_KEY_CHECKING: 'False'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - uses: actions/download-artifact@v4
+        with: {name: rotation-state-guest, path: state/}
+      - name: 2d · Cloudflare preflight (CF token only)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state cloudflare_preflighted \
+            --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+            --label "2d.cloudflare_preflight" \
+            --expect-marker cloudflare_manifest \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --until cloudflare_preflighted
+      - name: Is the inventory edit committed in shikoonet?
+        id: in_scope
+        env:
+          SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
+          NEW_IP: ${{ needs.swap_dataforest.outputs.new_ip }}
+          ALIAS: ${{ needs.swap_dataforest.outputs.alias }}
+        run: |
+          set -e
+          # Assign in_scope to the actual shell scope — NOT just stdout. The
+          # earlier version only echoed `in_scope=true|false` and never
+          # exported it, so `${in_scope:-false}` always expanded to
+          # `false` and the next steps' `if:` gates always skipped the
+          # DataForest DNS stages. Assigning here fixes the gate so the
+          # PATCH and the inventory edit actually run on a real rotation.
+          in_scope=false
+          if [ -n "$SHIKOONET_REPO" ]; then
+            git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
+            if grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml; then
+              in_scope=true
+            fi
+          fi
+          echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"
+      - name: 2e · Ansible + inventory (no provider/DNS token)
+        if: steps.in_scope.outputs.in_scope == 'true'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          install -m 600 -D /dev/null ~/.vault_pass_pasarguard
+          printf '%s\n' "$VAULT_PASSWORD" > ~/.vault_pass_pasarguard
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state ansible_done \
+            --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+            --label "2e.ansible" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --until ansible_done
+      - name: 2f · Cloudflare PATCH (apply, CF token only)
+        if: steps.in_scope.outputs.in_scope == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state cloudflare_replaced \
+            --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+            --label "2f.cloudflare_replace" \
+            --expect-marker cloudflare_apply \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --until cloudflare_replaced
+      - name: 2g · await_finalize (CF token only)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state awaiting_finalize \
+            --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+            --label "2g.awaiting_finalize" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ needs.swap_dataforest.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --until awaiting_finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-dns, path: state/, retention-days: 3}
 
   # 3. dns — the half that already worked. Runs `make ip-change HOST=<alias>`
   #    in a shikoonet checkout, which PATCHes the Cloudflare record in place
   #    and reads it back from the API as a gate.
   #
-  #    THE GATE THAT REPLACED THE PROMPT is the grep below. rotate.py is about
+  #    THE GATE THAT REPLACED THE PROMt is the grep below. rotate.py is about
   #    to ask "did you type the new address into the inventory?" — this job
   #    answers that from the shikoonet default branch, never from an
   #    assumption.
   dns:
     name: 3 · move DNS (gated by the inventory commit)
     needs: [swap]
+    if: inputs.operation == 'change-ip'
+        && inputs.provider == 'hcloud'
     runs-on: ubuntu-latest
     environment: hetzner-production
+    timeout-minutes: 30
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       TXID: ${{ needs.swap.outputs.txid }}
       NEW_IP: ${{ needs.swap.outputs.new_ip }}
       ALIAS: ${{ needs.swap.outputs.alias }}
       ANSIBLE_HOST_KEY_CHECKING: 'False'
+      # CLOUDFLARE_API_TOKEN is NOT in this job-level env. It is set ONLY
+      # on the step that actually invokes the Cloudflare playbook. That
+      # step's `if:` already guarantees the token never reaches a run that
+      # did not pass the inventory gate.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -273,22 +555,50 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          # The Cloudflare token lives ONLY on this step. It is present
+          # in the env only when:
+          #   1. inputs.operation == 'change-ip' (the job-level `if:`
+          #      gates off provider-only entirely)
+          #   2. AND the in_scope step confirmed this is a real rotation
+          #      (the step-level `if:` gates off throwaway test servers)
+          # Both gates are positive (`==`) so a broken token never
+          # reaches the env via a falsy short-circuit.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_ed25519
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           install -m 600 -D /dev/null ~/.vault_pass_pasarguard
           printf '%s\n' "$VAULT_PASSWORD" > ~/.vault_pass_pasarguard
-          printf 'yes\n' | python3 rotate.py resume --config rotation.yml \
-            --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
+          printf 'yes\n' | python3 .github/scripts/stage.py \
+            --expect-rc 0 \
+            --expect-state done \
+            --txid "$TXID" \
+            --label "dns.hcloud_resume" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: rotation-state-final, path: state/, retention-days: 30}
+        with: {name: rotation-state-final, path: state/, retention-days: 3}
 
   # 4. verify — the checkpoint says done, and says so on its own terms.
+  # verify is gated on (a) operation == change-ip (NOT provider-only, NOT
+  # a failed/skipped DNS) and (b) dns succeeded. Running after a failed
+  # dns with `always()` would have meant a green "verify" against a
+  # half-applied rotation; the gate below fixes that.
   verify:
     name: 4 · verify the checkpoint says done
     needs: [swap, dns]
+    if: inputs.operation == 'change-ip'
+        && inputs.provider == 'hcloud'
+        && needs.dns.result == 'success'
     runs-on: ubuntu-latest
+    # No mutating access — just reads the artifact and the config. Sits on
+    # hetzner-plan because that's where ROTATION_CONFIG lives; without an
+    # environment, secrets.ROTATION_CONFIG reads from the repo (empty) and the
+    # setup step fails with "ROTATION_CONFIG secret is empty" — exactly the
+    # failure we just saw on run #42.
+    environment: hetzner-plan
+    timeout-minutes: 30
     env:
       TXID: ${{ needs.swap.outputs.txid }}
     steps:
@@ -314,6 +624,122 @@ jobs:
           echo "only thing that notices a node that is up but silently unmonitored."
 
   # ===========================================================================
+  # operation: finalize — DataForest only: release OLD_IP from the Seed.
+  #
+  # Point-of-no-return. DataForest does not guarantee reacquisition of a
+  # released IPv4. The operator dispatches this as a separate workflow
+  # run; no automatic dependency reaches it.
+  #
+  # Two jobs, each pinned to its own protected environment. A GitHub
+  # job can reference exactly one environment, and the OLD_IP release
+  # is structurally two stages:
+  #   1. cloudflare-finalize-precheck (cloudflare-production) re-reads
+  #      both accounts' DNS against the persisted manifest, persists a
+  #      token-free `dns_finalize_verified` marker. Carries only the
+  #      two Cloudflare account tokens; no DataForest token.
+  #   2. dataforest-provider-finalize (dataforest-production) reads
+  #      that marker, validates the digest + txid + seed_id, then
+  #      runs seed.remove-ipv4. Carries only DATAFOREST_API_TOKEN; no
+  #      Cloudflare token.
+  #
+  # `finalize` is the only operation that may legitimately release
+  # the burned address. `change-ip`, `provider-only`, and `rollback`
+  # MUST all refuse it.
+  # ===========================================================================
+  cloudflare_finalize_precheck:
+    name: finalize · Cloudflare DNS read-back (two-account, CF production)
+    if: inputs.operation == 'finalize' && inputs.provider == 'dataforest'
+    runs-on: ubuntu-latest
+    environment: cloudflare-production
+    timeout-minutes: 30
+    outputs:
+      txid: ${{ steps.pick.outputs.txid }}
+    env:
+      # Two-account Cloudflare ONLY. No legacy CLOUDFLARE_API_TOKEN
+      # alias. The two-step precheck writes a fresh
+      # `dns_finalize_verified` marker the provider step consumes;
+      # the marker carries the digest, NOT the token values.
+      CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+      CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - uses: actions/download-artifact@v4
+        with: {name: rotation-state, path: state/}
+      - name: Refuse if no checkpoint
+        run: |
+          test -n "$(ls state/*.json 2>/dev/null)" || {
+            echo "no rotation-state artifact found; run a change-ip first";
+            exit 1;
+          }
+      - id: pick
+        name: Pick the awaiting_finalize txid
+        run: |
+          TXID=$(ls -t state/*.json | head -1 | xargs -n1 basename | sed 's/\.json$//')
+          STATE=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['state'])")
+          test "$STATE" = "awaiting_finalize" || {
+            echo "checkpoint state is '$STATE'; finalize must run from awaiting_finalize";
+            exit 11;
+          }
+          echo "txid=$TXID" >> "$GITHUB_OUTPUT"
+      - name: finalize precheck · Cloudflare DNS read-back (two-account)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 6 \
+            --expect-state dns_finalize_verified \
+            --expect-marker dns_finalize_verified \
+            --txid "${{ steps.pick.outputs.txid }}" \
+            --label "finalize.precheck" \
+            -- python3 rotate.py finalize-precheck \
+              --config rotation.yml \
+              --txid "${{ steps.pick.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-prechecked, path: state/, retention-days: 3}
+
+  dataforest_provider_finalize:
+    name: finalize · release OLD_IP (DataForest production)
+    if: inputs.operation == 'finalize' && inputs.provider == 'dataforest'
+    needs: [cloudflare_finalize_precheck]
+    runs-on: ubuntu-latest
+    environment: dataforest-production
+    timeout-minutes: 30
+    env:
+      # DataForest token ONLY. No Cloudflare token in scope; the
+      # marker persisted by the precheck job is the contract.
+      DATAFOREST_API_TOKEN: ${{ secrets.DATAFOREST_API_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - uses: actions/download-artifact@v4
+        with: {name: rotation-state-prechecked, path: state/}
+      - name: finalize provider · release OLD_IP (DF token only)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 0 \
+            --expect-state done \
+            --expect-marker old_ip_removed \
+            --expect-marker dns_finalize_verified \
+            --txid "${{ needs.cloudflare_finalize_precheck.outputs.txid }}" \
+            --label "finalize.provider" \
+            -- python3 rotate.py provider-finalize \
+              --config rotation.yml \
+              --txid "${{ needs.cloudflare_finalize_precheck.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-finalized, path: state/, retention-days: 3}
+
+  # ===========================================================================
   # operation: rollback — puts the OLD address back.
   #
   # Never automatic. GitLab keeps a finished pipeline's manual jobs clickable;
@@ -330,12 +756,18 @@ jobs:
   # ===========================================================================
   rollback:
     name: roll back to the old IP
-    if: inputs.operation == 'rollback'
+    if: inputs.operation == 'rollback' && inputs.provider == 'hcloud'
     runs-on: ubuntu-latest
     environment: hetzner-production
+    timeout-minutes: 30
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       GH_TOKEN: ${{ github.token }}
+      # CLOUDFLARE_API_TOKEN is intentionally absent at the job level.
+      # The DNS rollback step below carries it ONLY when the checkpoint
+      # indicates DNS recovery is required. A provider rollback that
+      # never touched Cloudflare skips that step entirely, and the
+      # token never enters this process.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -418,10 +850,178 @@ jobs:
           print(f"txid={txid}")
           EOF
       - run: python3 rotate.py status --config rotation.yml --txid "${{ steps.cp.outputs.txid }}"
-      - run: |
+      # Provider half only — no Cloudflare token. The DNS step below is
+      # gated on the checkpoint showing DNS recovery is required.
+      - name: Roll back the provider IP
+        run: |
           python3 rotate.py rollback --config rotation.yml \
             --txid "${{ steps.cp.outputs.txid }}" \
-            --confirm-server-id "${{ inputs.server_id }}"
+            --confirm-server-id "${{ inputs.server_id }}" \
+            --no-dns-rollback
+      # Decide from the checkpoint whether DNS recovery is required. This
+      # is a positive check (==) on a real field; no falsy-ternary trick.
+      - name: Decide whether DNS rollback is required
+        id: need_dns
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json, os
+          files = sorted(glob.glob("state/*.json"), key=os.path.getmtime)
+          cp = json.load(open(files[-1]))
+          needs_dns = (
+              cp.get("cloudflare_apply_started") is not None
+              or cp.get("cloudflare_apply") is not None
+              or ((cp.get("ansible") or {}).get("rc") == 0)
+          )
+          print(f"needs_dns_rollback={'true' if needs_dns else 'false'}")
+          EOF
+      # The DNS rollback step. CLOUDFLARE_API_TOKEN lives ONLY here.
+      # The gate is a positive == on the previous step's output. When
+      # the previous step set needs_dns_rollback=false, this step is
+      # skipped, the token is never exported, and the env block is
+      # never evaluated against `secrets.CLOUDFLARE_API_TOKEN`.
+      - name: Roll back the DNS records
+        if: steps.need_dns.outputs.needs_dns_rollback == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python3 rotate.py rollback --config rotation.yml \
+            --txid "${{ steps.cp.outputs.txid }}" \
+            --confirm-server-id "${{ inputs.server_id }}" \
+            --dns-rollback-only
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: rotation-state-rolledback, path: state/, retention-days: 30}
+        with: {name: rotation-state-rolledback, path: state/, retention-days: 3}
+
+  # -----------------------------------------------------------------------------
+  # operation: rollback for DataForest. The Hetzner rollback restores the
+  # OLD IP to the server; the DataForest rollback removes the NEW_IP from
+  # the Seed and reverts DNS / inventory / guest to OLD_IP. The same
+  # never-acquire-OLD-IP-back guarantee applies.
+  # -----------------------------------------------------------------------------
+  rollback_dataforest:
+    name: DataForest rollback (release NEW_IP, revert guest + DNS in isolated stages)
+    if: inputs.operation == 'rollback' && inputs.provider == 'dataforest'
+    runs-on: ubuntu-latest
+    environment: dataforest-production
+    timeout-minutes: 30
+    env:
+      # Job-level: GH_TOKEN only. The DNS step adds the CF token
+      # at step scope; the provider step adds DATAFOREST_API_TOKEN
+      # at step scope. Neither token is in the JOB env, so a
+      # process that runs only the job's env sees no production
+      # secret.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+      - name: Find the last DataForest transaction
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys, urllib.request
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          h = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json"}
+          arts = json.loads(urllib.request.urlopen(urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/actions/artifacts?per_page=100",
+              headers=h)).read())["artifacts"]
+          live = [a for a in arts
+                  if not a["expired"] and a["name"].startswith("rotation-state")]
+          if not live:
+              sys.exit("no rotation-state artifact; nothing to roll back")
+          finals = [a for a in live if a["name"].endswith("-finalized")]
+          art = max(finals or live, key=lambda a: a["created_at"])
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ARTIFACT_NAME={art['name']}\n")
+              f.write(f"ARTIFACT_RUN_ID={art['workflow_run']['id']}\n")
+          EOF
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: state/
+          github-token: ${{ github.token }}
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
+      - name: Pick the rollback txid
+        id: pick
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json, os
+          files = sorted(glob.glob("state/*.json"), key=os.path.getmtime)
+          cp = json.load(open(files[-1]))
+          print(f"txid={cp['txid']}")
+          EOF
+      # Decide from the checkpoint whether DNS rollback is required. This
+      # is a positive check (==) on a real field; no falsy-ternary trick.
+      - name: Decide whether DNS rollback is required
+        id: need_dns
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json, os
+          files = sorted(glob.glob("state/*.json"), key=os.path.getmtime)
+          cp = json.load(open(files[-1]))
+          needs_dns = (
+              cp.get("cloudflare_apply_started") is not None
+              or cp.get("cloudflare_apply") is not None
+              or ((cp.get("ansible") or {}).get("rc") == 0)
+          )
+          print(f"needs_dns_rollback={'true' if needs_dns else 'false'}")
+          EOF
+      # The DNS rollback step. CLOUDFLARE_API_TOKEN lives ONLY here.
+      # The DataForest provider step below MUST NOT see it.
+      - name: Roll back DNS (CF token only)
+        if: steps.need_dns.outputs.needs_dns_rollback == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 5 \
+            --expect-state rolled_back \
+            --txid "${{ steps.pick.outputs.txid }}" \
+            --label "rollback.dns" \
+            -- python3 rotate.py rollback-dns --config rotation.yml \
+              --txid "${{ steps.pick.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      # Inventory rollback — no token.
+      - name: Roll back inventory (no token)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 5 \
+            --expect-state rolled_back \
+            --txid "${{ steps.pick.outputs.txid }}" \
+            --label "rollback.inventory" \
+            -- python3 rotate.py rollback-inventory --config rotation.yml \
+              --txid "${{ steps.pick.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      # Guest rollback — no token.
+      - name: Roll back guest (no token)
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 5 \
+            --expect-state rolled_back \
+            --txid "${{ steps.pick.outputs.txid }}" \
+            --label "rollback.guest" \
+            -- python3 rotate.py rollback-guest --config rotation.yml \
+              --txid "${{ steps.pick.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      # Provider rollback — DF token only. The CF token MUST NOT be in
+      # scope; the CLI refuses if it is.
+      - name: Provider rollback (DF token only, release NEW_IP)
+        env:
+          DATAFOREST_API_TOKEN: ${{ secrets.DATAFOREST_API_TOKEN }}
+        run: |
+          python3 .github/scripts/stage.py \
+            --expect-rc 5 \
+            --expect-state rolled_back \
+            --expect-marker rollback_dns_step_at \
+            --txid "${{ steps.pick.outputs.txid }}" \
+            --label "rollback.provider" \
+            -- python3 rotate.py rollback-provider --config rotation.yml \
+              --txid "${{ steps.pick.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-rolledback-dataforest, path: state/, retention-days: 3}

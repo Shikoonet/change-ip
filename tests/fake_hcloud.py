@@ -252,6 +252,15 @@ def example_config(fake: FakeHcloud, alias: str = "Hetzner-DE") -> Dict[str, Any
             "node_record_zone": "tinooer.top",
             "allowed_records": [f"{alias}.tinooer.top"],
         },
+        "cloudflare": {
+            "expected_record_count": 4,
+            "allowed_records": [
+                f"{alias}.tinooer.top",
+                f"verb-{alias}.miragerunner.com",
+                f"verb-{alias}.palfora.ir",
+                f"verb-{alias}.shikoonet.xyz",
+            ],
+        },
         "timeouts": {"power_off": 180, "power_on": 300, "ssh": 10},
         "retries": {"provider": 2, "provider_delay": 0, "health": 3, "health_delay": 0},
         "old_ip": {"retention": "keep"},

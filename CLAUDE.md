@@ -42,6 +42,8 @@
 | `providers.py` | `HcloudProvider` — تنها لایه‌ای که با ارائه‌دهنده حرف می‌زند، از پشت seam‌ی به‌نام `runner` |
 | `ansible_adapter.py` | مکث inventory و `make ip-change HOST=<alias>` |
 | `hcloud_step.yml` | **تنها فایلی که می‌تواند چیزی را در هتزنر عوض کند.** یک `op` در هر اجرا |
+| `cloudflare_replace_ip_step.yml` | **تنها فایلی که می‌تواند رکورد DNS را در Cloudflare PATCH کند.** چهار op (`discover`/`apply`/`rollback`/`verify`) با manifest واحد |
+| `cloudflare_adapter.py` | دوری runner subprocess برای playbook، atomic tmpfile، redaction، رد توکن |
 | `tests/test_rotation.py` | رفتار — ماشین حالت، جدول rollback، resume از هر checkpoint |
 | `tests/contract.yml` | قرارداد — منبع را به‌عنوان **متن** و به‌عنوان **YAML** می‌خواند |
 | `.github/workflows/run.yml` | تنها workflow: روی push فقط تست آفلاین؛ عملیات‌ها با دراپ‌داون `operation` در dispatch. گیت انسانی، required reviewer روی environment است |
@@ -66,9 +68,72 @@ make ip-rotate-status  TXID=<t>
 
 ## `--until` و مرز CD
 
-`--until` فقط `connectivity_ok` و `ansible_done` را می‌پذیرد (`PAUSABLE` در `rotate.py`) —
-دو حالتی که باکس روشن و قابل‌دسترس است. **این لیست را گشاد نکنید:** هر حالت دیگری وسط swap
-است و «اینجا بایست» آنجا یعنی یک نود بدون هیچ آدرسی.
+`--until` فقط `connectivity_ok` و `ansible_done` و `cloudflare_replaced` را می‌پذیرد (`PAUSABLE`
+در `rotate.py`) — سه حالتی که باکس روشن و قابل‌دسترس است. **این لیست را گشاد نکنید:** هر حالت
+دیگری وسط swap است و «اینجا بایست» آنجا یعنی یک نود بدون هیچ آدرسی.
+
+## state flow جدید
+
+```
+confirmed → cloudflare_preflighted → new_ip_allocated → server_off
+        → old_ip_unassigned → new_ip_assigned → server_on
+        → connectivity_ok → ansible_done → cloudflare_replaced → done
+```
+
+`cloudflare_preflighted` اول می‌آید (پیش از هر mutation روی هتزنر): discover یک manifest
+از رکوردهای A داخل allowlist می‌سازد و قبل از اینکه یک بیت روی هتزنر عوض شود آن را روی
+چک‌پوینت persist می‌کند. `cloudflare_replaced` بعد از `ansible_done` می‌آید: PATCH فقط روی
+record IDهای manifest، نه scan، نه discover ثانویه، نه expansion.
+
+## allowlist (manifest، نه scan)
+
+`cloudflare.allowed_records` در کانفیگ فهرست FQDNهایی است که این چرخش حق عوض‌کردنشان را
+دارد. discover آن‌ها را resolve می‌کند، record_idهایشان را در manifest ذخیره می‌کند، و
+apply/rollback فقط آن record_idها را PATCH می‌زنند. اگر در کانفیگ هشت FQDN لیست شده ولی
+Cloudflare فقط شش تا برگرداند، preflight می‌ایستد — «نیمه‌ای که می‌بینم» نمی‌تواند
+«نیمه‌ای که عوض می‌کنم» باشد.
+
+## mutation-manifest برای rollback امن
+
+هر PATCH روی یک record_id کاملاً مشخص روی manifest انجام می‌شود — نه روی نتیجه‌ی
+discover ثانویه. اگر بین discover و apply انسانی رکوردی را ویرایش کرده باشد، apply با
+validation_error (نه drift ساکت) شکست می‌خورد. rollback همان record_idهای manifest را
+می‌گیرد و PATCH می‌کند و اگر یکی از آن‌ها هم‌اکنون محتوای شخص ثالث داشته باشد (یا اصلاً
+نباشد)، در JSON خروجی `rollback_incomplete: true` می‌نویسد.
+
+## توکن (از env، نه از argv، نه از checkpoint)
+
+`CLOUDFLARE_API_TOKEN` از env؛ ماژول `ansible.builtin.uri` خودش هدر `Authorization` را
+از آن می‌سازد. قرادرد آفلاین `no_log: true` روی هر task با `Authorization` را assert
+می‌کند و `cloudflare_adapter.redact_tree()` در زمان نوشتن روی دیسک redaction انجام می‌دهد
+تا یک field که فردا خروجی Ansible را حمل می‌کند نتواند نشت دهد.
+
+## رفتار non-TTY
+
+در غیاب TTY (CI، اجرای remote)، `inventory_step` و `inventory_rollback_step` همچنان
+متن را پرینت می‌کنند ولی prompt در انتظار پاسخ نمی‌ماند. CI باید اپراتورِ معتبر شدن
+inventory edit را با grep روی ریپوی shikoonet (همان که در جاب `dns` هست) ثابت کند، نه با
+`yes` خودکار.
+
+## preflight پیش از ارائه‌دهنده
+
+`cloudflare_preflight` نخستین step بعد از `confirmed` است و حتی پیش از allocate هم
+اجرا می‌شود. اگر Cloudflare token موجود نباشد، یا allowlist نامعتبر باشد، یا DNS خراب
+باشد، ابزار **پیش از اینکه یک IP بیل شود** شکست می‌خورد. هزینه‌ی شکست preflight: پیام
+stderr، نه یک node با آدرس سوخته.
+
+## partial-failure recovery (rollback_incomplete)
+
+اگر DNS rollback با موفقیت کامل نشود (یکی از رکوردها third-party، یا missing)، ابزار
+outcome را `rollback_incomplete` می‌گذارد (کد خروج ۷، با `EXIT_ROLLED_BACK=5` و
+`EXIT_ESCALATED=4` فرق دارد). آدرس روی سرور برگشته، اما DNS یا inventory تمام نشده؛
+operator ادامه می‌دهد با خواندن checkpoint و پاک‌کردن بقیه‌ی رکوردها دستی.
+
+## provider_only opt-out (برای throwaway test servers)
+
+`cloudflare.mode: provider_only` در کانفیگ کل DNS half را ساختاری غیرفعال می‌کند.
+ابزار در `connectivity_ok` pause می‌کند، حتی بدون `--until`. validate_config هر مقدار
+دیگری را رد می‌کند چون «skip ساکت» و «pause اعلام‌شده» فرق دارد.
 
 `EXIT_PAUSED` عمداً ۶ است و نه ۴ (`EXIT_ESCALATED`). یک مرز عادی pipeline که قرمز نشان داده
 شود، همان مکانیزمی است که باعث می‌شود escalation واقعی دیده نشود — همان درسی که در shikoonet
@@ -92,6 +157,34 @@ make ip-rotate-status  TXID=<t>
 
 **قاعده‌ی عمومی: وقتی یک گیت انسانی باید از اتوماسیون جان سالم به در ببرد، prompt را با چکی
 جایگزین کنید که اتوماسیون بتواند رویش شکست بخورد. هرگز با یک فرض.**
+
+## سکرت‌ها و environmentها (قبل از اولین dispatch)
+
+سکرت‌های workflow در `.github/workflows/run.yml` مستند شده‌اند؛ اینجا فقط چک‌لیست
+است برای قبل از اولین `workflow_dispatch` زنده.
+
+| نام | scope | استفاده |
+|---|---|---|
+| `HCLOUD_TOKEN` | env `hetzner-plan`، `hetzner-production` | فراخوانی hcloud در plan / swap / dns / verify / rollback |
+| `ROTATION_CONFIG` | env `hetzner-plan`، `hetzner-production` | محتوای `rotation.yml` (paste **بدون** `---` ابتدایی؛ Actions هر خط را مستقل ماسک می‌کند — اما masking best-effort است، نه مر امنت;ی;.ی: structured data یا JSON یا XML YAML is not safe; keep the raw و transformed value out of logs and step summary) |
+| `SHIKOONET_REPO` | repo | URL without credential in the URL itself; clone in job `dns` uses a temporary git credential helper that injects the token only for the one `git clone` call and is removed immediately after — never write the URL with token to `.git/config` and never leave the helper configured past the clone |
+| `SSH_PRIVATE_KEY` | repo | فقط استپ `Resume the rotation in shikoonet` (جاب `dns`) |
+| `ANSIBLE_VAULT_PASSWORD` | repo | vault شیکونِت، همان استپ |
+| `CLOUDFLARE_API_TOKEN` | env `hetzner-production` (یا هر محیط دیگری که جاب dns نیاز دارد) | فقط استپ‌هایی که playbook Cloudflare را اجرا می‌کنند؛ گیت مثبت `==` مانع نشت توکن به provider-only می‌شود. **environment secret**, نه repo secret — یک repo secret readable توسط هر workflow در هر برنCH است. |
+
+environmentها:
+- `hetzner-plan` — جاب‌های `plan` و `verify` (فقط‌خواندنی)
+- `hetzner-production` — جاب‌های `swap`، `dns`، `rollback` با required reviewer
+
+```bash
+gh secret list --repo Shikoonet/change-ip            # 5 سکرت repo-level
+gh secret list --env hetzner-plan --repo Shikoonet/change-ip      # HCLOUD_TOKEN, ROTATION_CONFIG
+gh secret list --env hetzner-production --repo Shikoonet/change-ip # همه‌ی توکن‌های production روی محیط production
+gh api repos/Shikoonet/change-ip/environments        # 2 environment با reviewer
+```
+
+`HCLOUD_TOKEN` و `ROTATION_CONFIG` روی **environment** باشند نه روی repo — یک سکرت
+repo-wide برای هر جابی روی هر برنچی قابل‌خواندن است. ماسک یک مرز نیست.
 
 ## قراردادها
 

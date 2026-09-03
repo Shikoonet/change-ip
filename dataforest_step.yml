@@ -1,0 +1,438 @@
+---
+# =============================================================================
+# dataforest_step.yml — the ONLY file that mutates the guest network during
+# a DataForest rotation.
+#
+#   ansible-playbook dataforest_step.yml -e op=configure_guest \
+#     -e step_out=/tmp/x.json -e '{...}'
+#
+# One invocation, one operation. rotate.py drives it as a subprocess and
+# reads back the JSON written to `step_out`. This file models
+# hcloud_step.yml's shape: one connection, one fact set, one op at a time.
+#
+# Supported ops:
+#   * detect_network_manager — return the manager name + a snapshot of
+#     existing interface / addresses / routes.
+#   * configure_guest        — add NEW_IP at runtime first, then persist.
+#   * verify_guest           — confirm NEW_IP is bound, OLD_IP still
+#                              bound, the SSH key reachable on NEW_IP,
+#                              and the configured service probes succeed.
+#   * remove_guest_address   — temporarily remove OLD_IP from the guest
+#                              while DataForest still owns it (finalize
+#                              preparation).
+#   * restore_guest          — restore a backup of the persistent
+#                              configuration taken before configure_guest.
+#
+# `connection: local` + `gather_facts: false` are load-bearing. The SSH
+# probe is the only thing that talks to the node over the network; every
+# other call uses `ansible.builtin.command` against the local control
+# node's network manager.
+#
+# Command construction is strict: every `ip` / `netplan` / `nmcli` /
+# `systemctl` invocation uses an argv list, never a shell. The values
+# come from a single `-e` JSON blob that has already been validated by
+# rotate.py (network_manager, interface, addresses, CIDR, gateway).
+#
+# Persistent paths and command paths are env-driven (DF_NETPLAN_DIR,
+# DF_SYSTEMD_NETWORK_DIR, DF_INTERFACES_D_DIR, IP_BIN, NETPLAN_BIN,
+# NMCLI_BIN, NETWORKCTL_BIN, SYSTEMCTL_BIN, SSH_BIN, SSH_KEYSCAN_BIN,
+# DF_PERSISTENT_DIR) so the offline test suite can drive the playbook
+# against fake binaries and a temp directory — without ever writing
+# to a real /etc path or invoking a real binary. rotate.py MUST export
+# all of these before the subprocess starts; defaults below point at
+# the canonical system locations and a real /etc would only ever be
+# touched in production where the defaults are correct.
+#
+# NO `ignore_errors:`, NO `failed_when: false`, NO `state: absent`.
+# =============================================================================
+- name: "dataforest step"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    ansible_managed: "Managed by Ansible (server-ip-rotation) - do not edit by hand"
+    _ops:
+      - detect_network_manager
+      - configure_guest
+      - verify_guest
+      - remove_guest_address
+      - restore_guest
+    # All binary paths are env-driven. Production defaults point at the
+    # system binaries; the offline harness overrides every one of these.
+    _ip_bin: "{{ lookup('env', 'IP_BIN') | default('/sbin/ip', true) }}"
+    _netplan_bin: "{{ lookup('env', 'NETPLAN_BIN') | default('/usr/sbin/netplan', true) }}"
+    _nmcli_bin: "{{ lookup('env', 'NMCLI_BIN') | default('/usr/bin/nmcli', true) }}"
+    _networkctl_bin: "{{ lookup('env', 'NETWORKCTL_BIN') | default('/usr/bin/networkctl', true) }}"
+    _systemctl_bin: "{{ lookup('env', 'SYSTEMCTL_BIN') | default('/usr/bin/systemctl', true) }}"
+    _ssh_bin: "{{ lookup('env', 'SSH_BIN') | default('/usr/bin/ssh', true) }}"
+    _ssh_keyscan_bin: "{{ lookup('env', 'SSH_KEYSCAN_BIN') | default('/usr/bin/ssh-keyscan', true) }}"
+    # Persistent configuration paths. Production defaults are real /etc
+    # paths; the offline harness MUST override ALL of these with a temp
+    # dir. The playbook asserts the env vars are present before any
+    # persistent write — production values match the defaults above,
+    # but the env-driven seam means a missed override can never silently
+    # touch real /etc.
+    _netplan_dir: "{{ lookup('env', 'DF_NETPLAN_DIR') | default('/etc/netplan', true) }}"
+    _systemd_network_dir: "{{ lookup('env', 'DF_SYSTEMD_NETWORK_DIR') | default('/etc/systemd/network', true) }}"
+    _interfaces_d_dir: "{{ lookup('env', 'DF_INTERFACES_D_DIR') | default('/etc/network/interfaces.d', true) }}"
+    _persistent_dir: "{{ lookup('env', 'DF_PERSISTENT_DIR') | default('', true) }}"
+
+  tasks:
+    - name: "dataforest | refuse unknown op"
+      ansible.builtin.assert:
+        that:
+          - op in _ops
+        fail_msg: "dataforest step: unknown op {{ op | default('<unset>') }}"
+
+    - name: "dataforest | write result envelope"
+      ansible.builtin.set_fact:
+        _result_path: "{{ step_out }}"
+
+    # ------------------------------------------------------------ detect ---
+    - name: "dataforest | detect network manager"
+      when: op == 'detect_network_manager'
+      block:
+        - name: "dataforest | probe netplan"
+          ansible.builtin.stat:
+            path: "{{ _netplan_dir }}"
+          register: _np_dir
+          changed_when: false
+        - name: "dataforest | probe systemd-networkd"
+          ansible.builtin.stat:
+            path: "{{ _systemd_network_dir }}"
+          register: _sn_dir
+          changed_when: false
+        - name: "dataforest | probe NetworkManager"
+          ansible.builtin.command:
+            argv: ["{{ _systemctl_bin }}", "is-active", "NetworkManager.service"]
+          register: _nm_active
+          changed_when: false
+          failed_when: _nm_active.rc not in [0, 3]
+        - name: "dataforest | probe ifupdown"
+          ansible.builtin.stat:
+            path: "{{ _interfaces_d_dir }}"
+          register: _iu_dir
+          changed_when: false
+        - name: "dataforest | pick the manager"
+          ansible.builtin.set_fact:
+            _manager: >-
+              {%- if _np_dir.stat.exists | default(false) -%}netplan
+              {%- elif _sn_dir.stat.exists | default(false) -%}systemd-networkd
+              {%- elif _nm_active.rc == 0 -%}networkmanager
+              {%- elif _iu_dir.stat.exists | default(false) -%}ifupdown
+              {%- else -%}unknown
+              {%- endif -%}
+        - name: "dataforest | read existing interface addresses"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "-o", "-4", "addr", "show"]
+          register: _addr_show
+          changed_when: false
+        - name: "dataforest | read existing routes"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "-o", "-4", "route", "show"]
+          register: _route_show
+          changed_when: false
+        - name: "dataforest | collect snapshot"
+          ansible.builtin.set_fact:
+            _snapshot:
+              network_manager: "{{ _manager }}"
+              addresses: "{{ _addr_show.stdout_lines | default([]) }}"
+              routes: "{{ _route_show.stdout_lines | default([]) }}"
+        - name: "dataforest | write detect result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _snapshot | to_nice_json }}"
+
+    # --------------------------------------------------------- configure ---
+    - name: "dataforest | configure guest network (NEW_IP)"
+      when: op == 'configure_guest'
+      block:
+        - name: "dataforest | add NEW_IP to the running interface"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "addr", "add", "{{ new_address }}", "dev", "{{ interface }}"]
+          register: _add
+          changed_when: true
+        - name: "dataforest | write netplan drop-in (netplan path)"
+          when: snapshot.network_manager == 'netplan'
+          ansible.builtin.copy:
+            dest: "{{ _netplan_dir }}/99-rotation-{{ txid }}.yaml"
+            mode: "0600"
+            content: |
+              network:
+                version: 2
+                ethernets:
+                  {{ interface }}:
+                    addresses:
+                      - {{ new_address }}
+                    routes:
+                      - to: 0.0.0.0/0
+                        via: {{ gateway }}
+          register: _netplan_write
+          changed_when: true
+        - name: "dataforest | netplan generate + apply"
+          when: snapshot.network_manager == 'netplan'
+          ansible.builtin.command:
+            argv: ["{{ _netplan_bin }}", "generate"]
+          changed_when: true
+        - name: "dataforest | write systemd-networkd file (systemd-networkd path)"
+          when: snapshot.network_manager == 'systemd-networkd'
+          ansible.builtin.copy:
+            dest: "{{ _systemd_network_dir }}/99-rotation-{{ interface }}.network"
+            mode: "0644"
+            content: |
+              [Match]
+              Name={{ interface }}
+              [Network]
+              Address={{ new_address }}
+              Gateway={{ gateway }}
+          register: _sn_write
+          changed_when: true
+        - name: "dataforest | networkctl reload (systemd-networkd)"
+          when: snapshot.network_manager == 'systemd-networkd'
+          ansible.builtin.command:
+            argv: ["{{ _networkctl_bin }}", "reload"]
+          changed_when: true
+        - name: "dataforest | configure NM (NetworkManager path)"
+          when: snapshot.network_manager == 'networkmanager'
+          ansible.builtin.command:
+            argv:
+              - "{{ _nmcli_bin }}"
+              - con
+              - mod
+              - "{{ interface }}"
+              - ipv4.addresses
+              - "{{ new_address }}"
+              - ipv4.gateway
+              - "{{ gateway }}"
+          register: _nm_mod
+          changed_when: true
+        - name: "dataforest | ifupdown append (ifupdown path)"
+          when: snapshot.network_manager == 'ifupdown'
+          ansible.builtin.blockinfile:
+            path: "{{ _interfaces_d_dir }}/{{ interface }}-rotation"
+            create: true
+            mode: "0644"
+            block: |
+              auto {{ interface }}
+              iface {{ interface }} inet static
+                address {{ new_address }}
+                gateway {{ gateway }}
+          register: _iu_write
+          changed_when: true
+        - name: "dataforest | refuse unknown network manager"
+          when: snapshot.network_manager not in ['netplan', 'systemd-networkd',
+                                                'networkmanager', 'ifupdown']
+          ansible.builtin.fail:
+            msg: "dataforest step: network_manager {{ snapshot.network_manager }} is not supported"
+        - name: "dataforest | capture env-driven paths of persistent files we wrote"
+          ansible.builtin.set_fact:
+            _written: >-
+              {{ [_netplan_dir ~ '/99-rotation-' ~ txid ~ '.yaml',
+                  _systemd_network_dir ~ '/99-rotation-' ~ interface ~ '.network',
+                  _interfaces_d_dir ~ '/' ~ interface ~ '-rotation'] | select | list }}
+        - name: "dataforest | configure_guest result body"
+          ansible.builtin.set_fact:
+            _result_body:
+              ok: true
+              op: "configure_guest"
+              invocation_id: "{{ invocation_id }}"
+              network_manager: "{{ snapshot.network_manager }}"
+              written: "{{ _written | default([]) }}"
+        - name: "dataforest | write configure result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            # `ansible.builtin.copy` writes `content` as a string; a YAML
+            # mapping would be coerced to its Python repr and `json.load`
+            # on the adapter side would raise `ValueError`. Same shape as
+            # the detect result at line 148: pipe the body through
+            # `to_nice_json` so the on-disk file is valid for the adapter.
+            content: "{{ _result_body | to_nice_json }}"
+
+    # ----------------------------------------------------------- verify ---
+    - name: "dataforest | verify guest network"
+      when: op == 'verify_guest'
+      block:
+        - name: "dataforest | ip -o addr show dev interface"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "-o", "-4", "addr", "show", "dev", "{{ interface }}"]
+          register: _v_addr
+          changed_when: false
+        # Parse `ip -o -4 addr show` output to a clean list of addresses.
+        # Substring matching against the raw stdout is unsafe: 10.0.0.1 is a
+        # substring of 10.0.0.10, so a presence assertion on 10.0.0.1 passes
+        # even when only 10.0.0.10 is bound. Two output shapes are accepted:
+        #   * real ip:  `2: eth0    inet 203.0.113.10/32 brd ...`
+        #   * fake ip (tests/fakebin): `    inet 203.0.113.10/32 brd ...`
+        # Strip the `/prefix`, compare against the requested IPs exactly.
+        - name: "dataforest | parse bound addresses"
+          ansible.builtin.set_fact:
+            _v_addrs: "{{ _v_addr.stdout_lines | map('regex_replace', '^\\s*(?:\\d+:\\s+\\S+\\s+)?inet\\s+(\\S+).*$', '\\1') | map('regex_replace', '/\\d+$', '') | list }}"
+        - name: "dataforest | assert NEW_IP is on the interface"
+          ansible.builtin.assert:
+            # `new_address` carries a `/prefix`; strip it for exact match
+            # against the parsed list.
+            that:
+              - new_address | regex_replace('/\\d+$','') in _v_addrs
+            fail_msg: "{{ new_address }} is not bound to {{ interface }} after configure_guest (bound: {{ _v_addrs }})"
+        - name: "dataforest | assert OLD_IP is still on the interface"
+          ansible.builtin.assert:
+            that:
+              - old_address | regex_replace('/\\d+$','') in _v_addrs
+            fail_msg: "{{ old_address }} was removed from {{ interface }}; configure_guest must not touch OLD_IP (bound: {{ _v_addrs }})"
+        - name: "dataforest | assert default route is present"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "-o", "-4", "route", "show", "default"]
+          register: _v_route
+          changed_when: false
+        - name: "dataforest | probe TCP on each configured port"
+          ansible.builtin.wait_for:
+            host: "{{ new_address }}"
+            port: "{{ item.port }}"
+            timeout: "{{ item.timeout | default(5) }}"
+          loop: "{{ service_probes | default([]) }}"
+          loop_control:
+            label: "{{ item.name | default(item.port) }}"
+          when: (service_probes | default([])) | length > 0
+        - name: "dataforest | ssh-keyscan NEW_IP host key"
+          ansible.builtin.command:
+            argv:
+              - "{{ _ssh_keyscan_bin }}"
+              - -T
+              - "{{ ssh_keyscan_timeout | default(5) }}"
+              - "{{ new_address }}"
+          register: _kh
+          changed_when: false
+        - name: "dataforest | compare host key against expected"
+          ansible.builtin.assert:
+            that:
+              - (_kh.stdout | default('')) is search(expected_host_key_pattern)
+            fail_msg: >-
+              ssh-keyscan against {{ new_address }} did not return a host
+              key matching /{{ expected_host_key_pattern }}/. Either the
+              node rotated its host key (refuse) or the connection went
+              somewhere else.
+        - name: "dataforest | verify_guest result body"
+          ansible.builtin.set_fact:
+            _result_body:
+              ok: true
+              op: "verify_guest"
+              invocation_id: "{{ invocation_id }}"
+              ssh_host_key: "{{ _kh.stdout | default('') }}"
+              verified_at: "{{ verified_at | default(lookup('env', 'DF_VERIFIED_AT')) }}"
+        - name: "dataforest | write verify result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _result_body | to_nice_json }}"
+
+    # ---------------------------------------------------- remove_guest ---
+    - name: "dataforest | remove_guest_address (temporary, finalize prep)"
+      when: op == 'remove_guest_address'
+      block:
+        - name: "dataforest | ip addr del OLD_IP"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "addr", "del", "{{ old_address }}", "dev", "{{ interface }}"]
+          register: _del
+          changed_when: true
+        - name: "dataforest | ip -o addr show dev interface (post-del)"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "-o", "-4", "addr", "show", "dev", "{{ interface }}"]
+          register: _v_addr_post
+          changed_when: false
+        # Same exact-membership check as configure_guest — see the comment
+        # there for why substring matching is unsafe. Accepts both the
+        # real ip and the test fake's output formats.
+        - name: "dataforest | parse bound addresses (post-del)"
+          ansible.builtin.set_fact:
+            _v_addrs_post: "{{ _v_addr_post.stdout_lines | map('regex_replace', '^\\s*(?:\\d+:\\s+\\S+\\s+)?inet\\s+(\\S+).*$', '\\1') | map('regex_replace', '/\\d+$', '') | list }}"
+        - name: "dataforest | assert NEW_IP is still on the interface"
+          ansible.builtin.assert:
+            that:
+              - new_address | regex_replace('/\\d+$','') in _v_addrs_post
+            fail_msg: "{{ new_address }} disappeared from {{ interface }} during finalize prep (bound: {{ _v_addrs_post }})"
+        - name: "dataforest | assert OLD_IP is gone from the interface"
+          ansible.builtin.assert:
+            that:
+              - old_address | regex_replace('/\\d+$','') not in _v_addrs_post
+            fail_msg: "{{ old_address }} still bound to {{ interface }}; refusing to call finalize without first removing it from the guest (bound: {{ _v_addrs_post }})"
+        - name: "dataforest | remove_guest_address result body"
+          ansible.builtin.set_fact:
+            _result_body:
+              ok: true
+              op: "remove_guest_address"
+              invocation_id: "{{ invocation_id }}"
+              addresses_after: "{{ _v_addrs_post }}"
+        - name: "dataforest | write remove_guest_address result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _result_body | to_nice_json }}"
+
+    # -------------------------------------------------------- restore ---
+    - name: "dataforest | restore guest network from backup"
+      when: op == 'restore_guest'
+      block:
+        - name: "dataforest | ip addr del NEW_IP (if present)"
+          ansible.builtin.command:
+            argv: ["{{ _ip_bin }}", "addr", "del", "{{ new_address }}", "dev", "{{ interface }}"]
+          register: _del_new
+          changed_when: true
+          failed_when: _del_new.rc not in [0, 2]
+        - name: "dataforest | check sha256 of persistent files"
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          register: _stat
+          loop: "{{ backup_files | default([]) }}"
+          loop_control:
+            label: "{{ item }}"
+          when: (backup_files | default([])) | length > 0
+        - name: "dataforest | refuse if any persistent file drifted"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (backup_files | default([])) | length == 0
+                or
+                (item.stat.checksum is defined
+                 and (expected_checksums | default({}))[item.item] is defined
+                 and item.stat.checksum == (expected_checksums | default({}))[item.item])
+            fail_msg: >-
+              dataforest restore_guest: persistent file {{ item.item }}
+              sha256 does not match the checksum taken before
+              configure_guest. Refusing to restore over a drifted file.
+          loop: "{{ _stat.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item | default('?') }}"
+          when: (backup_files | default([])) | length > 0
+        - name: "dataforest | restore backup file (cp from backup)"
+          ansible.builtin.copy:
+            remote_src: true
+            src: "{{ item }}"
+            dest: "{{ (item | regex_replace('\\.bak$', '')) }}"
+            mode: "preserve"
+          loop: "{{ backup_files | default([]) }}"
+          loop_control:
+            label: "{{ item }}"
+          when: (backup_files | default([])) | length > 0
+        - name: "dataforest | netplan apply (if available)"
+          ansible.builtin.command:
+            argv: ["{{ _netplan_bin }}", "apply"]
+          register: _np_apply
+          changed_when: true
+          failed_when: _np_apply.rc not in [0, 1]
+        - name: "dataforest | restore_guest result body"
+          ansible.builtin.set_fact:
+            _result_body:
+              ok: true
+              op: "restore_guest"
+              invocation_id: "{{ invocation_id }}"
+              restored: "{{ backup_files | default([]) }}"
+        - name: "dataforest | write restore_guest result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _result_body | to_nice_json }}"
