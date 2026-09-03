@@ -61,8 +61,14 @@ jobs:
         with: {python-version: '3.11'}
       - name: Install dependencies (one-shot)
         run: |
-          pip install --quiet --disable-pip-version-check ansible-core
-          pip install --quiet --disable-pip-version-check yamllint ansible-lint
+          # The Makefile's `lint` target hard-codes `.lint-venv/bin/` for
+          # yamllint and ansible-lint, so create that venv and install
+          # the same tools there. Installing them at system level would
+          # leave `make lint` and `make ci-full` looking for binaries
+          # the workflow did not actually install.
+          python3 -m venv .lint-venv
+          .lint-venv/bin/pip install --quiet --disable-pip-version-check \
+            ansible-core yamllint ansible-lint
           ansible-galaxy collection install --force 'hetzner.hcloud:>=7.0.0,<8.0.0'
       - name: Classify change and pick CI tier
         id: classify
