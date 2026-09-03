@@ -70,7 +70,15 @@ REMAINING_WRITES = {
 class Base(unittest.TestCase):
     def setUp(self):
         os.environ["HCLOUD_TOKEN"] = FAKE_TOKEN
-        os.environ.setdefault("CLOUDFLARE_API_TOKEN", FAKE_CF_TOKEN)
+        # UNCONDITIONAL assignment, NOT `setdefault`. A developer's
+        # shell that exports a real `CLOUDFLARE_API_TOKEN` would
+        # otherwise leak into the suite: register_secret would only
+        # register FAKE_CF_TOKEN for redaction, every "no token
+        # leaked" assertion checks for a string that's never present,
+        # and `test_missing_token_fails_preflight_before_hetzner`'s
+        # earlier `setdefault`-then-restore pattern left the real
+        # value silently replaced for the rest of the process.
+        os.environ["CLOUDFLARE_API_TOKEN"] = FAKE_CF_TOKEN
         register_secret(FAKE_TOKEN)
         register_secret(FAKE_CF_TOKEN)
         self.tmp = tempfile.TemporaryDirectory()
@@ -1197,26 +1205,51 @@ class TestCloudflareFlow(Base):
                          [r["record_id"] for r in persisted])
 
     def test_rollback_third_party_content_marks_incomplete(self):
-        # Tamper with a record so the rollback sees third-party content.
-        # `assign` is the IP-layer op we force to fail, so the rotation
-        # hits restore_old_ip which then runs the Cloudflare rollback.
-        self.fake.inject("assign", "stuck", "retryable", times=9)
-        # Inject: do the full run on a fresh fake+cf pair. Tamper happens
-        # AFTER apply so the manifest captured the (then-stale) old_ip, and
-        # rollback sees third-party content.
+        # Run the rotation forward to apply (records get PATCHed to
+        # NEW_IP, manifest captures OLD_IP per record). Then tamper
+        # one record's live content to a third-party IP — simulating
+        # a human edit between apply and rollback. Call restore_old_ip
+        # and assert it surfaces `rollback_incomplete` with the
+        # tampered record in `incomplete_records`.
+        #
+        # The earlier version of this test called `self.build()`
+        # without the tampered fake — `build()` constructs a NEW
+        # FakeHcloud(), so the `inject` and any tamper were
+        # discarded. The test then accepted any reachable state and
+        # could not detect a regression in this path.
         rot = self.build()
         cp = self.full_run(rot)
-        # Tamper after apply has already happened (state == cloudflare_replaced,
-        # just before verify). Cause a separate failure: inject on _step_ansible
-        # by failing the IP-change. The simplest path is the post-tampering
-        # verify failing — but the run already got past it. The state machine
-        # only re-enters restore_old_ip via _handle_failure.
-        # Instead, trigger via the IP-change non-zero RC.
-        rot2 = self.build(rc=1)  # non-zero ip_change => escalate path
-        cp2 = self.full_run(rot2)
-        # The behaviour we care about is exercised by the next test that
-        # directly forces restore_old_ip. Here we simply assert the state.
-        self.assertIn(cp2["state"], ("escalated", "rollback_incomplete"))
+        self.assertEqual(cp["state"], "done",
+                          msg=f"setup failed before tamper: {cp}")
+        # Tamper: overwrite the live content of the first record with
+        # a third-party IP, so the rollback reads a value that is
+        # neither OLD_IP (so it tries to PATCH) nor NEW_IP (so the
+        # fake's third-party-content branch fires).
+        original = self.cf.records[0]["content"]
+        self.cf.records[0]["content"] = "198.51.100.250"
+        self.addCleanup(
+            lambda: self.cf.records.__setitem__(0, dict(original_record))
+            if False else None  # noqa
+        )
+        # Simpler: explicit restore via a small helper that records
+        # the original dict and re-installs it on cleanup.
+        self.addCleanup(self._restore_record_content, 0, original)
+        # Drive restore_old_ip via the rotation's escalate path
+        # (we do not need to re-run the full plan; just call the
+        # rollback directly via the same `_do_dns_rollback` the
+        # production code uses, then mirror what `restore_old_ip`
+        # does on the caller's side — record the outcome).
+        outcome = rot._do_dns_rollback(cp)
+        cp["rollback"] = {"state": outcome}
+        cp["outcome"] = outcome
+        self.assertEqual(outcome, "rollback_incomplete")
+        rb = cp["cloudflare_rollback"].get("result") or {}
+        incomplete = rb.get("incomplete_records") or []
+        names = [r["name"] for r in incomplete]
+        self.assertIn(self.cf.records[0]["name"], names)
+
+    def _restore_record_content(self, index, original_content):
+        self.cf.records[index]["content"] = original_content
 
     def test_missing_token_fails_preflight_before_hetzner(self):
         os.environ.pop("CLOUDFLARE_API_TOKEN", None)

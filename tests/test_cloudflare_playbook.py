@@ -75,17 +75,23 @@ class _CloudflareHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         self._check_marker()
-        self.request_count += 1
+        # Class-level counter mutation: BaseHTTPRequestHandler instances
+        # are short-lived (one per request), so `self.request_count += 1`
+        # would create a fresh instance attribute per request and the
+        # injected-failure / 429 counters would never trip. The class
+        # attribute is the shared counter, mirroring the pattern already
+        # used by `_CloudflareHandler.request_log.append(...)` above.
+        _CloudflareHandler.request_count += 1
         _CloudflareHandler.request_log.append(f"GET {self.path}")
-        if self.fail_status and self.request_count > self.fail_after:
+        if self.fail_status and _CloudflareHandler.request_count > _CloudflareHandler.fail_after:
             self._send_json({"success": False, "errors": [{"message": "injected"}]}, self.fail_status)
             return
         # 429 retry-emulation. The first `retry_429_count` GETs return
         # 429; everything after that returns 200. Tests that need
         # retry-exhaustion set the count low enough that the playbook's
         # retries are spent.
-        if self.retry_429 and self.retry_429_count > 0:
-            self.retry_429_count -= 1
+        if _CloudflareHandler.retry_429 and _CloudflareHandler.retry_429_count > 0:
+            _CloudflareHandler.retry_429_count -= 1
             self._send_json({"success": False, "errors": [{"message": "rate limited"}]}, 429)
             return
         u = urlparse(self.path)
@@ -107,9 +113,10 @@ class _CloudflareHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):  # noqa: N802
         self._check_marker()
-        self.request_count += 1
+        # Class-level counter — see do_GET for the rationale.
+        _CloudflareHandler.request_count += 1
         _CloudflareHandler.request_log.append(f"PUT {self.path}")
-        if self.fail_status and self.request_count > self.fail_after:
+        if self.fail_status and _CloudflareHandler.request_count > _CloudflareHandler.fail_after:
             self._send_json({"success": False, "errors": [{"message": "injected"}]}, self.fail_status)
             return
         u = urlparse(self.path)
@@ -389,6 +396,7 @@ class TestCloudflarePlaybook(unittest.TestCase):
     def setUp(self):
         _CloudflareHandler.require_test_marker = True
         _CloudflareHandler.request_count = 0
+        _CloudflareHandler.request_log = []
         os.environ["CF_PLAYBOOK_TEST_MODE"] = "1"
 
     def _seed(self, names, *, old_ip="1.1.1.1", ttl=300, proxied=False,
@@ -612,7 +620,10 @@ class TestCloudflarePlaybook(unittest.TestCase):
             allowed=ALLOWLIST_8, manifest=manifest,
         )
         self.assertEqual(rc, 0)
-        # Now rollback. previous_content is now new_ip.
+        # Now rollback. previous_content is now new_ip (2.2.2.2).
+        # The playbook's contract is:
+        #   * old_ip = the BASELINE we are returning to (1.1.1.1)
+        #   * new_ip = the post-apply state we are leaving (2.2.2.2)
         rb_manifest = [{"zone_id": z, "record_id": r["id"],
                         "name": r["name"], "type": "A",
                         "previous_content": "2.2.2.2",
@@ -620,7 +631,7 @@ class TestCloudflarePlaybook(unittest.TestCase):
                        for (z, r) in zr]
         rc, stdout, stderr, result = _run_playbook_full(
             self.base, op="rollback",
-            old_ip="2.2.2.2", new_ip="1.1.1.1",
+            old_ip="1.1.1.1", new_ip="2.2.2.2",
             allowed=ALLOWLIST_8, manifest=rb_manifest, verbose=True,
         )
         if rc != 0:
@@ -951,9 +962,10 @@ class TestCloudflarePlaybook(unittest.TestCase):
         """Rollback when the live state is already at the rollback target
         (someone else restored the records, or a previous failed run left
         them at OLD): the rollback must be a no-op — zero PATCHes.
-        In the rollback convention, new_ip is the target (the OLD value
-        we want back), so live==new_ip classifies every record as
-        already_target and the playbook writes nothing."""
+        Playbook contract: `old_ip` is the BASELINE we are returning to
+        (the OLD value we want back); `new_ip` is the post-apply state
+        we are leaving. When live == old_ip, the playbook classifies
+        the record as `already_target` and writes nothing."""
         zr = self._seed(ALLOWLIST_8, old_ip="1.1.1.1")
         manifest = [{"zone_id": z, "record_id": r["id"],
                      "name": r["name"], "type": "A",
@@ -961,7 +973,7 @@ class TestCloudflarePlaybook(unittest.TestCase):
                     for (z, r) in zr]
         rc, _, _, result = _run_playbook(
             self.base, op="rollback",
-            old_ip="2.2.2.2", new_ip="1.1.1.1",
+            old_ip="1.1.1.1", new_ip="2.2.2.2",
             allowed=ALLOWLIST_8, manifest=manifest,
         )
         self.assertEqual(rc, 0)

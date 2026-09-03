@@ -168,7 +168,13 @@ def run_guest_op(
     if interface is not None:
         blob_args["interface"] = _check_interface(interface)
     if snapshot is not None:
-        blob_args["snapshot"] = json.dumps(snapshot)
+        # Compact JSON + single-quote wrap, matching the cloudflare
+        # adapter: Ansible's `-e key=value` parser tokenizes by
+        # whitespace, so default JSON separators (`, ` and `: `) split
+        # the value into multiple tokens. Compact separators remove
+        # the spaces; the surrounding single quotes are stripped by
+        # Ansible's YAML parser so the inner JSON parses as a mapping.
+        blob_args["snapshot"] = f"'{json.dumps(snapshot, separators=(',', ':'))}'"
     if new_address is not None:
         blob_args["new_address"] = _check_address(new_address)
     if old_address is not None:
@@ -182,11 +188,11 @@ def run_guest_op(
             )
         blob_args["expected_host_key_pattern"] = expected_host_key_pattern
     if service_probes is not None:
-        blob_args["service_probes"] = json.dumps(service_probes)
+        blob_args["service_probes"] = f"'{json.dumps(service_probes, separators=(',', ':'))}'"
     if backup_files is not None:
-        blob_args["backup_files"] = json.dumps(backup_files)
+        blob_args["backup_files"] = f"'{json.dumps(backup_files, separators=(',', ':'))}'"
     if expected_checksums is not None:
-        blob_args["expected_checksums"] = json.dumps(expected_checksums)
+        blob_args["expected_checksums"] = f"'{json.dumps(expected_checksums, separators=(',', ':'))}'"
     if ssh_keyscan_timeout:
         blob_args["ssh_keyscan_timeout"] = int(ssh_keyscan_timeout)
 

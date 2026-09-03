@@ -39,24 +39,42 @@ HERE = Path(__file__).resolve().parent
 
 
 def _parse_e_flags(argv: List[str]) -> Dict[str, str]:
-    """Parse `-e key=value` and `-e '{json}'` arguments."""
+    """Parse `-e key=value` arguments.
+
+    argv shapes seen from the adapters:
+
+        -e operation=apply                        # scalar key=value
+        -e allowed_records='["a","b"]'            # JSON wrapped in '
+        -e manifest='[{...}]'                    # JSON wrapped in '
+        -e result_file=/tmp/x.json               # path with no quotes
+
+    The Cloudflare adapter wraps JSON literals in single
+    quotes so the real ansible-playbook's YAML parser keeps
+    them as a single string (the playbook then `from_json`s
+    them). We mirror that: every `key=value` is split on the
+    first `=`; the value's leading/trailing single quotes are
+    stripped; the unquoted payload (raw JSON for lists, plain
+    text for scalars) is what the caller sees.
+    """
     out: Dict[str, str] = {}
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "-e" and i + 1 < len(argv):
-            val = argv[i + 1]
-            try:
-                obj = json.loads(val)
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        out[k] = str(v)
-                else:
-                    pass
-            except (json.JSONDecodeError, ValueError):
-                if "=" in val:
-                    k, v = val.split("=", 1)
-                    out[k.strip()] = v.strip()
+            raw = argv[i + 1]
+            if "=" not in raw:
+                # `-e '{json}'` (no key) — not used here, ignore.
+                i += 2
+                continue
+            k, v = raw.split("=", 1)
+            v = v.strip()
+            # Strip the outer single quotes the adapter uses
+            # to force YAML to keep the JSON literal as a
+            # string. Real ansible-playbook strips them as
+            # part of YAML parsing; we mimic that here.
+            if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+                v = v[1:-1]
+            out[k.strip()] = v
             i += 2
             continue
         i += 1

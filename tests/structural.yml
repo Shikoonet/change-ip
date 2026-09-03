@@ -1,0 +1,128 @@
+---
+# =============================================================================
+# server-ip-rotation — LIGHTWEIGHT structural contract.
+#
+#   ansible-playbook tests/structural.yml           (or: make ci-fast)
+#
+# `ci-fast` is reserved for docs-only / workflow-only PRs — the only
+# kind of change where a five-minute Python suite would be wasteful.
+# This playbook runs:
+#
+#   * the YAML shape of every step playbook (`--syntax-check`)
+#   * the YAML shape of the CI workflows (parse + no forbidden keys)
+#   * the YAML shape of the rotation example config
+#   * the lightweight Python structural tests under
+#     `tests/test_workflow_structure.py`
+#
+# It deliberately does NOT run:
+#
+#   * the full unittest suite (lives in `ci-provider`)
+#   * the behavioural contract `tests/contract.yml` (lives in
+#     `ci-provider`)
+#   * lint (lives in `ci-full`)
+#   * the real-playbook tests against the loopback API (live in
+#     `ci-provider`)
+#
+# The check is hermetic: no hosts, no network, no Hetzner, no
+# Cloudflare, no tokens. The Ansible binary it shells to is the
+# project-local `.lint-venv/bin/ansible-playbook` (override via
+# `ANSIBLE_PLAYBOOK_BIN=...`).
+# =============================================================================
+- name: "server-ip-rotation structural contract (ci-fast)"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    _proj: "{{ playbook_dir | dirname }}"
+    _steps:
+      - "{{ _proj }}/hcloud_step.yml"
+      - "{{ _proj }}/cloudflare_replace_ip_step.yml"
+      - "{{ _proj }}/dataforest_step.yml"
+      - "{{ _proj }}/node-onboard.yml"
+      - "{{ _proj }}/monitoring-doctor.yml"
+
+  tasks:
+
+    # ---- 1. python-side structural checks (no ansible-playbook needed) ---
+    - name: "structural | workflow structure tests"
+      ansible.builtin.command:
+        cmd: "python3 -m unittest tests.test_workflow_structure"
+        chdir: "{{ _proj }}"
+      changed_when: false
+      register: _workflow_structure
+      failed_when: _workflow_structure.rc != 0
+
+    # ---- 2. every step playbook must pass ansible syntax-check ---------
+    - name: "structural | ansible syntax check for every step playbook"
+      ansible.builtin.command:
+        cmd: "ansible-playbook --syntax-check {{ step }}"
+        chdir: "{{ _proj }}"
+      loop: "{{ _steps }}"
+      loop_control:
+        loop_var: step
+        label: "{{ step | basename }}"
+      changed_when: false
+
+    # ---- 3. CI workflows MUST parse and MUST NOT carry workflow_dispatch -
+    # the offline CI is `ci.yml`; live ops live in `run.yml` only.
+    # `on:` parses as the boolean `True` in YAML, so we look up the
+    # trigger map under BOTH the string and the bool. Two set_fact
+    # tasks because Ansible evaluates the value of every key in a
+    # single set_fact against the OLD var namespace, not the new one
+    # being assigned by the same call.
+    - name: "structural | read ci.yml as YAML"
+      ansible.builtin.set_fact:
+        _ci_yml: "{{ lookup('file', _proj + '/.github/workflows/ci.yml') | from_yaml }}"
+
+    - name: "structural | read ci.yml trigger map"
+      ansible.builtin.set_fact:
+        _ci_triggers: "{{ (_ci_yml['on'] if 'on' in _ci_yml else _ci_yml[True]) }}"
+
+    - name: "structural | assert ci.yml only triggers on push + pull_request"
+      ansible.builtin.assert:
+        that:
+          - _ci_triggers.push is defined
+          - _ci_triggers.pull_request is defined
+          - _ci_triggers.workflow_dispatch is not defined
+        fail_msg: >-
+          ci.yml is the OFFLINE CI; it MUST only trigger on push and
+          pull_request. workflow_dispatch belongs to run.yml (live ops).
+        quiet: true
+
+    - name: "structural | read run.yml as YAML"
+      ansible.builtin.set_fact:
+        _run_yml: "{{ lookup('file', _proj + '/.github/workflows/run.yml') | from_yaml }}"
+
+    - name: "structural | read run.yml trigger map"
+      ansible.builtin.set_fact:
+        _run_triggers: "{{ (_run_yml['on'] if 'on' in _run_yml else _run_yml[True]) }}"
+
+    - name: "structural | assert run.yml only triggers on workflow_dispatch"
+      ansible.builtin.assert:
+        that:
+          - _run_triggers.workflow_dispatch is defined
+          - _run_triggers.push is not defined
+          - _run_triggers.pull_request is not defined
+        fail_msg: >-
+          run.yml is the LIVE-OP workflow; a push or pull_request trigger
+          here would let a code push reach a mutation job.
+        quiet: true
+
+    # ---- 4. rotation.example.yml MUST exist and parse as YAML ----------
+    - name: "structural | rotation.example.yml parses as YAML"
+      ansible.builtin.set_fact:
+        _rotation_example: "{{ lookup('file', _proj + '/rotation.example.yml') | from_yaml }}"
+
+    - name: "structural | assert rotation.example.yml is a documented sample"
+      ansible.builtin.assert:
+        that:
+          - _rotation_example.server.id is defined
+          - _rotation_example.server.expected_ipv4 is defined
+          - (_rotation_example.cloudflare.allowed_records | length) > 0
+        fail_msg: >-
+          rotation.example.yml is the public schema; every field it
+          documents MUST be present and parseable.
+        quiet: true

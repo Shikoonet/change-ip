@@ -5,8 +5,16 @@
 # lives there: `ansible.repo_dir` in rotation.yml points at a checkout of it,
 # and the `ansible_done` step shells `make ip-change HOST=<alias>` inside it.
 # Everything else here runs on its own.
+#
+# Every recipe uses `set -euo pipefail` so a non-zero exit anywhere
+# halts the recipe with the SAME non-zero status. No `|| true`. No
+# `continue-on-error`. The regression test
+# `tests/test_make_failure_propagation.py` proves this for `test`
+# and `ci-fast`. Adding a new gate that swallows a failure must be
+# caught by that test.
 # =============================================================================
 SHELL   := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
 YELLOW  := \033[33m
 RESET   := \033[0m
 
@@ -47,15 +55,26 @@ require-txid:
 	@test -n "$(TXID)" || { printf "$(YELLOW)TXID is required. state/ holds one JSON file per transaction.$(RESET)\n"; exit 1; }
 
 # -- checks -------------------------------------------------------------------
-.PHONY: test
-test:
-	python3 -m unittest discover -s tests -t .
-	python3 rotate.py --self-test
-	ansible-playbook tests/contract.yml
+# The `test`, `ci-fast`, `ci-provider`, `ci-full`, and
+# `test-provider-all` targets are defined below the lint target
+# to keep Makefile parsing simple.
 
 .PHONY: test-cloudflare-playbook
 test-cloudflare-playbook:
-	python3 -m unittest tests.test_cloudflare_playbook -v
+	# Two suites, both real-playbook coverage against a guarded loopback:
+	#   tests.test_cloudflare_playbook — single-account apply/rollback/verify
+	#                                    on a loopback fake API server.
+	#   tests.test_cloudflare_real_playbook_multi_account
+	#                                  — multi-account apply/rollback + the
+	#                                    partial-B-then-real-rollback path,
+	#                                    with a server-restart that proves
+	#                                    the mutation counter survives
+	#                                    process boundaries.
+	# Discover/verify scenarios use GET only; apply/rollback scenarios
+	# drive the loopback server with real PUT/PATCH mutations. The
+	# fake server binds 127.0.0.1 only; nothing here can reach the
+	# real Cloudflare API.
+	python3 -m unittest tests.test_cloudflare_playbook tests.test_cloudflare_real_playbook_multi_account -v
 
 .PHONY: test-dataforest
 test-dataforest:
@@ -71,15 +90,88 @@ test-dataforest-playbook:
 	# failure mode the playbook can produce.
 	python3 -m unittest tests.test_dataforest_playbook -v
 
+.PHONY: ci-fast
+# Docs-only / workflow-only / config-only PRs: ONLY structural
+# checks. No Python unittest suite. No real-playbook integration.
+# No behavioural contract. No lint. Target: < 1 runner minute.
+# The CI workflow's path-routing step selects this target when
+# the diff is docs-only.
+#
+# `tests/structural.yml` reads the YAML shape of every step
+# playbook, every CI workflow, and `rotation.example.yml` —
+# nothing that requires a live API or a long suite. Combined
+# with `tests.test_workflow_structure.py` (Python-side structural
+# checks), this is the only thing ci-fast does.
+ci-fast:
+	@echo "ci-fast: structural playbook (covers both Python structural tests and YAML shape)"
+	# tests/structural.yml itself runs `python3 -m unittest
+	# tests.test_workflow_structure` (the lightweight structural
+	# checks) AND every step playbook's `--syntax-check` AND every
+	# CI workflow's trigger map. Running the Python unittest here
+	# in addition would execute the same suite twice; one
+	# invocation is the contract.
+	ANSIBLE_PLAYBOOK_BIN=$(LINT_BIN)/ansible-playbook \
+	ansible-playbook tests/structural.yml
+
+.PHONY: ci-provider
+# Provider / rotation / workflow / Makefile / test PRs: complete
+# offline coverage — every unit, every staged test, every real-
+# playbook test against a local loopback API, the behavioural
+# contract, and rotate.py --self-test. Lint is NOT in ci-provider:
+# ci-full is the lint gate. This keeps provider PRs fast while
+# still exercising every behaviour.
+ci-provider:
+	@echo "ci-provider: complete offline unit + staged + real-playbook suite"
+	python3 -m unittest discover -s tests -t .
+	python3 rotate.py --self-test
+	# Invoke the contract playbook WITHOUT overriding
+	# `ANSIBLE_PLAYBOOK_BIN` — the contract only reads the
+	# playbooks as text and runs the Python suite, so the
+	# PATH-resolved `ansible-playbook` is the right binary. An
+	# inherited override would force the adapter's
+	# `ROTATION_TEST_MODE is not set` guard to fire on the
+	# subprocesses the unittest exercise.
+	ansible-playbook tests/contract.yml
+
+.PHONY: ci-full
+# Push to main: ci-provider (full offline regression) +
+# blocking lint. ci-full ADDS lint without re-running the
+# provider tests; lint is included in ci-provider above as
+# best-effort, but in ci-full it is a hard gate.
+ci-full: ci-provider
+	@echo "ci-full: ci-provider + blocking lint"
+	@if [ ! -x "$(LINT_BIN)/yamllint" ]; then \
+		echo "yamllint missing at $(LINT_BIN)/yamllint"; exit 127; \
+	fi
+	@if [ ! -x "$(LINT_BIN)/ansible-lint" ]; then \
+		echo "ansible-lint missing at $(LINT_BIN)/ansible-lint"; exit 127; \
+	fi
+	$(LINT_BIN)/yamllint -c .yamllint.yml \
+		hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml \
+		cf_record_pages.yml tests/contract.yml tests/structural.yml \
+		rotation.example.yml
+	$(LINT_BIN)/ansible-lint \
+		hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml
+	ansible-playbook --syntax-check \
+		hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml \
+		tests/contract.yml tests/structural.yml
+	python3 -m compileall -q rotate.py providers.py ansible_adapter.py \
+		cloudflare_adapter.py dataforest_adapter.py \
+		dataforest_guest_adapter.py
+
+.PHONY: test
+# Convenience: the full offline regression in one target. Used
+# by the `ci-provider` and `ci-full` Make entry points.
+test:
+	python3 -m unittest discover -s tests -t .
+	python3 rotate.py --self-test
+	ansible-playbook tests/contract.yml
+
 .PHONY: test-provider-all
-# Provider-only suites. NOTE: this target deliberately does NOT
-# include `make test` — that target already discovers ALL test files
-# (test_dataforest + test_dataforest_playbook + contract + self-test)
-# under `python3 -m unittest discover -s tests -t .`. Running both
-# would double-count every suite. Final reports should state:
-#   unique discovered tests = the count from `make test`
-#   repeated executions      = `make test-provider-all` re-runs the two
-#                              provider suites a second time on top.
+# Provider-only suites (LOCAL convenience target, NOT on the
+# CI path). Runs BOTH provider suites; the dependency graph
+# proves this at test time. Used to iterate on the provider
+# half without re-running the full offline suite.
 test-provider-all: test-dataforest test-dataforest-playbook
 
 .PHONY: lint

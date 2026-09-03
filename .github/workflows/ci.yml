@@ -1,0 +1,92 @@
+# =============================================================================
+# server-ip-rotation — OFFLINE CI
+#
+# This workflow is the required check for `push` and `pull_request`.
+# It runs ONLY offline jobs (no live API calls, no production tokens).
+# Live rotation / finalize / rollback operations live in `run.yml` and
+# are dispatched only via `workflow_dispatch`.
+#
+# Workflow-level concurrency: a newer commit on the same PR cancels the
+# previous offline run. The discriminator is the PR number (or ref on
+# push). A feature-branch push runs the SAME required check as the
+# PR check, so there is no duplicate push workflow.
+# =============================================================================
+name: ci
+
+'on':
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Newer PR run cancels the previous PR run. Live operations in
+# `run.yml` use a different group (`rotation-*`) and are NEVER
+# cancelled by a push.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# The default GITHUB_TOKEN scope is enough to read the repo and
+# upload sanitized failure-only artifacts.
+permissions:
+  actions: read
+  contents: read
+
+# Path-routing is done INSIDE the job, not via a top-level
+# `paths:` filter on the workflow. A `paths:` filter would
+# leave the required check pending on any push that touches
+# filtered-out files, which the brief explicitly forbids.
+#
+# A single offline job:
+#   1. reads the list of files in the push / PR;
+#   2. classifies the change as docs-only or relevant;
+#   3. picks the right Make target (ci-fast vs ci-full);
+#   4. runs the chosen target;
+#   5. fails the required check on lint failure.
+#
+# Checkout, Python setup, and dependency installation happen
+# ONCE per run, not per tier. The `make ci-fast` and
+# `make ci-full` targets themselves contain their own lint
+# invocation.
+jobs:
+  offline:
+    name: offline tests (push + PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - name: Install dependencies (one-shot)
+        run: |
+          pip install --quiet --disable-pip-version-check ansible-core
+          pip install --quiet --disable-pip-version-check yamllint ansible-lint
+          ansible-galaxy collection install --force 'hetzner.hcloud:>=7.0.0,<8.0.0'
+      - name: Classify change and pick CI tier
+        id: classify
+        # The classifier is a small Python script under test
+        # (`tests/test_classify_change.py`). PR diffs use
+        # `pull_request.base.sha..github.sha`; push diffs use
+        # `before..sha`. Any indeterminate diff (missing SHA,
+        # all-zero SHA, shallow clone, git error) escalates to
+        # ci-full. The classifier writes `tier=` to $GITHUB_OUTPUT
+        # so the next step consumes it via the actual step
+        # output, not a transient shell variable.
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          CI_HEAD_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/classify_change.py
+      - name: Run the selected CI tier
+        run: make ${{ steps.classify.outputs.tier }}
+      - name: Upload sanitized failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-${{ github.run_id }}
+          path: |
+            state/
+            test-results/
+          retention-days: 3
+          if-no-files-found: ignore

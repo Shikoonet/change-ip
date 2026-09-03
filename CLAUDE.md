@@ -166,11 +166,11 @@ operator ادامه می‌دهد با خواندن checkpoint و پاک‌کر�
 | نام | scope | استفاده |
 |---|---|---|
 | `HCLOUD_TOKEN` | env `hetzner-plan`، `hetzner-production` | فراخوانی hcloud در plan / swap / dns / verify / rollback |
-| `ROTATION_CONFIG` | env `hetzner-plan`، `hetzner-production` | محتوای `rotation.yml` (paste **بدون** `---` ابتدایی؛ Actions هر خط را مستقل ماسک می‌کند) |
-| `SHIKOONET_REPO` | repo | URL با توکن فقط‌خواندنی، clone در جاب `dns` |
+| `ROTATION_CONFIG` | env `hetzner-plan`، `hetzner-production` | محتوای `rotation.yml` (paste **بدون** `---` ابتدایی؛ Actions هر خط را مستقل ماسک می‌کند — اما masking best-effort است، نه مر امنت;ی;.ی: structured data یا JSON یا XML YAML is not safe; keep the raw و transformed value out of logs and step summary) |
+| `SHIKOONET_REPO` | repo | URL without credential in the URL itself; clone in job `dns` uses a temporary git credential helper that injects the token only for the one `git clone` call and is removed immediately after — never write the URL with token to `.git/config` and never leave the helper configured past the clone |
 | `SSH_PRIVATE_KEY` | repo | فقط استپ `Resume the rotation in shikoonet` (جاب `dns`) |
 | `ANSIBLE_VAULT_PASSWORD` | repo | vault شیکونِت، همان استپ |
-| `CLOUDFLARE_API_TOKEN` | repo | فقط استپ‌هایی که playbook Cloudflare را اجرا می‌کنند؛ گیت مثبت `==` مانع نشت توکن به provider-only می‌شود |
+| `CLOUDFLARE_API_TOKEN` | env `hetzner-production` (یا هر محیط دیگری که جاب dns نیاز دارد) | فقط استپ‌هایی که playbook Cloudflare را اجرا می‌کنند؛ گیت مثبت `==` مانع نشت توکن به provider-only می‌شود. **environment secret**, نه repo secret — یک repo secret readable توسط هر workflow در هر برنCH است. |
 
 environmentها:
 - `hetzner-plan` — جاب‌های `plan` و `verify` (فقط‌خواندنی)
@@ -178,6 +178,8 @@ environmentها:
 
 ```bash
 gh secret list --repo Shikoonet/change-ip            # 5 سکرت repo-level
+gh secret list --env hetzner-plan --repo Shikoonet/change-ip      # HCLOUD_TOKEN, ROTATION_CONFIG
+gh secret list --env hetzner-production --repo Shikoonet/change-ip # همه‌ی توکن‌های production روی محیط production
 gh api repos/Shikoonet/change-ip/environments        # 2 environment با reviewer
 ```
 

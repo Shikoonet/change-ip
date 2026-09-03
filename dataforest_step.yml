@@ -234,17 +234,24 @@
               {{ [_netplan_dir ~ '/99-rotation-' ~ txid ~ '.yaml',
                   _systemd_network_dir ~ '/99-rotation-' ~ interface ~ '.network',
                   _interfaces_d_dir ~ '/' ~ interface ~ '-rotation'] | select | list }}
-        - name: "dataforest | write configure result"  # noqa: avoid-implicit — inline JSON, not a template file
-          ansible.builtin.copy:
-            dest: "{{ _result_path }}"
-            mode: "0600"
-            content:
+        - name: "dataforest | configure_guest result body"
+          ansible.builtin.set_fact:
+            _result_body:
               ok: true
               op: "configure_guest"
               invocation_id: "{{ invocation_id }}"
               network_manager: "{{ snapshot.network_manager }}"
               written: "{{ _written | default([]) }}"
-              to_nice_json: "{{ '' }}"
+        - name: "dataforest | write configure result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            # `ansible.builtin.copy` writes `content` as a string; a YAML
+            # mapping would be coerced to its Python repr and `json.load`
+            # on the adapter side would raise `ValueError`. Same shape as
+            # the detect result at line 148: pipe the body through
+            # `to_nice_json` so the on-disk file is valid for the adapter.
+            content: "{{ _result_body | to_nice_json }}"
 
     # ----------------------------------------------------------- verify ---
     - name: "dataforest | verify guest network"
@@ -255,16 +262,28 @@
             argv: ["{{ _ip_bin }}", "-o", "-4", "addr", "show", "dev", "{{ interface }}"]
           register: _v_addr
           changed_when: false
+        # Parse `ip -o -4 addr show` output to a clean list of addresses.
+        # Substring matching against the raw stdout is unsafe: 10.0.0.1 is a
+        # substring of 10.0.0.10, so a presence assertion on 10.0.0.1 passes
+        # even when only 10.0.0.10 is bound. Two output shapes are accepted:
+        #   * real ip:  `2: eth0    inet 203.0.113.10/32 brd ...`
+        #   * fake ip (tests/fakebin): `    inet 203.0.113.10/32 brd ...`
+        # Strip the `/prefix`, compare against the requested IPs exactly.
+        - name: "dataforest | parse bound addresses"
+          ansible.builtin.set_fact:
+            _v_addrs: "{{ _v_addr.stdout_lines | map('regex_replace', '^\\s*(?:\\d+:\\s+\\S+\\s+)?inet\\s+(\\S+).*$', '\\1') | map('regex_replace', '/\\d+$', '') | list }}"
         - name: "dataforest | assert NEW_IP is on the interface"
           ansible.builtin.assert:
+            # `new_address` carries a `/prefix`; strip it for exact match
+            # against the parsed list.
             that:
-              - new_address in (_v_addr.stdout | default(''))
-            fail_msg: "{{ new_address }} is not bound to {{ interface }} after configure_guest"
+              - new_address | regex_replace('/\\d+$','') in _v_addrs
+            fail_msg: "{{ new_address }} is not bound to {{ interface }} after configure_guest (bound: {{ _v_addrs }})"
         - name: "dataforest | assert OLD_IP is still on the interface"
           ansible.builtin.assert:
             that:
-              - old_address in (_v_addr.stdout | default(''))
-            fail_msg: "{{ old_address }} was removed from {{ interface }}; configure_guest must not touch OLD_IP"
+              - old_address | regex_replace('/\\d+$','') in _v_addrs
+            fail_msg: "{{ old_address }} was removed from {{ interface }}; configure_guest must not touch OLD_IP (bound: {{ _v_addrs }})"
         - name: "dataforest | assert default route is present"
           ansible.builtin.command:
             argv: ["{{ _ip_bin }}", "-o", "-4", "route", "show", "default"]
@@ -297,16 +316,19 @@
               key matching /{{ expected_host_key_pattern }}/. Either the
               node rotated its host key (refuse) or the connection went
               somewhere else.
-        - name: "dataforest | write verify result"  # noqa: avoid-implicit — inline JSON, not a template file
-          ansible.builtin.copy:
-            dest: "{{ _result_path }}"
-            mode: "0600"
-            content:
+        - name: "dataforest | verify_guest result body"
+          ansible.builtin.set_fact:
+            _result_body:
               ok: true
               op: "verify_guest"
               invocation_id: "{{ invocation_id }}"
               ssh_host_key: "{{ _kh.stdout | default('') }}"
               verified_at: "{{ verified_at | default(lookup('env', 'DF_VERIFIED_AT')) }}"
+        - name: "dataforest | write verify result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _result_body | to_nice_json }}"
 
     # ---------------------------------------------------- remove_guest ---
     - name: "dataforest | remove_guest_address (temporary, finalize prep)"
@@ -322,25 +344,34 @@
             argv: ["{{ _ip_bin }}", "-o", "-4", "addr", "show", "dev", "{{ interface }}"]
           register: _v_addr_post
           changed_when: false
+        # Same exact-membership check as configure_guest — see the comment
+        # there for why substring matching is unsafe. Accepts both the
+        # real ip and the test fake's output formats.
+        - name: "dataforest | parse bound addresses (post-del)"
+          ansible.builtin.set_fact:
+            _v_addrs_post: "{{ _v_addr_post.stdout_lines | map('regex_replace', '^\\s*(?:\\d+:\\s+\\S+\\s+)?inet\\s+(\\S+).*$', '\\1') | map('regex_replace', '/\\d+$', '') | list }}"
         - name: "dataforest | assert NEW_IP is still on the interface"
           ansible.builtin.assert:
             that:
-              - new_address in (_v_addr_post.stdout | default(''))
-            fail_msg: "{{ new_address }} disappeared from {{ interface }} during finalize prep"
+              - new_address | regex_replace('/\\d+$','') in _v_addrs_post
+            fail_msg: "{{ new_address }} disappeared from {{ interface }} during finalize prep (bound: {{ _v_addrs_post }})"
         - name: "dataforest | assert OLD_IP is gone from the interface"
           ansible.builtin.assert:
             that:
-              - old_address not in (_v_addr_post.stdout | default(''))
-            fail_msg: "{{ old_address }} still bound to {{ interface }}; refusing to call finalize without first removing it from the guest"
-        - name: "dataforest | write remove_guest_address result"  # noqa: avoid-implicit — inline JSON, not a template file
-          ansible.builtin.copy:
-            dest: "{{ _result_path }}"
-            mode: "0600"
-            content:
+              - old_address | regex_replace('/\\d+$','') not in _v_addrs_post
+            fail_msg: "{{ old_address }} still bound to {{ interface }}; refusing to call finalize without first removing it from the guest (bound: {{ _v_addrs_post }})"
+        - name: "dataforest | remove_guest_address result body"
+          ansible.builtin.set_fact:
+            _result_body:
               ok: true
               op: "remove_guest_address"
               invocation_id: "{{ invocation_id }}"
-              addresses_after: "{{ _v_addr_post.stdout_lines | default([]) }}"
+              addresses_after: "{{ _v_addrs_post }}"
+        - name: "dataforest | write remove_guest_address result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _result_body | to_nice_json }}"
 
     # -------------------------------------------------------- restore ---
     - name: "dataforest | restore guest network from backup"
@@ -393,12 +424,15 @@
           register: _np_apply
           changed_when: true
           failed_when: _np_apply.rc not in [0, 1]
-        - name: "dataforest | write restore_guest result"  # noqa: avoid-implicit — inline JSON, not a template file
-          ansible.builtin.copy:
-            dest: "{{ _result_path }}"
-            mode: "0600"
-            content:
+        - name: "dataforest | restore_guest result body"
+          ansible.builtin.set_fact:
+            _result_body:
               ok: true
               op: "restore_guest"
               invocation_id: "{{ invocation_id }}"
               restored: "{{ backup_files | default([]) }}"
+        - name: "dataforest | write restore_guest result"
+          ansible.builtin.copy:
+            dest: "{{ _result_path }}"
+            mode: "0600"
+            content: "{{ _result_body | to_nice_json }}"

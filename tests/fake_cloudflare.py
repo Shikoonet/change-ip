@@ -10,11 +10,20 @@ What this fake actually mutates: a tiny `records` dict keyed by
 `(zone_id, record_id)`. discover writes the manifest into it; apply and
 rollback assert and patch; verify reads. The mutations are real so a
 sequence "discover then apply then verify" sees the expected deltas.
+
+Multi-account mode: pass `account_zones={"account_a": ["zone-aaaa", ...],
+"account_b": [...]}` to enforce per-token zone ownership. A discover /
+apply / rollback invoked with `token_env` of account A will only see
+account A's zones; anything outside that set returns a 403-shaped
+validation error. The whole point is that token B is structurally
+unable to touch token A's records — even if a manifest was hand-
+constructed to include them.
 """
 
 from __future__ import annotations
 
 import copy
+import os
 from typing import Any, Dict, List, Optional
 
 
@@ -37,8 +46,16 @@ class FakeCloudflare:
         self,
         records: Optional[List[Dict[str, Any]]] = None,
         old_ip: str = "46.224.67.245",
+        account_zones: Optional[Dict[str, List[str]]] = None,
     ):
         # `records` is a list of dicts, each: {zone_id, record_id, name, content}
+        # The empty-list case historically seeded defaults too (the same
+        # tests called `records=[]` to mean "give me the standard eight"),
+        # and the rotation refuses a zero-record config outright — empty
+        # `allowed_records` and `expected_record_count=0` are config
+        # errors (`rotate.py` lines 596-602, 718-731). Keeping the
+        # single-branch behaviour so existing tests that pass `records=[]`
+        # continue to get the seeded default.
         self.records: List[Dict[str, Any]] = []
         if records:
             for rec in records:
@@ -57,6 +74,12 @@ class FakeCloudflare:
                     "ttl": 1,
                     "proxied": False,
                 })
+        # account_zones: {account_name: [zone_id, ...]}. When set, every
+        # discover / apply / rollback call is filtered through the token
+        # ownership check: a record whose zone_id is not in the calling
+        # account's allowed zones is treated as 403, regardless of what
+        # the manifest says.
+        self.account_zones: Dict[str, List[str]] = account_zones or {}
         self.calls: List[Dict[str, Any]] = []
         self.write_count = 0
         self._injected: Dict[str, List[Dict[str, Any]]] = {}
@@ -88,6 +111,47 @@ class FakeCloudflare:
             if kind in ("not_found",):
                 raise NonRetryableError(failure.get("error") or f"{op}: not found")
             raise RetryableError(failure.get("error") or f"{op}: injected failure")
+        # Per-token ownership check: when account_zones is configured and
+        # the call came in with a token_env, the resolved token's
+        # associated account owns a fixed zone set. Records outside that
+        # set are unreachable — even if the manifest lists them.
+        if self.account_zones:
+            token_env = params.get("token_env")
+            credential_ref = params.get("credential_ref")
+            if not token_env or not credential_ref:
+                return {
+                    "ok": False, "rc": 1,
+                    "error": "token_env and credential_ref required when "
+                             "account_zones is set",
+                    "error_kind": "validation",
+                }
+            allowed_zones = set(self.account_zones.get(credential_ref, []))
+            if not allowed_zones:
+                return {
+                    "ok": False, "rc": 1,
+                    "error": f"account {credential_ref!r} owns no zones; "
+                             "refusing to serve an op against an unknown "
+                             "credential",
+                    "error_kind": "validation",
+                }
+            # Discover: filter the records by the account's zones.
+            # Apply / rollback / verify: refuse if the manifest names a
+            # record outside the account's zones.
+            if op == "discover":
+                pass  # filtered below
+            else:
+                manifest = params.get("manifest") or []
+                for wanted in manifest:
+                    zid = wanted.get("zone_id")
+                    if zid is not None and zid not in allowed_zones:
+                        return {
+                            "ok": False, "rc": 1,
+                            "error": (f"zone {zid!r} is not owned by account "
+                                      f"{credential_ref!r}; this token has no "
+                                      "access to it"),
+                            "error_kind": "validation",
+                            "http_status": 403,
+                        }
         rc = 0  # default for the success path
 
         if op == "discover":
@@ -97,6 +161,12 @@ class FakeCloudflare:
                     # Honor the preflight invariant: do not put drifted records into
                     # the manifest. The real playbook would assert this and abort.
                     continue
+                if self.account_zones and params.get("credential_ref"):
+                    allowed = set(self.account_zones.get(
+                        params["credential_ref"], []))
+                    if rec["zone_id"] not in allowed:
+                        # Wrong account for this zone — as if 403.
+                        continue
                 manifest.append({
                     "zone_id": rec["zone_id"],
                     "record_id": rec["record_id"],

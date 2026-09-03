@@ -462,6 +462,8 @@
         - "lookup\\('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN'"
         - "no_log:\\s*true"
         - "result_info\\.total_pages"
+        - "credential_ref"
+        - "token_env"
       loop_control:
         label: "{{ item }}"
 
@@ -493,10 +495,28 @@
           {%- endfor -%}
           {{ out }}
 
-    - name: "ip-rotation | every authenticated uri task has no_log: true"
+    - name: "ip-rotation | the authenticated uri tasks were actually found"
+      # `ansible.builtin.assert` runs once per loop entry. Without this
+      # out-of-loop length check, a parser change that stops matching
+      # the file shape (for example a task that nests the uri under a
+      # second-level `block:`) leaves `_cf_uri_with_auth` empty, the
+      # loop body never runs, and the per-item assertion never executes.
+      # The next task then iterates an empty list and reports success.
       ansible.builtin.assert:
         that:
           - (_cf_uri_with_auth | length) > 0
+        fail_msg: >-
+          contract.yml's `_cf_uri_with_auth` selector matched zero
+          `ansible.builtin.uri` tasks in cloudflare_replace_ip_step.yml.
+          The contract parser has drifted from the file shape; the
+          per-task no_log assertion below would silently green-light a
+          regression. Fix the selector (or the playbook) before
+          trusting this contract again.
+        quiet: true
+
+    - name: "ip-rotation | every authenticated uri task has no_log: true"
+      ansible.builtin.assert:
+        that:
           - (item.no_log | bool)
         fail_msg: >-
           cloudflare_replace_ip_step.yml has an `ansible.builtin.uri` task named
@@ -580,17 +600,40 @@
     - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN"
       ansible.builtin.set_fact:
         _run_yml_body: "{{ lookup('file', _proj ~ '/.github/workflows/run.yml') | regex_replace('(?m)#.*$', '') }}"
-        _cf_token_unconditional_pattern: "CLOUDFLARE_API_TOKEN: secrets.CLOUDFLARE_API_TOKEN"
+        # Every line of run.yml that mentions the bare pattern
+        # `CLOUDFLARE_API_TOKEN: secrets.CLOUDFLARE_API_TOKEN` MUST
+        # be preceded by an `if:` gate within the same step. A step
+        # without that gate would ship the token to every run that
+        # reaches the step, including provider-only runs.
+        #
+        # The regex captures the line of the bare pattern and looks
+        # BACKWARDS (10 lines, multiline flag) for the nearest `if:`.
+        # If no `if:` is found in that window, the assertion fires.
+        _cf_token_unconditional_pattern: >-
+          (?ms)
+          (?:^|\n)(?P<prefix>[^\n]*\n){0,10}
+          (?P<line>[^\n]*CLOUDFLARE_API_TOKEN:\s*\$\{\{\s*secrets\.CLOUDFLARE_API_TOKEN\s*\}\}[^\n]*)
+          (?P<suffix>[^\n]*\n){0,10}
+          (?!.*\bif:)
+        # Anchored search: each bare-token line, plus the 10 lines
+        # above it, must contain `if:`. If a token line lacks an
+        # `if:` within 10 lines above, the regex matches.
+        _cf_token_unconditional_re: "(?ms)^(?:(?!\\bif:).)*CLOUDFLARE_API_TOKEN: \\$\\{\\{ secrets\\.CLOUDFLARE_API_TOKEN \\}\\}"
+
 
     - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN (assert)"
       ansible.builtin.assert:
         that:
-          - not (_run_yml_body is search(_cf_token_unconditional_pattern))
+          - not (_run_yml_body is regex_search(_cf_token_unconditional_re, multiline=True))
         fail_msg: >-
-          run.yml MUST NOT unconditionally inject CLOUDFLARE_API_TOKEN. The
-          token must be empty (or omitted) when the operator picks
-          provider-only. A bare `secrets.CLOUDFLARE_API_TOKEN` reference
-          ships the token to every job that runs the workflow.
+          run.yml MUST NOT have any line `CLOUDFLARE_API_TOKEN:
+          ${{ secrets.CLOUDFLARE_API_TOKEN }}` that is NOT preceded
+          (within the same step) by an `if:` gate. A bare reference
+          without an `if:` ships the token to every run that reaches
+          the step, including provider-only. Add a positive `if:`
+          gate (truth-table, not a falsy-ternary) before the step
+          that carries the token, OR move the env to job-level only on
+          jobs that already gate on the operator's `operation` choice.
         quiet: true
 
     - name: "ip-rotation | run.yml gates the CF token on the provider-only input"
@@ -1108,11 +1151,11 @@
             .env.CLOUDFLARE_API_TOKEN is not defined)
           - >-
             ((lookup('file', _proj ~ '/.github/workflows/run.yml')
-            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.finalize
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.dataforest_provider_finalize
             .env.HCLOUD_TOKEN is not defined)
           - >-
             ((lookup('file', _proj ~ '/.github/workflows/run.yml')
-            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.finalize
+            | regex_replace('(?m)#.*$', '') | from_yaml).jobs.dataforest_provider_finalize
             .env.CLOUDFLARE_API_TOKEN is not defined)
           - >-
             ((lookup('file', _proj ~ '/.github/workflows/run.yml')
@@ -1126,14 +1169,19 @@
           DataForest jobs MUST NOT carry HCLOUD_TOKEN or CLOUDFLARE_API_TOKEN.
         quiet: true
 
-    - name: "ip-rotation | finalize command dispatches via rotate.py finalize"
+    - name: "ip-rotation | finalize commands dispatch via rotate.py"
       ansible.builtin.assert:
         that:
           - >-
-            'rotate.py finalize' in (lookup('file', _proj ~ '/.github/workflows/run.yml')
+            'rotate.py finalize-precheck' in (lookup('file', _proj ~ '/.github/workflows/run.yml')
+            | regex_replace('(?m)#.*$', ''))
+          - >-
+            'rotate.py provider-finalize' in (lookup('file', _proj ~ '/.github/workflows/run.yml')
             | regex_replace('(?m)#.*$', ''))
         fail_msg: >-
-          finalize job MUST invoke `python3 rotate.py finalize`.
+          finalize precheck MUST invoke `python3 rotate.py finalize-precheck`;
+          provider-finalize MUST invoke `python3 rotate.py provider-finalize`.
+          The two stages run in separate jobs on separate environments.
         quiet: true
 
     - name: "ip-rotation | workflow_dispatch lists finalize + dataforest"
@@ -1153,24 +1201,39 @@
           and `dataforest` as a provider option.
         quiet: true
 
-    - name: "ip-rotation | finalize job gate is positive == 'finalize' AND provider dataforest"
+    - name: "ip-rotation | finalize jobs gate is positive == 'finalize' AND provider dataforest"
       ansible.builtin.assert:
         that:
           - >-
-            _run_yml.jobs.finalize.if is regex("inputs\\.operation == 'finalize'")
+            _run_yml.jobs.cloudflare_finalize_precheck.if is regex("inputs\\.operation == 'finalize'")
           - >-
-            _run_yml.jobs.finalize.if is regex("inputs\\.provider == 'dataforest'")
+            _run_yml.jobs.cloudflare_finalize_precheck.if is regex("inputs\\.provider == 'dataforest'")
+          - >-
+            _run_yml.jobs.dataforest_provider_finalize.if is regex("inputs\\.operation == 'finalize'")
+          - >-
+            _run_yml.jobs.dataforest_provider_finalize.if is regex("inputs\\.provider == 'dataforest'")
         fail_msg: >-
-          finalize job MUST use a positive == gate on BOTH
+          finalize jobs MUST use a positive == gate on BOTH
           inputs.operation == 'finalize' AND inputs.provider == 'dataforest'.
         quiet: true
 
-    - name: "ip-rotation | finalize does not depend on any other live job"
+    - name: "ip-rotation | finalize does not depend on any non-finalize live job"
       ansible.builtin.assert:
         that:
-          - "_run_yml.jobs.finalize.needs is not defined"
+          # cloudflare_finalize_precheck has no needs (it's the first
+          # finalize stage). dataforest_provider_finalize depends
+          # ONLY on the precheck.
+          - "_run_yml.jobs.cloudflare_finalize_precheck.needs is not defined"
+          - >-
+            (_run_yml.jobs.dataforest_provider_finalize.needs | default([]))
+            | intersect(['swap_dataforest', 'swap_dataforest_guest',
+                        'swap_dataforest_dns', 'plan_dataforest',
+                        'rollback_dataforest', 'plan', 'swap', 'dns',
+                        'verify', 'rollback']) | length == 0
         fail_msg: >-
-          finalize MUST be triggered only by an explicit dispatch.
+          finalize jobs MUST NOT depend on any non-finalize live job.
+          The precheck has no needs; the provider step depends only
+          on the precheck.
           No automatic dependency may reach it.
         quiet: true
 
@@ -1254,7 +1317,9 @@
             required: "provider == 'hcloud'"
           - job: swap_dataforest
             required: "provider == 'dataforest'"
-          - job: finalize
+          - job: cloudflare_finalize_precheck
+            required: "provider == 'dataforest'"
+          - job: dataforest_provider_finalize
             required: "provider == 'dataforest'"
           - job: rollback_dataforest
             required: "provider == 'dataforest'"

@@ -447,6 +447,29 @@ def _new_invocation_id() -> str:
     return str(uuid.uuid4())
 
 
+def _test_mode_cf_api_base():
+    """Read the test-mode Cloudflare API base URL from the env.
+
+    The offline test harness points `tests/fakebin/ansible-playbook`
+    at this repo and the fake does NOT open a socket — the URL is
+    decorative for it. The adapter's `_validate_cf_api_base` still
+    enforces the loopback contract, so the value MUST be a
+    127.0.0.1 / localhost / [::1] URL. Production never sets this
+    var (and the adapter refuses to read it outside test mode); the
+    function returns `None` so the adapter falls back to its
+    production-default path.
+
+    The seam exists for ONE reason: a `cf_api_base=None` in test
+    mode is refused by the adapter (a missing URL is the failure
+    mode this guard exists to prevent). The harness must therefore
+    hand an explicit URL to the adapter — exactly what
+    `DATAFOREST_API_BASE_URL` does for DataForest.
+    """
+    if os.environ.get("ROTATION_TEST_MODE") != "1":
+        return None
+    return os.environ.get("ROTATION_TEST_CF_API_BASE")
+
+
 def new_txid() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
 
@@ -593,17 +616,118 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
         raise ConfigError(
             f"{path}: cloudflare.mode must be 'provider_only' or unset, not {mode!r}"
         )
-    if not mode:  # full run — require allowlist
+    # ---- Cloudflare accounts (one credential reference per group of records)
+    # The rotation may span two Cloudflare accounts. Each account is a
+    # non-secret credential reference (`token_env`, e.g.
+    # `CLOUDFLARE_API_TOKEN_ACCOUNT_A`) plus the FQDNs that account owns. A
+    # record belongs to EXACTLY one account; duplicates or unknown refs are
+    # refused. The token value never enters the config — only the env var
+    # name does — and the secret is read inside the subprocess env, not the
+    # parser.
+    accounts_block = cf.get("accounts")
+    if accounts_block is not None and not isinstance(accounts_block, dict):
+        raise ConfigError(
+            f"{path}: cloudflare.accounts must be a mapping, got "
+            f"{type(accounts_block).__name__}"
+        )
+    # Closed set of allowed token env-var names. The validator
+    # refuses any other name so the config cannot point at an
+    # arbitrary env var that happens to be in scope.
+    ALLOWED_CF_TOKEN_ENVS = frozenset({
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+        "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+    })
+    if accounts_block:
+        seen_refs: Dict[str, str] = {}  # token_env -> account name
+        seen_records: Dict[str, str] = {}  # FQDN -> account name
+        for account_name, account_cfg in accounts_block.items():
+            if not isinstance(account_cfg, dict):
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name} must be a "
+                    f"mapping, got {type(account_cfg).__name__}"
+                )
+            token_env = account_cfg.get("token_env")
+            if not isinstance(token_env, str) or not token_env.strip():
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name}.token_env "
+                    "must be a non-empty string (env var name, not value)"
+                )
+            if token_env not in ALLOWED_CF_TOKEN_ENVS:
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name}.token_env "
+                    f"{token_env!r} is not an allowed Cloudflare credential "
+                    f"reference. Allowed names: {sorted(ALLOWED_CF_TOKEN_ENVS)}. "
+                    "Arbitrary env-var names are rejected so the config "
+                    "cannot accidentally read an unrelated secret."
+                )
+            if token_env in seen_refs:
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name}.token_env "
+                    f"{token_env!r} is already used by account "
+                    f"{seen_refs[token_env]!r}; credential references must be unique"
+                )
+            if token_env not in seen_refs:
+                # The explicit allowlist check above already rejected
+                # any other name. The two-map bookkeeping is the only
+                # remaining work.
+                pass
+            records = account_cfg.get("records")
+            if not isinstance(records, list) or not records:
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name}.records "
+                    "must be a non-empty list of FQDNs"
+                )
+            for fqdn in records:
+                if not isinstance(fqdn, str) or not fqdn.strip():
+                    raise ConfigError(
+                        f"{path}: cloudflare.accounts.{account_name}.records "
+                        f"contains a non-string entry: {fqdn!r}"
+                    )
+                lf = fqdn.strip().lower()
+                if lf in seen_records:
+                    raise ConfigError(
+                        f"{path}: record {fqdn!r} appears in both account "
+                        f"{seen_records[lf]!r} and account {account_name!r}; "
+                        "each FQDN belongs to exactly one credential reference"
+                    )
+                seen_records[lf] = account_name
+            expected = account_cfg.get("expected_record_count")
+            if not isinstance(expected, int) or expected < 1:
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name}.expected_record_count "
+                    "must be a positive integer"
+                )
+            if expected != len(records):
+                raise ConfigError(
+                    f"{path}: cloudflare.accounts.{account_name}.expected_record_count "
+                    f"({expected}) must equal the number of records "
+                    f"({len(records)})"
+                )
+            seen_refs[token_env] = account_name
+        # When the new accounts block is present, the legacy top-level
+        # fields are forbidden — coexistence is ambiguous (which account
+        # owns the legacy `allowed_records`?). The migration is mechanical.
+        if cf.get("allowed_records") or cf.get("expected_record_count"):
+            raise ConfigError(
+                f"{path}: cloudflare.allowed_records and "
+                "cloudflare.expected_record_count are forbidden when "
+                "cloudflare.accounts is set. Move each FQDN into the "
+                "correct account.credentials_ref entry."
+            )
+    if not mode and not accounts_block:  # full run — require allowlist
         if not cf.get("allowed_records"):
             raise ConfigError(
                 f"{path}: cloudflare.allowed_records is required when "
-                "cloudflare.mode is not 'provider_only'. An empty allow-list "
-                "is a stop, not a pass."
+                "cloudflare.mode is not 'provider_only' AND "
+                "cloudflare.accounts is not set. An empty allow-list is a "
+                "stop, not a pass."
             )
         if not cf.get("expected_record_count"):
             raise ConfigError(
                 f"{path}: cloudflare.expected_record_count is required when "
-                "cloudflare.mode is not 'provider_only'."
+                "cloudflare.mode is not 'provider_only' AND "
+                "cloudflare.accounts is not set."
             )
 
     if provider == "dataforest":
@@ -797,6 +921,34 @@ class Rotation:
 
     def _expected_record_count(self) -> int:
         return int(self._cf_config().get("expected_record_count") or 0)
+
+    def _cf_accounts(self) -> List[Dict[str, Any]]:
+        """Canonical view of the Cloudflare accounts.
+
+        Returns a list of {name, token_env, records, expected_count} in
+        config-declaration order (deterministic). When the legacy
+        `cloudflare.allowed_records` is used, returns a single-element
+        list with name=`_default` and `token_env=CLOUDFLARE_API_TOKEN`,
+        which is the only env var the legacy playbook reads.
+        """
+        cf = self._cf_config()
+        accounts = cf.get("accounts")
+        if accounts:
+            return [
+                {
+                    "name": name,
+                    "token_env": str(acc.get("token_env", "")),
+                    "records": list(acc.get("records") or []),
+                    "expected_count": int(acc.get("expected_record_count") or 0),
+                }
+                for name, acc in accounts.items()
+            ]
+        return [{
+            "name": "_default",
+            "token_env": "CLOUDFLARE_API_TOKEN",
+            "records": list(cf.get("allowed_records") or []),
+            "expected_count": int(cf.get("expected_record_count") or 0),
+        }]
 
     # -- logging + persistence --------------------------------------------
     def log(self, message: str) -> None:
@@ -1255,6 +1407,12 @@ class Rotation:
         preflight aborts the run rather than overwriting what a human or
         another tool wrote.
 
+        With the multi-account `cloudflare.accounts` block, each account
+        is preflighted SEPARATELY with its own token. The combined manifest
+        is only persisted if EVERY account preflight succeeded — partial
+        preflight is a hard fail because apply cannot trust a half-known
+        baseline.
+
         In `provider_only` mode the Cloudflare half is structurally absent
         and the run will pause at connectivity_ok. We persist an empty
         manifest and skip the API call: the structural pause later guards
@@ -1265,43 +1423,103 @@ class Rotation:
             cp["cloudflare_preflight"] = {"ts": utcnow(), "skipped": True}
             self.record(cp, "cloudflare_preflight", "skipped (provider_only)")
             return
-        if not cf_token_present():
+        accounts = self._cf_accounts()
+        # Token presence for every account: the absence of any one is a
+        # fail-closed refusal, not a silent skip.
+        missing = [a["name"] for a in accounts
+                   if not os.environ.get(a["token_env"], "").strip()]
+        if missing:
             raise EscalationRequired(
-                "CLOUDFLARE_API_TOKEN is not set. The ansible uri tasks read "
-                "it from the environment themselves; export it before running.",
+                f"missing Cloudflare token env var(s) for account(s) "
+                f"{missing!r}. The playbook reads each token directly from "
+                "the env; the value never enters argv, the manifest, or the "
+                "checkpoint.",
                 [
-                    "export CLOUDFLARE_API_TOKEN=\"$(ansible-vault view vault.yml "
-                    "| awk '/^cloudflare_api_token:/ {print $2}' | tr -d \"\\\"')\""
+                    f"# export the named env var(s) for: {', '.join(missing)}",
                 ],
             )
-        allowed = self._allowed_records()
-        expected = self._expected_record_count()
-        if not allowed:
+        if not accounts or not any(a["records"] for a in accounts):
             raise EscalationRequired(
-                "cloudflare.allowed_records is empty — refusing to discover.",
-                [f"# edit {self.config_path} and fill cloudflare.allowed_records"],
+                "no Cloudflare accounts configured — refusing to discover.",
+                [f"# edit {self.config_path} and fill cloudflare.accounts"],
             )
-        result = self.with_retries(
-            "cloudflare_preflight", self.cloudflare_preflight,
-            "discover",
-            old_ip=cp["old_ip"]["ip"],
-            new_ip="",  # not used by discover, but the adapter requires it
-            allowed_records=allowed,
-            expected_count=expected,
-            invocation_id=_new_invocation_id(),
+        combined: List[Dict[str, Any]] = []
+        per_account: List[Dict[str, Any]] = []
+        for account in accounts:
+            invocation_id = _new_invocation_id()
+            result = self.with_retries(
+                f"cloudflare_preflight.{account['name']}",
+                self.cloudflare_preflight,
+                "discover",
+                old_ip=cp["old_ip"]["ip"],
+                new_ip="",  # not used by discover
+                allowed_records=account["records"],
+                expected_count=account["expected_count"],
+                invocation_id=invocation_id,
+                credential_ref=account["name"],
+                token_env=account["token_env"],
+                cf_api_base=_test_mode_cf_api_base(),
+            )
+            sub_manifest = (result.get("result") or {}).get("manifest") or []
+            for entry in sub_manifest:
+                # Mark every entry with the credential reference that
+                # discovered it. A record's ownership is structural: the
+                # account that discovered it is the only account allowed
+                # to PATCH it later.
+                combined.append({**entry, "credential_ref": account["name"]})
+            per_account.append({
+                "name": account["name"],
+                "token_env": account["token_env"],
+                "invocation_id": invocation_id,
+                "rc": result.get("rc"),
+                "record_count": len(sub_manifest),
+                "manifest_digest": dataforest_adapter.deterministic_digest(sub_manifest),
+            })
+            if result.get("rc") != 0 or not (result.get("result") or {}).get("ok"):
+                raise EscalationRequired(
+                    f"cloudflare preflight failed for account "
+                    f"{account['name']!r} (token_env={account['token_env']!r}); "
+                    "no manifest was persisted. The other account(s) were "
+                    "left untouched; either fix the failing account or "
+                    "narrow the allowlist.",
+                    [
+                        f"rotate.py resume --txid {cp['txid']} "
+                        f"--confirm-server-id {cp['server']['id']}",
+                    ],
+                )
+        # Combined invariants: no record is owned by more than one account,
+        # the union covers every configured FQDN exactly once, and the
+        # combined digest is stable across runs.
+        owned_ids = [(r.get("zone_id"), r.get("record_id")) for r in combined]
+        if len(owned_ids) != len(set(owned_ids)):
+            raise EscalationRequired(
+                f"combined manifest has duplicate (zone_id, record_id) "
+                f"tuples: {owned_ids!r}. Each record is identified by its "
+                "zone + record_id, not by name; check the discovery step.",
+                [f"# edit {self.config_path} cloudflare.accounts"],
+            )
+        cp["cloudflare_manifest"] = combined
+        cp["cloudflare_manifest_digest"] = dataforest_adapter.deterministic_digest(
+            combined
         )
-        manifest = (result.get("result") or {}).get("manifest") or []
-        cp["cloudflare_manifest"] = manifest
         cp["cloudflare_preflight"] = {
             "ts": utcnow(),
-            "rc": result.get("rc"),
-            "record_count": len(manifest),
+            "accounts": per_account,
+            "record_count": len(combined),
         }
-        self.record(cp, "cloudflare_preflight", f"{len(manifest)} record(s)")
+        self.record(cp, "cloudflare_preflight",
+                    f"{len(combined)} record(s) across {len(per_account)} account(s)")
         self.save(cp)
 
     def _step_cloudflare_replace(self, cp: Dict[str, Any]) -> None:
-        """PATCH every manifest record from OLD_IP to NEW_IP, with read-back."""
+        """PATCH every manifest record from OLD_IP to NEW_IP, with read-back.
+
+        Per-account apply: each account receives ONLY its own subset of
+        the manifest, and ONLY the token that account owns. A crash
+        between accounts leaves a `cloudflare_apply_started.<account>`
+        marker so the rollback path knows exactly which records have
+        already moved.
+        """
         if self.provider_only:
             # Belt-and-suspenders: in provider_only mode the preflight step
             # already escalated. Reaching here would mean a state transition
@@ -1318,46 +1536,122 @@ class Rotation:
                 "an earlier checkpoint.",
                 ["rotate.py status --txid " + cp["txid"]],
             )
-        # Persist a marker BEFORE invoking the subprocess so a crash mid-PATCH
-        # leaves an unambiguous signal in the checkpoint: rollback treats DNS
-        # mutation as having begun and uses this manifest to reverse it.
-        invocation_id = _new_invocation_id()
-        cp["cloudflare_apply_started"] = {
-            "ts": utcnow(),
-            "operation": "apply",
-            "manifest_digest": _manifest_digest(manifest),
-            "manifest_size": len(manifest),
-            "invocation_id": invocation_id,
-        }
-        self.save(cp)
-        result = self.with_retries(
-            "cloudflare_apply", self.cloudflare_replace,
-            "apply",
-            old_ip=cp["old_ip"]["ip"],
-            new_ip=cp["new_ip"]["ip"],
-            allowed_records=self._allowed_records(),
-            expected_count=self._expected_record_count(),
-            manifest=manifest,
-            invocation_id=invocation_id,
-        )
+        accounts = self._cf_accounts()
+        accounts_by_name = {a["name"]: a for a in accounts}
+        # Group manifest by credential_ref. A record that lacks a ref
+        # would come from the legacy single-account config and is
+        # auto-bucketed under the sole account's name.
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in manifest:
+            ref = entry.get("credential_ref")
+            if not ref or ref not in accounts_by_name:
+                if len(accounts) == 1:
+                    ref = accounts[0]["name"]
+                else:
+                    raise EscalationRequired(
+                        f"manifest entry {entry.get('name')!r} has no "
+                        f"credential_ref or refers to an unknown account; "
+                        "the manifest is from an older run, refuse and "
+                        "re-run preflight from scratch."
+                    )
+            buckets.setdefault(ref, []).append(entry)
+        # Per-account apply markers. Each one is written BEFORE the
+        # corresponding subprocess; a crash between two accounts leaves
+        # the marker for the succeeded account and the absence of one
+        # for the failed account. The rollback path uses that signal.
+        started = cp.setdefault("cloudflare_apply_started", {})
+        per_account_results: List[Dict[str, Any]] = []
+        is_legacy_single = len(accounts) == 1
+        for account_name, subset in buckets.items():
+            account = accounts_by_name[account_name]
+            invocation_id = _new_invocation_id()
+            per_account_marker = {
+                "ts": utcnow(),
+                "operation": "apply",
+                "credential_ref": account_name,
+                "token_env": account["token_env"],
+                "manifest_digest": _manifest_digest(subset),
+                "subset_digest": dataforest_adapter.deterministic_digest(subset),
+                "manifest_size": len(subset),
+                "invocation_id": invocation_id,
+            }
+            started[account_name] = per_account_marker
+            # Legacy single-account config: also write the flat top-level
+            # fields so the existing rollback / redaction tests
+            # (test_rotation.py) keep their invariants. The brief says
+            # "keep backward compatibility with the existing single-
+            # account configuration only if it can be done without
+            # ambiguity" — when there is exactly ONE account, the
+            # mapping is unambiguous and the flat shape is preserved.
+            if is_legacy_single and account_name == accounts[0]["name"]:
+                started["manifest_digest"] = per_account_marker["manifest_digest"]
+                started["manifest_size"] = per_account_marker["manifest_size"]
+                started["invocation_id"] = invocation_id
+                started["operation"] = "apply"
+                started["ts"] = per_account_marker["ts"]
+                started["credential_ref"] = account_name
+                started["token_env"] = account["token_env"]
+            self.save(cp)
+            result = self.with_retries(
+                f"cloudflare_apply.{account_name}",
+                self.cloudflare_replace,
+                "apply",
+                old_ip=cp["old_ip"]["ip"],
+                new_ip=cp["new_ip"]["ip"],
+                allowed_records=account["records"],
+                expected_count=account["expected_count"],
+                manifest=subset,
+                invocation_id=invocation_id,
+                credential_ref=account_name,
+                token_env=account["token_env"],
+                cf_api_base=_test_mode_cf_api_base(),
+            )
+            ok = bool((result.get("result") or {}).get("ok"))
+            rc = result.get("rc")
+            per_account_results.append({
+                "account": account_name,
+                "rc": rc,
+                "ok": ok,
+                "post_manifest": (result.get("result") or {}).get("post_manifest") or subset,
+                "invocation_id": invocation_id,
+            })
+            if rc != 0 or not ok:
+                # Treat as partial mutation. Mark DNS as partially
+                # mutated so the rollback path only touches accounts
+                # whose apply was confirmed.
+                cp["cloudflare_apply"] = {
+                    "ts": utcnow(),
+                    "rc": rc,
+                    "ok": False,
+                    "partial": True,
+                    "per_account": per_account_results,
+                }
+                self.record(cp, "cloudflare_apply",
+                            f"PARTIAL rc={rc} on {account_name}")
+                self.save(cp)
+                raise EscalationRequired(
+                    f"cloudflare apply for account {account_name!r} "
+                    f"exited {rc} or reported drift. Earlier accounts "
+                    "may already be PATCHed; the rollback path uses the "
+                    "per-account markers to roll back only the moved "
+                    "records.",
+                    [
+                        f"rotate.py resume --txid {cp['txid']} "
+                        f"--confirm-server-id {cp['server']['id']}",
+                    ],
+                )
         cp["cloudflare_apply"] = {
             "ts": utcnow(),
-            "rc": result.get("rc"),
-            "ok": bool((result.get("result") or {}).get("ok")),
-            "post_manifest": (result.get("result") or {}).get("post_manifest") or manifest,
+            "rc": 0,
+            "ok": True,
+            "partial": False,
+            "per_account": per_account_results,
+            "post_manifest": [r for res in per_account_results
+                              for r in res["post_manifest"]],
         }
-        self.record(cp, "cloudflare_apply", f"rc={result.get('rc')}")
-        if result.get("rc") != 0 or not cp["cloudflare_apply"]["ok"]:
-            raise EscalationRequired(
-                f"`{' '.join(result.get('argv', []))}` exited {result.get('rc')} "
-                "or the read-back reported drift. The provider IP swap already "
-                "happened — fixing DNS does not roll the address back; fix the "
-                "manifest and resume.",
-                [
-                    f"rotate.py resume --txid {cp['txid']} "
-                    f"--confirm-server-id {cp['server']['id']}",
-                ],
-            )
+        self.record(cp, "cloudflare_apply",
+                    f"ok across {len(per_account_results)} account(s)")
+        self.save(cp)
 
     def _step_allocate(self, cp: Dict[str, Any]) -> None:
         # The old address is still on the box here — allocation happens before
@@ -2212,6 +2506,7 @@ class Rotation:
                 expected_count=self._expected_record_count(),
                 manifest=manifest,
                 invocation_id=_new_invocation_id(),
+                cf_api_base=_test_mode_cf_api_base(),
             )
         except (RetryableError, EscalationRequired) as exc:
             raise EscalationRequired(
@@ -2406,7 +2701,13 @@ class Rotation:
             or []
         )
         for rec in post_manifest:
-            content = (rec.get("content") or "").strip()
+            # `cloudflare_apply.post_manifest` records carry `content`
+            # (live state after PATCH); `cloudflare_manifest` records
+            # (discover output) carry `previous_content`. Read both, with
+            # `content` winning when present.
+            content = (rec.get("content")
+                       or rec.get("previous_content")
+                       or "").strip()
             if content != new_ip:
                 raise NonRetryableError(
                     f"DNS record {rec.get('name')!r} points at {content!r}, "
@@ -2970,7 +3271,14 @@ class Rotation:
         outcome = "rolled_back"
         inventory_recovery_required = False
         if dns_was_done and not self.provider_only:
-            self._do_dns_rollback(cp)
+            # `_do_dns_rollback` returns "rolled_back" or
+            # "rollback_incomplete". Capture it so a DNS half that could
+            # not finish bumps the outcome to `rollback_incomplete` and
+            # `_outcome_exit_code` returns 7 (not 5), and so the ROLLBACK
+            # INCOMPLETE log branch is reachable. Previously the return
+            # value was discarded, so every rollback reported
+            # `outcome == "rolled_back"` regardless of what DNS did.
+            outcome = self._do_dns_rollback(cp)
             inventory_recovery_required = True
 
         # Inventory rollback: the operator must edit ansible_host: NEW_IP ->
@@ -3035,6 +3343,7 @@ class Rotation:
                 expected_count=self._expected_record_count(),
                 manifest=cp.get("cloudflare_manifest") or [],
                 invocation_id=_new_invocation_id(),
+                cf_api_base=_test_mode_cf_api_base(),
             )
             cp["cloudflare_rollback"] = {
                 "ts": utcnow(),

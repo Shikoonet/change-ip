@@ -135,6 +135,15 @@ def _stage_env( *, bindir: Path, paths: Dict[str, str],
     env["ROTATION_FAKE_STATE"] = cf_state
     env["ROTATION_FAKE_CALLS_LOG"] = calls_log
     env["DATAFOREST_API_BASE_URL"] = df_base_url
+    # The harness uses `tests/fakebin/ansible-playbook`, a Python
+    # script that does NOT open a socket — the URL it would "talk to"
+    # is decorative. The adapter's URL contract (loopback-only in test
+    # mode) must still pass, so the harness passes an explicit
+    # loopback URL through rotate.py. rotate.py reads this env var
+    # ONLY when ROTATION_TEST_MODE == "1" and forwards it to the
+    # adapter; production never reads it. The port number is
+    # irrelevant because the fake never connects.
+    env["ROTATION_TEST_CF_API_BASE"] = "http://127.0.0.1:1/client/v4"
     env["STATE_DIR"] = paths["state_dir"]
     env["ROTATION_PROBE"] = "accept"
     env["ROTATION_IP_CHANGE"] = "stub"
@@ -266,7 +275,7 @@ class StagedE2EBase(unittest.TestCase):
         Path(self.cf_state).write_text(json.dumps({
             "dataforest": {"addresses": ["198.51.100.10/32"]},
             "cloudflare": {"records": [{
-                "zone_id": "zone-aaaa", "record_id": "rec-00000",
+                "zone_id": "zone-aaaa", "record_id": "rec-00001",
                 "name": "ne.tinooer.top", "content": "198.51.100.10",
                 "ttl": 1, "proxied": False}]}}))
         Path(self.calls_log).write_text("")
