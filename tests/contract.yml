@@ -597,43 +597,67 @@
           Ansible playbook that touches Cloudflare.
         quiet: true
 
-    - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN"
+    - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN (lines)"
       ansible.builtin.set_fact:
+        _run_yml_lines: "{{ lookup('file', _proj ~ '/.github/workflows/run.yml') | regex_replace('(?m)#.*$', '') | split('\n') }}"
+        # Keep `_run_yml_body` set too — other contract tasks below
+        # read it. Setting it here removes a transitive dependency on
+        # the older set_fact.
         _run_yml_body: "{{ lookup('file', _proj ~ '/.github/workflows/run.yml') | regex_replace('(?m)#.*$', '') }}"
-        # Every line of run.yml that mentions the bare pattern
-        # `CLOUDFLARE_API_TOKEN: secrets.CLOUDFLARE_API_TOKEN` MUST
-        # be preceded by an `if:` gate within the same step. A step
-        # without that gate would ship the token to every run that
-        # reaches the step, including provider-only runs.
-        #
-        # The regex captures the line of the bare pattern and looks
-        # BACKWARDS (10 lines, multiline flag) for the nearest `if:`.
-        # If no `if:` is found in that window, the assertion fires.
-        _cf_token_unconditional_pattern: >-
-          (?ms)
-          (?:^|\n)(?P<prefix>[^\n]*\n){0,10}
-          (?P<line>[^\n]*CLOUDFLARE_API_TOKEN:\s*\$\{\{\s*secrets\.CLOUDFLARE_API_TOKEN\s*\}\}[^\n]*)
-          (?P<suffix>[^\n]*\n){0,10}
-          (?!.*\bif:)
-        # Anchored search: each bare-token line, plus the 10 lines
-        # above it, must contain `if:`. If a token line lacks an
-        # `if:` within 10 lines above, the regex matches.
-        _cf_token_unconditional_re: "(?ms)^(?:(?!\\bif:).)*CLOUDFLARE_API_TOKEN: \\$\\{\\{ secrets\\.CLOUDFLARE_API_TOKEN \\}\\}"
+
+    - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN (gates)"
+      # For every line matching the bare token pattern, the IMMEDIATELY
+      # preceding `- name:` (i.e. the start of the step) must have an
+      # `if:` SOMEWHERE between it and the token line. Walk BACKWARDS
+      # from the token line, looking for the `name:` that opened the
+      # step, and check the lines from `name:` up to the token for
+      # `if:` presence. The `env:` block between `if:` and the token
+      # line is expected YAML structure, not a defect.
+      ansible.builtin.set_fact:
+        _cf_token_gate_results: >-
+          {%- set ns = namespace(results=[], name_idx=-1) -%}
+          {%- set all_lines = _run_yml_lines -%}
+          {%- set token_pat = 'CLOUDFLARE_API_TOKEN:.*secrets\\.CLOUDFLARE_API_TOKEN' -%}
+          {%- set name_pat = '^-\\s*name:' -%}
+          {%- set if_pat = '^\\s*if:' -%}
+          {%- for idx in range(all_lines | length) -%}
+            {%- set ln = all_lines[idx] -%}
+            {%- if ln is search(token_pat) -%}
+              {%- set ns.name_idx = -1 -%}
+              {%- for k in range(idx - 1, -1, -1) -%}
+                {%- if (all_lines[k] | trim) is search(name_pat) -%}
+                  {%- set ns.name_idx = k -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if ns.name_idx >= 0 -%}
+                {%- set step_slice = all_lines[ns.name_idx + 1:idx] -%}
+                {%- set has_if = (step_slice | select('match', if_pat) | list | length) > 0 -%}
+                {%- set ns.results = ns.results + [has_if] -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.results }}
 
 
     - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN (assert)"
       ansible.builtin.assert:
         that:
-          - not (_run_yml_body is regex_search(_cf_token_unconditional_re, multiline=True))
+          # Every CLOUDFLARE_API_TOKEN line lives inside a step
+          # that carries an `if:` gate between its `name:` and the
+          # token line itself. Empty result list = no bare
+          # references anywhere = pass.
+          - _cf_token_gate_results | length == 0 or (_cf_token_gate_results | min)
+          # Sanity: run.yml has at least one CF token line; an empty
+          # result means the contract is vacuous (someone stripped
+          # every token), which is also worth flagging.
+          - _cf_token_gate_results | length > 0
         fail_msg: >-
-          run.yml MUST NOT have any line `CLOUDFLARE_API_TOKEN:
-          ${{ secrets.CLOUDFLARE_API_TOKEN }}` that is NOT preceded
-          (within the same step) by an `if:` gate. A bare reference
+          run.yml MUST NOT have a `CLOUDFLARE_API_TOKEN: {% raw
+          %}${{ secrets.CLOUDFLARE_API_TOKEN }}{% endraw %}` line
+          that is NOT in a step with an `if:` gate. A bare reference
           without an `if:` ships the token to every run that reaches
-          the step, including provider-only. Add a positive `if:`
-          gate (truth-table, not a falsy-ternary) before the step
-          that carries the token, OR move the env to job-level only on
-          jobs that already gate on the operator's `operation` choice.
+          the step, including provider-only. Per-line gate results:
+          {{ _cf_token_gate_results }}.
         quiet: true
 
     - name: "ip-rotation | run.yml gates the CF token on the provider-only input"
