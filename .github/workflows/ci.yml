@@ -68,7 +68,7 @@ jobs:
           # the workflow did not actually install.
           python3 -m venv .lint-venv
           .lint-venv/bin/pip install --quiet --disable-pip-version-check \
-            ansible-core yamllint ansible-lint
+            ansible-core pyyaml yamllint ansible-lint
           ansible-galaxy collection install --force 'hetzner.hcloud:>=7.0.0,<8.0.0'
       - name: Classify change and pick CI tier
         id: classify
