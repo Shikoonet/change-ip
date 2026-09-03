@@ -61,11 +61,13 @@ jobs:
         with: {python-version: '3.11'}
       - name: Install dependencies (one-shot)
         run: |
-          # The Makefile's `lint` target hard-codes `.lint-venv/bin/` for
-          # yamllint and ansible-lint, so create that venv and install
-          # the same tools there. Installing them at system level would
-          # leave `make lint` and `make ci-full` looking for binaries
-          # the workflow did not actually install.
+          # PyYAML is needed at the system Python because the test
+          # harness spawns `python3 rotate.py ...` as a subprocess —
+          # `rotate.py` imports yaml for config parsing, and the
+          # subprocess uses the same `python3` that the harness does.
+          # The .lint-venv venv below is for the Makefile's `lint`
+          # target, which hard-codes `.lint-venv/bin/`.
+          pip install --quiet --disable-pip-version-check pyyaml
           python3 -m venv .lint-venv
           .lint-venv/bin/pip install --quiet --disable-pip-version-check \
             ansible-core pyyaml yamllint ansible-lint
