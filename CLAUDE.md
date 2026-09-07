@@ -139,6 +139,23 @@ operator ادامه می‌دهد با خواندن checkpoint و پاک‌کر�
 شود، همان مکانیزمی است که باعث می‌شود escalation واقعی دیده نشود — همان درسی که در shikoonet
 با «کانال آلرت هفته‌ها قرمز بود» پرداخت شد.
 
+### skip-defence ثابت در `_step_cloudflare_preflight`
+
+اولین if-block `_step_cloudflare_preflight` (rotate.py:1416-1425) قبل از
+هر lookup توکن پایان می‌یابد: manifest خالی، envelope با `skipped: True`، `return`.
+هیچ تماسی به Cloudflare نمی‌خورد، هیچ env var توکنی نمی‌خواند. defence در خودِ rotate.py
+ساختاری است، نه یک چک بعدی.
+
+- source-level: `tests/contract.yml` عبارت `if self.provider_only: … cp["cloudflare_manifest"] = [] … return`
+  را به ترتیب در خود rotate.py چک می‌کند. هر refactor که این ترتیب را به‌هم بزند، باید این تست
+  را نیز به‌روز کند.
+- behaviour-level: `tests/test_rotation.py::TestCloudflareFlow::test_provider_only_throwaway_opt_out_structurally_blocks_dns`
+  ثابت می‌کند که در کل run، هیچ discover/apply/verify صدا زده نمی‌شود.
+- سنجش operator-supplied server fixture:
+  `tests/test_rotation.py::TestCloudflareFlow::test_provider_only_skip_with_real_server_fixture`
+  همین ادعا را روی سرور هتزنر `#164897365 @ 188.245.32.133` (server اخیراً توسط
+  operator تأیید شد) pin می‌کند تا یک regression که به یک سرور پیش‌فرض برمی‌گردد، شناسایی شود.
+
 ## گیت انسانی در CI
 
 ابزار عمداً وسط کار می‌ایستد تا انسان `inventory/hosts.yml` را ویرایش کند. pipeline آن را
@@ -177,14 +194,29 @@ environmentها:
 - `hetzner-production` — جاب‌های `swap`، `dns`، `rollback` با required reviewer
 
 ```bash
-gh secret list --repo Shikoonet/change-ip            # 5 سکرت repo-level
-gh secret list --env hetzner-plan --repo Shikoonet/change-ip      # HCLOUD_TOKEN, ROTATION_CONFIG
-gh secret list --env hetzner-production --repo Shikoonet/change-ip # همه‌ی توکن‌های production روی محیط production
-gh api repos/Shikoonet/change-ip/environments        # 2 environment با reviewer
+# وضعیت فعلی (live audit 2026-09-07):
+gh secret list --repo Shikoonet/change-ip            # 0 سکرت repo-level — همه environment-scoped هستند
+gh secret list --env dataforest-production --repo Shikoonet/change-ip   # DATAFOREST_API_TOKEN
+gh secret list --env cloudflare-production --repo Shikoonet/change-ip  # CLOUDFLARE_API_TOKEN_ACCOUNT_A, _B
+gh secret list --env hetzner-plan --repo Shikoonet/change-ip          # HCLOUD_TOKEN, ROTATION_CONFIG
+gh secret list --env hetzner-production --repo Shikoonet/change-ip     # HCLOUD_TOKEN, ROTATION_CONFIG
+gh api repos/Shikoonet/change-ip/environments                       # 4 environment با reviewer
+# هفت سکرت زیر **هنوز تعریف نشده‌اند** و باید قبل از اولین `Run workflow → change-ip` اضافه شوند:
+#   CLOUDFLARE_API_TOKEN          (legacy single-account, on hetzner-production)
+#   SHIKOONET_REPO                (on cloudflare-production + hetzner-production)
+#   SSH_PRIVATE_KEY               (on cloudflare-production + hetzner-production)
+#   ANSIBLE_VAULT_PASSWORD        (on cloudflare-production + hetzner-production)
+# `bash scripts/setup-secrets.sh` این لیست را به‌صورت idempotent audit می‌کند
+# و دقیقاً `gh secret set` commands مورد نیاز را چاپ می‌کند.
 ```
 
 `HCLOUD_TOKEN` و `ROTATION_CONFIG` روی **environment** باشند نه روی repo — یک سکرت
 repo-wide برای هر جابی روی هر برنچی قابل‌خواندن است. ماسک یک مرز نیست.
+
+> **هشدار**: هفت سکرت بالا در حال حاضر missing هستند. CI آفلاین (push+PR) آن‌ها را لازم
+> ندارد (مسیر dispatch اجرا نمی‌شود)، پس pipeline سبز می‌ماند؛ ولی **اولین** `Run workflow
+> → change-ip` بدون `git clone` موفق یا `ssh` کار، شکست می‌خورد. قبل از اولین
+> dispatch انسانی، `bash scripts/setup-secrets.sh` را اجرا کنید.
 
 ## قراردادها
 

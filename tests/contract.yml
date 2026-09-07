@@ -671,6 +671,44 @@
           picks provider-only.
         quiet: true
 
+    # ---- 7a. provider_only skip-defence (source-level) --------------------
+    # `cloudflare.mode: provider_only` is the throwaway-test-server
+    # opt-out. The contract is structural: when provider_only is on,
+    # `_step_cloudflare_preflight` MUST return before reading any
+    # account / token env, MUST persist an empty manifest, and MUST
+    # record skipped=True on the preflight envelope. A behavioural
+    # test in test_rotation.py proves the runtime behaviour; this
+    # contract proves the source still has the early-return, so a
+    # refactor that reorders steps cannot silently disable the skip.
+    - name: "ip-rotation | rotate.py provider_only skip returns before token lookup"
+      ansible.builtin.set_fact:
+        _rotate_py_body: "{{ lookup('file', _repo ~ '/rotate.py') | regex_replace('(?m)#.*$', '') }}"
+
+    - name: "ip-rotation | rotate.py provider_only skip writes empty manifest"
+      ansible.builtin.assert:
+        that:
+          # Look for the early-return block: provider_only → empty
+          # cloudflare_manifest → skipped-preflight envelope → return.
+          # The three markers MUST appear IN THIS ORDER (the early
+          # return must precede the read-token-loop). The order is
+          # the structural protection: nothing between `provider_only`
+          # and `return` may read a Cloudflare token.
+          - _rotate_py_body is search(
+              "(?ms)provider_only:\\s*\\n\\s*cp\\[\\\"cloudflare_manifest\\\"\\]\\s*=\\s*\\[\\].*?return",
+              multiline=True)
+        fail_msg: >-
+          rotate.py provider_only skip-path regressed. The early
+          return at the top of _step_cloudflare_preflight must
+          persist cloudflare_manifest=[] AND a skipped envelope
+          AND return BEFORE the accounts-loop that reads the token
+          env vars. A regression that lets anything between
+          `if self.provider_only:` and `return` reach the CF API
+          would let CLOUDFLARE_API_TOKEN escape the operator's
+          provider_only opt-out. Verified offline by
+          tests.test_rotation.TestCloudflareFlow
+              .test_provider_only_skip_with_real_server_fixture
+              (server #164897365 at 188.245.32.133).
+
     # ---- 8. summary sanitisation --------------------------------------------
     # GitHub Actions publishes `$GITHUB_STEP_SUMMARY`, `$GITHUB_OUTPUT` and
     # stdout/stderr of every step. The contract is that none of these may

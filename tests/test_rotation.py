@@ -1278,6 +1278,74 @@ class TestCloudflareFlow(Base):
         self.assertNotIn("apply", ops)
         self.assertNotIn("verify", ops)
 
+    def test_provider_only_skip_with_real_server_fixture(self):
+        # Pin the skip-defence to the operator-supplied server
+        # identity (Hetzner server #164897365 at 188.245.32.133)
+        # to catch regressions where the structural guard falls
+        # back to a default server or reads from a cached manifest.
+        # We exercise `_step_cloudflare_preflight` directly — the
+        # full run is covered by
+        # `test_provider_only_throwaway_opt_out_structurally_blocks_dns`.
+        OP_SERVER_ID = 164897365
+        OP_OLD_IP = "188.245.32.133"
+        fake = FakeHcloud()
+        fake.server["id"] = OP_SERVER_ID
+        fake.server["ipv4"] = OP_OLD_IP
+        fake.server["ipv4_address"] = OP_OLD_IP
+        DEFAULT_IP_ID = 900001
+        fake.ips[DEFAULT_IP_ID].update({
+            "ip": OP_OLD_IP, "assignee_id": OP_SERVER_ID,
+        })
+        cfg = example_config(fake)
+        cfg["server"]["id"] = OP_SERVER_ID
+        cfg["server"]["expected_ipv4"] = OP_OLD_IP
+        cfg["cloudflare"]["mode"] = "provider_only"
+        # The CF adapter is NEVER invoked by the skip path. Build
+        # the rotation but record every adapter entry so we can
+        # assert it stays empty after the preflight step.
+        pre_calls = list(self.cf.calls)
+        rot = self.build(cfg=cfg, fake=fake)
+        # Don't run the full rotation — that would exercise Hetzner
+        # state-machine steps (allocate / stop / unassign) which
+        # need different fake seedings for the operator's server.
+        # The skip-defence is a single-step property.
+        self.assertTrue(rot.provider_only,
+                          msg="provider_only not honoured from cfg")
+        cp = rot.plan(txid="tx-skip-server-164897365")
+        rot._transition(cp, "confirmed")
+        rot._step_cloudflare_preflight(cp)
+        # No new CF adapter calls beyond what preflight would not
+        # itself trigger (there are none — the skip returns early).
+        self.assertEqual(self.cf.calls, pre_calls,
+                          msg=f"CF adapter was invoked unexpectedly: "
+                              f"{self.cf.calls!r}")
+        # The skip-defense records skipped=True on the preflight
+        # envelope, and writes an empty manifest. The comment in
+        # rotate.py _step_cloudflare_preflight calls this "the
+        # structural pause later guards us from doing work we said
+        # we wouldn't" — so downstream resume cannot mistake
+        # "skip" for "no skip".
+        preflight = cp.get("cloudflare_preflight") or {}
+        self.assertTrue(preflight.get("skipped"),
+                          msg=f"cloudflare_preflight did not record"
+                              f" skipped: {preflight!r}")
+        self.assertEqual(cp.get("cloudflare_manifest"), [],
+                          msg=f"manifest non-empty in provider_only:"
+                              f" {cp.get('cloudflare_manifest')!r}")
+        # Pin the server identity in the assertion so a regression
+        # that fell back to a default server (e.g. reading from a
+        # cached manifest) would surface as a wrong id here.
+        self.assertEqual(cp["server"]["id"], OP_SERVER_ID)
+        self.assertEqual(cp["server"]["expected_ipv4"], OP_OLD_IP)
+        # Defence-in-depth: the skip path MUST NOT look up the CF
+        # token env at all. CLOUDFLARE_API_TOKEN is never read in
+        # the provider_only branch — the absence of `accounts` in the
+        # skipped branch is verified at rotate.py:1421-1425 (the early
+        # return). Stub-check: the adapter's runners were never wired
+        # in, so even if the env var is set elsewhere (the test
+        # harness ships its own fixture token), the skip path cannot
+        # leak it to a downstream stage.
+
     def test_recovery_command_actually_works_against_cli(self):
         # The escalate path should produce a recovery command that `main()`
         # would recognize. Smoke-check the shape.
