@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import copy
 import json
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -291,6 +293,14 @@ class TestReleaseOldIp(Base):
         self.assertEqual(fake.server["ipv4_address"], "46.224.67.245")
         # and running it again is a no-op, not an error
         self.assertEqual(rot.release_orphan_ip("all-unassigned"), {"released": []})
+
+    def test_plan_states_the_real_retention(self):
+        """The reviewer approves swap off this text; it said 'keep' under 'release'."""
+        fake, rot = self._orphan_world()
+        rot.plan()
+        text = "\n".join(self.lines)
+        self.assertIn("old address retention:     release", text)
+        self.assertNotIn("nothing is ever deleted", text)
 
     def test_all_unassigned_refuses_under_keep(self):
         fake, rot = self._orphan_world(retention="keep")
@@ -1408,6 +1418,20 @@ class TestConfig(Base):
         loaded = rot.load(cp["txid"])
         self.assertEqual(loaded["outcome"], "done")
         json.dumps(loaded)  # must stay serialisable
+
+    def test_status_needs_no_token(self):
+        """The verify job runs `status` on an environment that carries no token."""
+        rot = self.build()
+        cp = self.full_run(rot)
+        path = self.write_config(example_config(self.fake))
+        del os.environ["HCLOUD_TOKEN"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = rotate.main(["status", "--config", path, "--txid", cp["txid"]],
+                                 runner=self.fake)
+        finally:
+            os.environ["HCLOUD_TOKEN"] = FAKE_TOKEN
+        self.assertEqual(rc, 0)
 
     def test_job_summary_gets_one_row_per_state(self):
         """The CI table is what a finished run leaves behind once the log scrolls."""

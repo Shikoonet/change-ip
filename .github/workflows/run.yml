@@ -1049,8 +1049,11 @@ jobs:
           cp = json.load(open(f"state/{os.environ['TXID']}.json"))
           if cp.get("outcome") != "done":
               sys.exit(f"outcome is {cp.get('outcome')!r}, not 'done'")
+          fate = ("was RELEASED — deleted from Hetzner"
+                  if cp["old_ip"].get("retention") == "released"
+                  else "is unassigned and RETAINED")
           print(f"{cp['server']['expected_name']} is on {cp['new_ip']['ip']}; "
-                f"{cp['old_ip']['ip']} is unassigned and RETAINED.")
+                f"{cp['old_ip']['ip']} {fate}.")
           EOF
       - run: |
           echo "Now run 'make monitoring-doctor' in the shikoonet repo. It is the"

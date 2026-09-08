@@ -1611,7 +1611,10 @@ class Rotation:
             o("   10. fresh read-back and a second probe")
             o("")
             o(f"  DNS records this may move: {', '.join(cp['snapshot']['dns_records'])}")
-            o(f"  old address retention:     keep  (nothing is ever deleted)")
+            retention = (self.cfg.get("old_ip") or {}).get("retention", "keep")
+            o(f"  old address retention:     {retention}  "
+              + ("(deleted from Hetzner once the rotation is done — no rollback to it after that)"
+                 if retention == "release" else "(kept, unassigned, billed)"))
             o("")
             o("  ⚠ Hetzner guarantees the same DATACENTER, never the same prefix. The new")
             o("    address will not be adjacent to the old one and there is no API to ask")
@@ -4567,11 +4570,13 @@ def _dispatch(
     register_secret(os.environ.get(DATAFOREST_TOKEN_ENV))
 
     provider_name = cfg.get("provider") or "hcloud"
-    if provider_name == "hcloud" and not token_present():
+    # `status` reads a checkpoint file and contacts nothing; the verify job
+    # runs it on an environment that carries no token, and run 34278767506
+    # went red on a finished rotation because of this gate alone.
+    if provider_name == "hcloud" and args.command != "status" and not token_present():
         print(
             "HCLOUD_TOKEN is not set. Nothing was contacted.\n"
-            "  export HCLOUD_TOKEN=\"$(ansible-vault view vault.yml"
-            " | awk '/^hcloud_api_token:/ {print $2}' | tr -d \"\\\"\'\')\"",
+            "  export it from your secret store; never pass it as an argument.",
             file=sys.stderr,
         )
         return EXIT_USAGE

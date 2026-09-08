@@ -31,6 +31,13 @@ content scan، token per account) اثبات شده. مسیر **PATCH** — `app
 به `89.167.72.62`. نامش را کسی تایپ نکرد — `plan` روی placeholder رد کرد و نام واقعی را
 در پیام رد گفت. برای هر باکس جدید همین کار را بکن.
 
+**سومین چرخش، اولین `change-ip` سرتاسری (۲۰۲۶-۰۹-۰۸ ۲۱:۰۸ UTC، run `34278767506`):** همان
+باکس، `46.62.161.237` → `89.167.72.62`. `allocate` به سهمیه‌ی Primary IP خورد، خود run آدرس
+بی‌صاحب را آزاد کرد و دوباره allocate زد؛ swap؛ دو scan روی هر دو حساب Cloudflare (۸ zone،
+۰ رکورد روی آدرس قدیم) → «DNS خارج از scope» → `done` → `46.62.161.237` از هتزنر حذف شد.
+یک دکمه، دو Approve، هیچ کار دستی. جاب `verify` همان run قرمز شد چون `status` بی‌دلیل
+توکن می‌خواست — همان روز درست شد. PATCH روی Cloudflare همچنان زنده اجرا نشده (رکوردی نبود).
+
 و `--check` اینجا کمکی نمی‌کند: **ماژول‌های hcloud در check mode هیچ action واقعی نمی‌سازند**،
 پس هیچ ترتیبی با آن اعتبارسنجی نمی‌شود. اولین اجرای زنده‌ی نیمه‌ی DNS تأیید جداگانه‌ی کاربر
 می‌خواهد.
@@ -270,8 +277,8 @@ operator ادامه می‌دهد با خواندن checkpoint و پاک‌کر�
 environmentها:
 - `hetzner-plan` — جاب‌های `plan` و `verify` (فقط‌خواندنی). **بدون reviewer**
 - `hetzner-production` — جاب‌های `swap`، `dns`، `rollback`. **با required reviewer از ۲۰۲۶-۰۹-۰۸**
-- `cloudflare-production` — جاب `dns_scan` و مراحل DNS دیتافارست. **هنوز بدون reviewer**
-- `dataforest-production` — مراحل provider دیتافارست. **هنوز بدون reviewer**
+- `cloudflare-production` — جاب `dns_scan` و مراحل DNS دیتافارست. **با required reviewer**
+- `dataforest-production` — مراحل provider دیتافارست. **با required reviewer**
 
 ⚠ تا ۲۰۲۶-۰۹-۰۸ هیچ environmentی reviewer نداشت، در حالی که همین فایل آن را «دکمه‌ی
 توقف» می‌نامید. protection را از API بخوان نه از این متن:
@@ -284,7 +291,7 @@ gh secret list --env dataforest-production --repo Shikoonet/change-ip   # DATAFO
 gh secret list --env cloudflare-production --repo Shikoonet/change-ip  # CLOUDFLARE_API_TOKEN_ACCOUNT_A, _B
 gh secret list --env hetzner-plan --repo Shikoonet/change-ip          # HCLOUD_TOKEN, ROTATION_CONFIG
 gh secret list --env hetzner-production --repo Shikoonet/change-ip     # HCLOUD_TOKEN, ROTATION_CONFIG
-gh api repos/Shikoonet/change-ip/environments   # 4 environment؛ فقط hetzner-production reviewer دارد
+gh api repos/Shikoonet/change-ip/environments   # 4 environment؛ هر سه محیط mutating reviewer دارند، hetzner-plan عمداً نه
 # چهار سکرت زیر **هنوز تعریف نشده‌اند** و باید قبل از اولین `Run workflow → change-ip` اضافه شوند:
 #   CLOUDFLARE_API_TOKEN          (legacy single-account, on hetzner-production)
 #   SHIKOONET_REPO                (on cloudflare-production + hetzner-production)
