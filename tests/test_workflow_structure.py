@@ -403,6 +403,51 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn('"$retention" != "release"', body)
         self.assertIn("--ip", body)
 
+    def test_every_test_module_is_in_exactly_one_ci_shard(self):
+        """The CI matrix is the only list of what runs. It must be complete.
+
+        The suite is sharded across runners by module so wall clock is the
+        longest module rather than the sum. The cost of that shape is that a
+        module left out of the matrix is silently never run — a green check
+        that tested less than it says. This reads ci.yml's matrix and the
+        tests/ directory and requires a bijection.
+        """
+        import glob, os
+        import yaml as _yaml
+        root = Path(__file__).resolve().parents[1]
+        ci = _yaml.safe_load((root / ".github" / "workflows" / "ci.yml").read_text())
+        include = ci["jobs"]["unit"]["strategy"]["matrix"]["include"]
+        assigned = {}
+        for entry in include:
+            for mod in entry["modules"].split():
+                self.assertNotIn(mod, assigned,
+                                 f"{mod} is in shards {assigned.get(mod)} and {entry['shard']}")
+                assigned[mod] = entry["shard"]
+        # TRACKED files, not the working tree. CI checks out a commit; a test
+        # file that exists only on a developer's disk is invisible to it. The
+        # first version of this test used glob and passed locally while the
+        # matrix named tests.test_onboard — untracked — which CI would have
+        # failed on with ModuleNotFoundError. Judge by what a checkout has.
+        import subprocess
+        try:
+            tracked = subprocess.run(
+                ["git", "-C", str(root), "ls-files", "tests/test_*.py"],
+                capture_output=True, text=True, check=True, timeout=30,
+            ).stdout.split()
+            on_disk = {"tests." + os.path.basename(p)[:-3] for p in tracked}
+        except (OSError, subprocess.SubprocessError):
+            # No git (e.g. an exported tree): fall back to what is on disk.
+            on_disk = {"tests." + os.path.basename(p)[:-3]
+                       for p in glob.glob(str(root / "tests" / "test_*.py"))}
+        missing = sorted(on_disk - set(assigned))
+        extra = sorted(set(assigned) - on_disk)
+        self.assertEqual(missing, [], f"tracked test modules not in any CI shard: {missing}")
+        self.assertEqual(extra, [], f"CI shards name modules that are not tracked: {extra}")
+        # and the self-test runs somewhere
+        fast = ci["jobs"]["unit"]["steps"]
+        self.assertTrue(any("--self-test" in (s.get("run") or "") for s in fast),
+                        "rotate.py --self-test must run in a shard")
+
     def test_dns_scan_is_read_only(self):
         """dns_scan carries two Cloudflare tokens. It must never mutate.
 

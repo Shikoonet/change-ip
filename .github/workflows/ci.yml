@@ -10,6 +10,20 @@
 # previous offline run. The discriminator is the PR number (or ref on
 # push). A feature-branch push runs the SAME required check as the
 # PR check, so there is no duplicate push workflow.
+#
+# SHAPE (2026-09-08). One job took 8 minutes: 568s of tests run serially,
+# 259s of them a single module (test_cloudflare_playbook, 33 tests that
+# each start a real ansible-playbook). Nothing was redundant — it was
+# serial. So: classify once, then run in PARALLEL
+#   * the unit suite as module shards, one runner each, each shard serial
+#     inside (three modules fail if run concurrently in one process);
+#   * the contract playbook's structural checks, with the suite skipped
+#     (it runs in the shards — once, never twice);
+#   * lint.
+# Wall clock = the longest shard, ~4.5 min, not the sum. Every test module
+# must be in exactly one shard — tests/test_workflow_structure reads the
+# matrix below and fails if one is missing or doubled, so a new test file
+# cannot go silently unrun.
 # =============================================================================
 name: ci
 
@@ -32,69 +46,188 @@ permissions:
   actions: read
   contents: read
 
-# Path-routing is done INSIDE the job, not via a top-level
-# `paths:` filter on the workflow. A `paths:` filter would
-# leave the required check pending on any push that touches
-# filtered-out files, which the brief explicitly forbids.
-#
-# A single offline job:
-#   1. reads the list of files in the push / PR;
-#   2. classifies the change as docs-only or relevant;
-#   3. picks the right Make target (ci-fast vs ci-full);
-#   4. runs the chosen target;
-#   5. fails the required check on lint failure.
-#
-# Checkout, Python setup, and dependency installation happen
-# ONCE per run, not per tier. The `make ci-fast` and
-# `make ci-full` targets themselves contain their own lint
-# invocation.
 jobs:
-  offline:
-    name: offline tests (push + PR)
+  # ---- 0. which tier? ------------------------------------------------------
+  # Path-routing is done here, not via a top-level `paths:` filter — that
+  # would leave the required check pending on a push that touches only
+  # filtered-out files. The classifier is under test
+  # (tests/test_classify_change.py); anything indeterminate escalates to
+  # ci-full.
+  classify:
+    name: classify
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
+    outputs:
+      tier: ${{ steps.classify.outputs.tier }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 50
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - name: Install dependencies (one-shot)
-        run: |
-          # PyYAML is needed at the system Python because the test
-          # harness spawns `python3 rotate.py ...` as a subprocess —
-          # `rotate.py` imports yaml for config parsing, and the
-          # subprocess uses the same `python3` that the harness does.
-          # The .lint-venv venv below is for the Makefile's `lint`
-          # target, which hard-codes `.lint-venv/bin/`.
-          pip install --quiet --disable-pip-version-check pyyaml
-          python3 -m venv .lint-venv
-          .lint-venv/bin/pip install --quiet --disable-pip-version-check \
-            ansible-core pyyaml yamllint ansible-lint
-          ansible-galaxy collection install --force 'hetzner.hcloud:>=7.0.0,<8.0.0'
-      - name: Classify change and pick CI tier
-        id: classify
-        # The classifier is a small Python script under test
-        # (`tests/test_classify_change.py`). PR diffs use
-        # `pull_request.base.sha..github.sha`; push diffs use
-        # `before..sha`. Any indeterminate diff (missing SHA,
-        # all-zero SHA, shallow clone, git error) escalates to
-        # ci-full. The classifier writes `tier=` to $GITHUB_OUTPUT
-        # so the next step consumes it via the actual step
-        # output, not a transient shell variable.
+      - id: classify
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
           CI_HEAD_SHA: ${{ github.sha }}
         run: python3 .github/scripts/classify_change.py
-      - name: Run the selected CI tier
-        run: make ${{ steps.classify.outputs.tier }}
+
+  # ---- docs-only: structural playbook only --------------------------------
+  fast:
+    name: offline tests (docs-only)
+    needs: classify
+    if: needs.classify.outputs.tier == 'ci-fast'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.ansible/collections
+          key: ci-deps-${{ runner.os }}-v1
+      - name: Install
+        run: |
+          pip install --quiet --disable-pip-version-check pyyaml
+          python3 -m venv .lint-venv
+          .lint-venv/bin/pip install --quiet --disable-pip-version-check ansible-core pyyaml
+          ansible-galaxy collection install 'hetzner.hcloud:>=7.0.0,<8.0.0'
+      - run: make ci-fast
+
+  # ---- code: the suite, sharded by module ---------------------------------
+  unit:
+    name: tests · ${{ matrix.shard }}
+    needs: classify
+    if: needs.classify.outputs.tier == 'ci-full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Balanced on measured serial times. cf-playbook is the floor.
+          - shard: cf-playbook          # 259s
+            modules: tests.test_cloudflare_playbook
+          - shard: dataforest           # 93s + 67s
+            modules: tests.test_dataforest tests.test_dataforest_playbook
+          - shard: staged               # 75s + 17s + 47s
+            modules: tests.test_staged_cli tests.test_staged_e2e tests.test_cloudflare_real_playbook_multi_account
+          - shard: fast                 # everything else, ~10s, plus --self-test
+            modules: tests.test_rotation tests.test_workflow_structure tests.test_stage_runner tests.test_make_failure_propagation tests.test_setup_secrets tests.test_cloudflare_multi_account tests.test_cloudflare_adapter_subprocess_env tests.test_classify_change tests.test_cf_api_base_contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.ansible/collections
+          key: ci-deps-${{ runner.os }}-v1
+      - name: Install
+        run: |
+          # PyYAML at the system Python: the harness spawns `python3
+          # rotate.py ...` and rotate.py imports yaml. ansible-core for the
+          # playbook shards; the collection for hcloud_step.yml.
+          pip install --quiet --disable-pip-version-check pyyaml ansible-core
+          ansible-galaxy collection install 'hetzner.hcloud:>=7.0.0,<8.0.0'
+      - run: make test-shard MODULES="${{ matrix.modules }}"
+      - name: rotate.py --self-test
+        if: matrix.shard == 'fast'
+        run: python3 rotate.py --self-test
       - name: Upload sanitized failure artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-failure-${{ github.run_id }}
+          name: ci-failure-${{ matrix.shard }}-${{ github.run_id }}
           path: |
             state/
             test-results/
           retention-days: 3
           if-no-files-found: ignore
+
+  # ---- code: the contract, structural checks only -------------------------
+  contract:
+    name: contract (structural)
+    needs: classify
+    if: needs.classify.outputs.tier == 'ci-full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.ansible/collections
+          key: ci-deps-${{ runner.os }}-v1
+      - name: Install
+        run: |
+          pip install --quiet --disable-pip-version-check pyyaml ansible-core
+          ansible-galaxy collection install 'hetzner.hcloud:>=7.0.0,<8.0.0'
+      - run: make contract-structural
+
+  # ---- code: lint ---------------------------------------------------------
+  lint:
+    name: lint
+    needs: classify
+    if: needs.classify.outputs.tier == 'ci-full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.ansible/collections
+          key: ci-deps-${{ runner.os }}-v1
+      - name: Install
+        run: |
+          # The Makefile's lint targets hard-code .lint-venv/bin/.
+          pip install --quiet --disable-pip-version-check pyyaml ansible-core
+          python3 -m venv .lint-venv
+          .lint-venv/bin/pip install --quiet --disable-pip-version-check \
+            ansible-core pyyaml yamllint ansible-lint
+          ansible-galaxy collection install 'hetzner.hcloud:>=7.0.0,<8.0.0'
+      - run: make ci-lint
+
+  # ---- the one required check ----------------------------------------------
+  # Branch protection should require THIS job, not the matrix members: it
+  # is the only job whose name is stable across tiers. It fails if any
+  # needed job failed or was cancelled, and passes when a tier's jobs were
+  # legitimately skipped.
+  offline:
+    name: offline tests (push + PR)
+    needs: [classify, fast, unit, contract, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Gate on every needed job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["RESULTS"])
+          tier = needs["classify"]["outputs"].get("tier")
+          bad = {k: v["result"] for k, v in needs.items()
+                 if v["result"] in ("failure", "cancelled")}
+          print(f"tier={tier}")
+          for k, v in needs.items():
+              print(f"  {k}: {v['result']}")
+          if needs["classify"]["result"] != "success":
+              sys.exit("classify did not succeed")
+          if bad:
+              sys.exit(f"failed/cancelled: {bad}")
+          ran = [k for k, v in needs.items() if v["result"] == "success" and k != "classify"]
+          if not ran:
+              sys.exit("no tier ran anything — that is a routing bug, not a pass")
+          PY

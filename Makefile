@@ -138,6 +138,45 @@ ci-provider:
 	# subprocesses the unittest exercise.
 	ansible-playbook tests/contract.yml
 
+# ---- CI-only targets: the same checks, cut for parallel runners ------------
+# Measured 2026-09-08: the suite is 568s serial and ONE module,
+# test_cloudflare_playbook, is 259s of it (33 tests, each a real
+# ansible-playbook run). A single CI job took 8 minutes. These targets let
+# ci.yml run the suite as module shards on separate runners, the contract's
+# structural checks without the suite, and lint — all in parallel — so wall
+# clock is the longest shard, not the sum. Nothing is skipped: every module
+# is in exactly one shard (tests/test_workflow_structure asserts it), the
+# self-test runs in the fast shard, and locally `make test` is unchanged.
+.PHONY: test-shard
+test-shard:
+	@test -n "$(MODULES)" || { echo "test-shard: MODULES=tests.test_x ... is required"; exit 2; }
+	python3 -m unittest $(MODULES)
+
+.PHONY: contract-structural
+contract-structural:
+	ansible-playbook tests/contract.yml -e skip_python_suite=true
+
+.PHONY: ci-lint
+ci-lint:
+	@if [ ! -x "$(LINT_BIN)/yamllint" ]; then \
+		echo "yamllint missing at $(LINT_BIN)/yamllint"; exit 127; \
+	fi
+	@if [ ! -x "$(LINT_BIN)/ansible-lint" ]; then \
+		echo "ansible-lint missing at $(LINT_BIN)/ansible-lint"; exit 127; \
+	fi
+	$(LINT_BIN)/yamllint -c .yamllint.yml \
+		hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml \
+		cf_record_pages.yml tests/contract.yml tests/structural.yml \
+		rotation.example.yml
+	$(LINT_BIN)/ansible-lint \
+		hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml
+	ansible-playbook --syntax-check \
+		hcloud_step.yml cloudflare_replace_ip_step.yml dataforest_step.yml \
+		tests/contract.yml tests/structural.yml
+	python3 -m compileall -q rotate.py providers.py ansible_adapter.py \
+		cloudflare_adapter.py dataforest_adapter.py \
+		dataforest_guest_adapter.py
+
 .PHONY: ci-full
 # Push to main: ci-provider (full offline regression) +
 # blocking lint. ci-full ADDS lint without re-running the
