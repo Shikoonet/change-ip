@@ -46,10 +46,24 @@
 #    fetch page 1, validate total_pages, then loop `2..total_pages`.
 #    Same shape for /zones and /zones/{id}/dns_records.
 #
-# 4. APPLY AND ROLLBACK TOUCH ONLY MANIFEST RECORDS. No DNS scan; no "find
-#    every A record in these zones"; no expansion of `allowed_records`. The
-#    manifest is what was discovered before the box moved, and only those
-#    IDs are PATCHed. Anything that drifted after discover aborts.
+# 4. APPLY AND ROLLBACK TOUCH ONLY MANIFEST RECORDS. The manifest is what
+#    was discovered before the box moved, and only those IDs are PATCHed.
+#    Anything that drifted after discover aborts. That property is unchanged
+#    and is the one that matters.
+#
+#    DISCOVER, HOWEVER, NOW SCANS. It asks each zone for A records whose
+#    content is already OLD_IP (`?type=A&content=<ip>`, filtered server-side)
+#    and unions them with the `allowed_records` lookups. `allowed_records` is
+#    a FLOOR: every name in it must come back, or preflight stops; records
+#    found only by the scan are added on top.
+#
+#    The earlier version of this note forbade the scan. It was changed on
+#    2026-09-08 because a hand-maintained allowlist goes stale exactly the
+#    way it did in practice — a record added from a phone was not in the
+#    config, so the rotation left it pointing at a dead address. OLD_IP comes
+#    from the checkpoint, never from a human, so "points at OLD_IP" is a
+#    sound definition of "belongs to this box". Apply still PATCHes only the
+#    ids captured before the provider moved anything.
 #
 # 5. PATCH BODY IS `{"content": TARGET_IP}` ONLY. TTL, proxied, comment, and
 #    tags are NOT sent; the operation is an IP replacement, not a record
@@ -313,6 +327,42 @@
               {{ pairs }}
           when: operation == 'discover'
 
+        # The allowlist is a FLOOR, not the whole story. `_pairs` above is
+        # every FQDN the config named; this adds one content-filtered lookup
+        # per zone, so an A record somebody created after the config was
+        # written — from a phone, from the Cloudflare UI — is still found and
+        # still moves. Cloudflare filters server-side (`?type=A&content=<ip>`),
+        # so this is one request per zone, not a full record dump.
+        #
+        # What this trades away: design note 4's "no DNS scan". A record that
+        # points at OLD_IP but belongs to something else now moves too. That
+        # is the intended reading — OLD_IP is this box's address, read from
+        # the checkpoint and never typed by a human, so a record pointing at
+        # it is a record pointing at this box. The manifest is still built
+        # BEFORE any provider mutation and apply/rollback still PATCH only
+        # the record_ids captured here.
+        - name: "cloudflare | discover | one content-scan lookup per zone, plus the allowlist"
+          ansible.builtin.set_fact:
+            _pairs: |
+              {%- set out = [] -%}
+              {%- for pr in _pairs -%}
+                {%- set _ = out.append(pr | combine({'filter': 'name=' ~ pr.name, 'scan': false})) -%}
+              {%- endfor -%}
+              {%- for z in _zones -%}
+                {%- set zn = (z.name | default('') | lower | regex_replace('\\.$', '')) -%}
+                {%- if (zn | length) > 0 -%}
+                  {%- set _ = out.append({
+                      'zone_id': z.id,
+                      'zone_name': zn,
+                      'name': '(content-scan) ' ~ zn,
+                      'filter': 'content=' ~ old_ip,
+                      'scan': true
+                    }) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ out }}
+          when: operation == 'discover'
+
         - name: "cloudflare | discover | reject duplicate (zone_id, name) tuples"
           ansible.builtin.assert:
             that:
@@ -324,7 +374,7 @@
         - name: "cloudflare | discover | record page 1 per pair"
           ansible.builtin.uri:
             url: >-
-              {{ cf_api_base }}/zones/{{ item.zone_id }}/dns_records?type=A&name={{ item.name }}&per_page=50&page=1
+              {{ cf_api_base }}/zones/{{ item.zone_id }}/dns_records?type=A&{{ item.filter }}&per_page=50&page=1
             method: GET
             headers:
               Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
@@ -445,9 +495,23 @@
                      }) -%}
                 {%- endfor -%}
               {%- endfor -%}
-              {{ ns.records }}
+              {%- set seen = {} -%}
+              {%- set uniq = [] -%}
+              {%- for rec in ns.records -%}
+                {%- if rec.record_id not in seen -%}
+                  {%- set _ = seen.update({rec.record_id: true}) -%}
+                  {%- set _ = uniq.append(rec) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ uniq }}
           when: operation == 'discover'
 
+        # De-duplicated by record_id above: an allowlisted FQDN that also
+        # points at OLD_IP comes back from BOTH its name lookup and its
+        # zone's content scan, and that is one record, not two. This assert
+        # is the post-condition — it now also catches Cloudflare returning
+        # the same id under two different names, which de-duplication would
+        # otherwise hide.
         - name: "cloudflare | discover | reject duplicate record ids"
           ansible.builtin.assert:
             that:
@@ -462,12 +526,14 @@
             that:
               - item.type == 'A'
               - item.previous_content == old_ip
-              - (item.name | lower) in (allowed_records | from_json | map('lower'))
             fail_msg: >-
               Record {{ item.name }} ({{ item.type }}) currently points at
               {{ item.previous_content }}, not the old_ip this rotation started
               against. Pre-flighting a manifest with the wrong baseline would
               PATCH a record this run has no business touching.
+              (Membership of `allowed_records` is NO LONGER required per
+              record — the allowlist is a floor, asserted as a subset below.
+              Pointing at old_ip is what puts a record in scope.)
             quiet: true
           loop: "{{ _manifest }}"
           loop_control:
@@ -477,15 +543,23 @@
         - name: "cloudflare | discover | assert expected count"
           ansible.builtin.assert:
             that:
-              - (_manifest | length) == (expected_count | int)
-              - ((_manifest | map(attribute='name') | map('lower') | sort)
-                  == (allowed_records | from_json | map('lower') | sort))
+              - (_manifest | length) >= (expected_count | int)
+              - ((allowed_records | from_json | map('lower') | reject('in',
+                   (_manifest | map(attribute='name') | map('lower') | list))
+                   | list) | length) == 0
             fail_msg: >-
-              Cloudflare returned a different number of A records than the
-              config promised. Refusing: the manifest is what this run would
-              PATCH, and an incomplete manifest would edit some DNS names
-              and miss others. Got {{ _manifest | length }} manifest entries;
-              expected {{ expected_count | int }}.
+              The allowlist is a FLOOR and it was not met. Every FQDN in
+              `allowed_records` must come back from Cloudflare pointing at
+              old_ip; a missing one means a broken token, the wrong zone, or
+              a record somebody already moved — none of which is safe to
+              PATCH around. Missing:
+              {{ allowed_records | from_json | map('lower')
+                 | reject('in', (_manifest | map(attribute='name')
+                 | map('lower') | list)) | list | join(', ') }}.
+              Got {{ _manifest | length }} manifest entries; the floor is
+              {{ expected_count | int }}. Extra records ABOVE the floor are
+              expected and intended — they are A records that point at
+              old_ip and were never listed in the config.
             quiet: true
           when: operation == 'discover'
 

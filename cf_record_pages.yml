@@ -19,7 +19,7 @@
 - name: "cf_record_pages | fetch page N for a record"
   ansible.builtin.uri:
     url: >-
-      {{ cf_api_base }}/zones/{{ cf_record_lookup.pair.zone_id }}/dns_records?type=A&name={{ cf_record_lookup.pair.name }}&per_page=50&page={{ cf_record_page_number }}
+      {{ cf_api_base }}/zones/{{ cf_record_lookup.pair.zone_id }}/dns_records?type=A&{{ cf_record_lookup.pair.filter }}&per_page=50&page={{ cf_record_page_number }}
     method: GET
     headers:
       Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"

@@ -161,7 +161,34 @@ class _CloudflareHandler(BaseHTTPRequestHandler):
         zone_id = parts[2]
         qs = parse_qs(u.query)
         name = qs.get("name", [None])[0]
+        content = qs.get("content", [None])[0]
         page = int(qs.get("page", ["1"])[0])
+        if content is not None:
+            # The discover block's per-zone content scan. The fake's source of
+            # truth is `records_pages`; a content query is a VIEW over it, not
+            # a second fixture that could drift from the first. Overrides stay
+            # reachable under the "content=<ip>" key so a test can still pin a
+            # malformed page onto the scan path.
+            override = self.records_pages_overrides.get(
+                (zone_id, "content=" + content, page))
+            if override is not None:
+                self._send_json(override["body"], override.get("status", 200))
+                return
+            seen, matched = set(), []
+            for (z, _n), pages_ in self.records_pages.items():
+                if z != zone_id:
+                    continue
+                for pg in pages_:
+                    for rec in pg:
+                        if rec.get("content") == content and rec.get("id") not in seen:
+                            seen.add(rec.get("id"))
+                            matched.append(rec)
+            self._send_json({
+                "success": True,
+                "result": matched,
+                "result_info": {"total_pages": 1, "page": 1, "per_page": 50},
+            }, 200)
+            return
         key = (zone_id, name or "")
         # Per-page overrides win over the standard page list — they let a
         # single test pin an anomaly (missing result_info, wrong
@@ -439,6 +466,108 @@ class TestCloudflarePlaybook(unittest.TestCase):
         self.assertEqual(len(result["manifest"]), 8)
         self.assertEqual(sorted(r["name"] for r in result["manifest"]),
                          sorted(ALLOWLIST_8))
+
+    def test_discover_finds_a_record_outside_the_allowlist(self):
+        """The record somebody added from a phone.
+
+        It points at old_ip, it is in a zone the token can see, and the config
+        has never heard of it. Before the content scan the rotation moved the
+        eight listed names and left this one pointing at a dead address. The
+        allowlist is now a floor: all eight must still come back, and this
+        ninth one comes back on top of them.
+        """
+        zr = _zone_records_for(ALLOWLIST_8)
+        pages = _records_pages_one(zr, ALLOWLIST_8)
+        # A ninth A record, same old_ip, in an existing zone, NOT in the
+        # allowlist and never resolved by name.
+        stray = {"id": "rec-stray", "name": "mobile.tinooer.top",
+                 "type": "A", "content": "1.1.1.1", "ttl": 300, "proxied": False}
+        zr = zr + [("zone-tinooer.top", stray)]
+        pages[("zone-tinooer.top", stray["name"])] = [[stray]]
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(ALLOWLIST_8)],
+                          records_pages=pages)
+
+        rc, stdout, stderr, result = _run_playbook_full(
+            self.base, op="discover", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8, verbose=True,
+        )
+        if rc != 0:
+            print("STDOUT:", stdout[-2500:])
+            print("STDERR:", stderr[-1500:])
+        self.assertEqual(rc, 0)
+        names = sorted(r["name"] for r in result["manifest"])
+        # the floor is intact ...
+        for listed in ALLOWLIST_8:
+            self.assertIn(listed, names)
+        # ... and the stray was picked up on top of it, exactly once.
+        self.assertIn("mobile.tinooer.top", names)
+        self.assertEqual(len(result["manifest"]), 9)
+        self.assertEqual(len({r["record_id"] for r in result["manifest"]}), 9)
+
+    def test_apply_patches_the_record_found_only_by_the_scan(self):
+        """Discovery is worthless if apply then skips what it found."""
+        zr = _zone_records_for(ALLOWLIST_8)
+        pages = _records_pages_one(zr, ALLOWLIST_8)
+        stray = {"id": "rec-stray", "name": "mobile.tinooer.top",
+                 "type": "A", "content": "1.1.1.1", "ttl": 300, "proxied": False}
+        zr = zr + [("zone-tinooer.top", stray)]
+        pages[("zone-tinooer.top", stray["name"])] = [[stray]]
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(ALLOWLIST_8)],
+                          records_pages=pages)
+
+        rc, _, _, discovered = _run_playbook_full(
+            self.base, op="discover", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8)
+        self.assertEqual(rc, 0)
+
+        rc, stdout, stderr, applied = _run_playbook_full(
+            self.base, op="apply", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8, manifest=discovered["manifest"], verbose=True)
+        if rc != 0:
+            print("STDOUT:", stdout[-2500:])
+            print("STDERR:", stderr[-1500:])
+        self.assertEqual(rc, 0)
+        moved = {r["name"]: r["content"] for r in applied["post_manifest"]}
+        self.assertEqual(moved.get("mobile.tinooer.top"), "2.2.2.2")
+        self.assertTrue(all(v == "2.2.2.2" for v in moved.values()))
+
+    def test_discover_stops_when_an_allowlisted_name_is_missing(self):
+        """The floor is a floor: extras are welcome, absences are not."""
+        short = ALLOWLIST_8[:-1]
+        zr = _zone_records_for(short)
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(short)],
+                          records_pages=_records_pages_one(zr, short))
+        rc, _, stderr, _ = _run_playbook_full(
+            self.base, op="discover", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8)
+        self.assertNotEqual(rc, 0)
+
+    def test_floor_is_not_satisfied_by_strays_making_up_the_count(self):
+        """The sneaky one. Eight listed, one of them gone, two strays found.
+
+        The manifest is nine entries, so a count-only check (`>= 8`) passes
+        and the missing name sails through. Only the subset clause catches it.
+        This is why the floor is asserted by NAME and not by arithmetic.
+        """
+        short = ALLOWLIST_8[:-1]              # one allowlisted name absent
+        zr = _zone_records_for(short)
+        pages = _records_pages_one(zr, short)
+        for i in (1, 2):                      # two strays on the same old_ip
+            stray = {"id": f"rec-stray-{i}", "name": f"stray{i}.tinooer.top",
+                     "type": "A", "content": "1.1.1.1", "ttl": 300,
+                     "proxied": False}
+            zr = zr + [("zone-tinooer.top", stray)]
+            pages[("zone-tinooer.top", stray["name"])] = [[stray]]
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(short)],
+                          records_pages=pages)
+        rc, stdout, stderr, _ = _run_playbook_full(
+            self.base, op="discover", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8)
+        self.assertNotEqual(rc, 0, "a missing allowlisted name must stop the run "
+                                   "even when strays pad the count above the floor")
+        # and it must name the record it could not find, or the operator is
+        # left diffing a config against a zone by hand.
+        self.assertIn(ALLOWLIST_8[-1], stdout + stderr)
 
     def test_discover_more_than_50_zones(self):
         """Seed 60 zones across 2 pages; the playbook must walk both.

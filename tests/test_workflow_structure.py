@@ -889,9 +889,22 @@ class TestCICommandGraphExecutable(unittest.TestCase):
     def test_ci_provider_runs_full_offline_regression(self):
         out = self._dry_run("ci-provider")
         joined = " ".join(out)
-        # All unit tests, contract, and self-test must run.
-        self.assertIn("unittest discover", joined)
+        # All unit tests, contract, and self-test must run — but through ONE
+        # invocation, the contract playbook. ci-provider used to also shell
+        # `unittest discover` and `--self-test` directly, which ran all 462
+        # tests twice and pushed the CI job past its 15-minute timeout.
         self.assertIn("contract.yml", joined)
+        self.assertNotIn("unittest discover", joined,
+                         msg="ci-provider must not shell the suite directly; "
+                             "tests/contract.yml already runs it, and running "
+                             "it twice is what timed CI out")
+        # ...so the guarantee now lives in the contract playbook, and this is
+        # where it is asserted. Without these two lines, deleting the tasks
+        # from contract.yml would silently leave ci-provider running no tests
+        # at all.
+        contract = (Path(__file__).resolve().parents[1] / "tests" / "contract.yml").read_text()
+        self.assertIn("python3 -m unittest discover -s tests -t .", contract)
+        self.assertIn("python3 rotate.py --self-test", contract)
         # ci-provider deliberately does NOT run lint; that gate is
         # ci-full. A ci-provider with lint is a regression — a
         # provider PR (touching real code) should not pay the
