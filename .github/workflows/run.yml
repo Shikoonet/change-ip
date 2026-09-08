@@ -450,6 +450,10 @@ jobs:
         id: in_scope
         env:
           SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
+          # shikoonet is private; see the hcloud dns job for why an anonymous
+          # clone is not an option.
+          SHIKOONET_PAT: ${{ secrets.SHIKOONET_PAT }}
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
           NEW_IP: ${{ needs.swap_dataforest.outputs.new_ip }}
           ALIAS: ${{ needs.swap_dataforest.outputs.alias }}
         run: |
@@ -462,7 +466,22 @@ jobs:
           # PATCH and the inventory edit actually run on a real rotation.
           in_scope=false
           if [ -n "$SHIKOONET_REPO" ]; then
-            git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
+            # Same private-repo clone as the hcloud dns job; see the comment
+            # there. An anonymous clone exits 128 with "could not read
+            # Username", after the Seed has already been changed.
+            tok="${SHIKOONET_PAT:-$ADMIN_PAT}"
+            if [ -z "$tok" ]; then
+              echo "::error::no SHIKOONET_PAT or ADMIN_PAT; cannot read $SHIKOONET_REPO"
+              exit 1
+            fi
+            tokf=$(mktemp); chmod 600 "$tokf"; printf '%s' "$tok" > "$tokf"
+            if ! git -c "credential.helper=!f() { echo username=x-access-token; echo password=$(cat $tokf); }; f" \
+                   clone --depth 1 --quiet "$SHIKOONET_REPO" /tmp/shikoonet; then
+              rm -f "$tokf"
+              echo "::error::clone of shikoonet failed; the token cannot read it"
+              exit 1
+            fi
+            rm -f "$tokf"
             if grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml; then
               in_scope=true
             fi
@@ -559,6 +578,13 @@ jobs:
         id: in_scope
         env:
           SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
+          # shikoonet is a PRIVATE repo, so an anonymous clone gets
+          # "could not read Username for 'https://github.com'" and exit 128 —
+          # which is what killed this job on 2026-09-08 after the address had
+          # already moved. SHIKOONET_PAT if provided, else ADMIN_PAT; both may
+          # be empty, and the check below says so in words.
+          SHIKOONET_PAT: ${{ secrets.SHIKOONET_PAT }}
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
         run: |
           set -e
           # Assign in_scope in the shell scope — NOT just stdout. The earlier
@@ -570,7 +596,28 @@ jobs:
           if [ -z "$SHIKOONET_REPO" ]; then
             echo "SHIKOONET_REPO is empty -> out of scope"
           else
-            git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
+            tok="${SHIKOONET_PAT:-$ADMIN_PAT}"
+            if [ -z "$tok" ]; then
+              echo "::error::Cannot read $SHIKOONET_REPO: no SHIKOONET_PAT or"
+              echo "::error::ADMIN_PAT is set, and the repo is private. The"
+              echo "::error::inventory gate cannot be evaluated, and skipping it"
+              echo "::error::would move DNS without confirming the commit exists."
+              exit 1
+            fi
+            # A credential helper that lives for this one command. A token
+            # inside the URL would land in .git/config, remotes and error
+            # messages — CLAUDE.md forbids exactly that.
+            tokf=$(mktemp); chmod 600 "$tokf"; printf '%s' "$tok" > "$tokf"
+            if ! git -c "credential.helper=!f() { echo username=x-access-token; echo password=$(cat $tokf); }; f" \
+                   clone --depth 1 --quiet "$SHIKOONET_REPO" /tmp/shikoonet; then
+              rm -f "$tokf"
+              echo "::error::clone of shikoonet failed. The token in use cannot"
+              echo "::error::read that repository — a fine-grained PAT scoped to"
+              echo "::error::change-ip alone will not. Grant it read access, or"
+              echo "::error::set SHIKOONET_PAT to one that has it."
+              exit 1
+            fi
+            rm -f "$tokf"
             if grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml; then
               in_scope=true
             else

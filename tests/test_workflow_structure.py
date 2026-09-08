@@ -274,6 +274,36 @@ class WorkflowStructureTests(unittest.TestCase):
             "these steps offer only the legacy CLOUDFLARE_API_TOKEN, which is "
             f"not defined on this repo: {offenders}. Add {A} and {B} beside it."))
 
+    def test_in_scope_clones_are_authenticated(self):
+        """shikoonet is private, so an anonymous clone is a guaranteed failure.
+
+        On 2026-09-08 a change-ip run swapped the address and then died in the
+        inventory gate with "could not read Username for 'https://github.com'",
+        exit 128 — a job that can only ever fail, placed after the mutation. A
+        clone of that repo must carry a credential, and the token must not be
+        in the URL: it would land in .git/config, remotes and error output.
+        """
+        offenders = []
+        for job_name, job in self.jobs.items():
+            for st in (job.get("steps") or []):
+                run = st.get("run") or ""
+                if "clone" not in run or "SHIKOONET_REPO" not in run:
+                    continue
+                env = {**(job.get("env") or {}), **(st.get("env") or {})}
+                blob = " ".join(f"{k}={v}" for k, v in env.items())
+                has_cred = "PAT" in blob
+                uses_helper = "credential.helper" in run
+                if not (has_cred and uses_helper):
+                    offenders.append(
+                        f"{job_name}/{st.get('name', st.get('id', '?'))}"
+                        f" (token={has_cred}, helper={uses_helper})")
+                # And never the other shape: a token spliced into the URL.
+                self.assertNotIn("https://x-access-token:", run,
+                                 msg=f"{job_name}: token in the clone URL")
+        self.assertEqual(offenders, [], msg=(
+            "these steps clone shikoonet without an authenticated credential "
+            f"helper: {offenders}"))
+
     def test_dns_scan_is_read_only(self):
         """dns_scan carries two Cloudflare tokens. It must never mutate.
 
