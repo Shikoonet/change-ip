@@ -41,6 +41,24 @@
 `SERVER_ID` باید دقیقاً با `server.id` در کانفیگ برابر باشد. «هرچه کانفیگ شده را بچرخان»
 هیچ املایی ندارد. `make ip-rotate-plan` شماره را چاپ می‌کند.
 
+## آدرس روی فرم است، نه در کانفیگ (از ۲۰۲۶-۰۹-۰۸)
+
+`server.expected_ipv4` برای hcloud **اختیاری** است و در `ROTATION_CONFIG` نیست. آدرس هر بار
+روی فرم dispatch تایپ می‌شود و `rotate.py --expect-ipv4` آن را در برابر یک **خواندن زنده**
+assert می‌کند.
+
+چرا: آدرس تنها فیلدی است که یک چرخش عوضش می‌کند. پین‌کردنش در secret یعنی بعد از هر اجرای
+موفق یک انسان باید secret را روی دو environment ویرایش کند وگرنه dispatch بعدی رد می‌شود.
+این دقیقاً یک بار اتفاق افتاد و یک اجرای گیج‌کننده هزینه داشت.
+
+مقایسه با خواندن زنده **قوی‌تر** از مقایسه با کانفیگ است: قبلاً فقط ثابت می‌شد دو کپی از یک
+حدس با هم می‌خوانند؛ حالا حدس با واقعیت سنجیده می‌شود، پس هم typo را می‌گیرد هم سروری که
+بیرون از این ابزار جابه‌جا شده. اگر هیچ آدرسی هم تایپ نشود، `id` و `name` و `location` و
+`project_fingerprint` همچنان باید بخوانند و چک‌پوینت آدرس واقعی را ثبت می‌کند.
+
+⚠ برای **dataforest** همچنان اجباری است، چون آنجا load-bearing است: یک Seed چند آدرس همزمان
+دارد و این تعیین می‌کند کدام `OLD_IP` است. نامتقارنی عمدی است.
+
 ## نقشه
 
 | فایل | نقش |
@@ -70,6 +88,16 @@ make ip-rotate-resume  TXID=<t> SERVER_ID=<id>
 make ip-rotate-rollback TXID=<t> SERVER_ID=<id>
 make ip-rotate-status  TXID=<t>
 ```
+
+عملیات‌های `workflow_dispatch` در `run.yml`: `plan`، `change-ip`، `provider-only`،
+`dns-scan`، `rollback`، `finalize`.
+
+`dns-scan` فقط‌خواندنی است و به سؤالی جواب می‌دهد که هیچ ابزاری نداشت: **چه چیزی هنوز به
+این آدرس اشاره می‌کند؟** هر zone را برای رکوردهای A با آن محتوا می‌گردد (هر حساب Cloudflare
+جدا، با توکن خودش)، فهرست را چاپ و به‌عنوان artifact ذخیره می‌کند. قبل از آزادکردن یک
+Primary IP لازم است — هتزنر آدرس رهاشده را می‌تواند به مشتری دیگری بدهد و آن‌وقت دامنه‌ی تو
+به سرور یک غریبه اشاره می‌کند. هیچ PATCHی نمی‌زند؛ `discover` فقط GET است و
+`test_dns_scan_is_read_only` وجود `apply`/`rollback` را در آن جاب رد می‌کند.
 
 `HCLOUD_TOKEN` باید export شده باشد. **هرگز به‌عنوان آرگومان پاس نمی‌شود.**
 
@@ -204,25 +232,31 @@ operator ادامه می‌دهد با خواندن checkpoint و پاک‌کر�
 | نام | scope | استفاده |
 |---|---|---|
 | `HCLOUD_TOKEN` | env `hetzner-plan`، `hetzner-production` | فراخوانی hcloud در plan / swap / dns / verify / rollback |
-| `ROTATION_CONFIG` | env `hetzner-plan`، `hetzner-production` | محتوای `rotation.yml` (paste **بدون** `---` ابتدایی؛ Actions هر خط را مستقل ماسک می‌کند — اما masking best-effort است، نه مر امنت;ی;.ی: structured data یا JSON یا XML YAML is not safe; keep the raw و transformed value out of logs and step summary) |
+| `ROTATION_CONFIG` | env `hetzner-plan`، `hetzner-production` | محتوای `rotation.yml` (paste **بدون** `---` ابتدایی). **بدون `server.expected_ipv4`** — آدرس روی فرم dispatch می‌آید، پس این secret بعد از چرخش بیات نمی‌شود و دیگر هرگز لازم نیست دستی عوضش کنی. Actions هر خط را مستقل ماسک می‌کند و masking یک مرز نیست: مقدار خام و تبدیل‌شده را از لاگ و step summary دور نگه دار |
 | `SHIKOONET_REPO` | repo | URL without credential in the URL itself; clone in job `dns` uses a temporary git credential helper that injects the token only for the one `git clone` call and is removed immediately after — never write the URL with token to `.git/config` and never leave the helper configured past the clone |
 | `SSH_PRIVATE_KEY` | repo | فقط استپ `Resume the rotation in shikoonet` (جاب `dns`) |
 | `ANSIBLE_VAULT_PASSWORD` | repo | vault شیکونِت، همان استپ |
 | `CLOUDFLARE_API_TOKEN` | env `hetzner-production` (یا هر محیط دیگری که جاب dns نیاز دارد) | فقط استپ‌هایی که playbook Cloudflare را اجرا می‌کنند؛ گیت مثبت `==` مانع نشت توکن به provider-only می‌شود. **environment secret**, نه repo secret — یک repo secret readable توسط هر workflow در هر برنCH است. |
 
 environmentها:
-- `hetzner-plan` — جاب‌های `plan` و `verify` (فقط‌خواندنی)
-- `hetzner-production` — جاب‌های `swap`، `dns`، `rollback` با required reviewer
+- `hetzner-plan` — جاب‌های `plan` و `verify` (فقط‌خواندنی). **بدون reviewer**
+- `hetzner-production` — جاب‌های `swap`، `dns`، `rollback`. **با required reviewer از ۲۰۲۶-۰۹-۰۸**
+- `cloudflare-production` — جاب `dns_scan` و مراحل DNS دیتافارست. **هنوز بدون reviewer**
+- `dataforest-production` — مراحل provider دیتافارست. **هنوز بدون reviewer**
+
+⚠ تا ۲۰۲۶-۰۹-۰۸ هیچ environmentی reviewer نداشت، در حالی که همین فایل آن را «دکمه‌ی
+توقف» می‌نامید. protection را از API بخوان نه از این متن:
+`gh api repos/Shikoonet/change-ip/environments/<env> --jq '.protection_rules'`
 
 ```bash
-# وضعیت فعلی (live audit 2026-09-07):
+# وضعیت فعلی (live audit 2026-09-08):
 gh secret list --repo Shikoonet/change-ip            # 0 سکرت repo-level — همه environment-scoped هستند
 gh secret list --env dataforest-production --repo Shikoonet/change-ip   # DATAFOREST_API_TOKEN
 gh secret list --env cloudflare-production --repo Shikoonet/change-ip  # CLOUDFLARE_API_TOKEN_ACCOUNT_A, _B
 gh secret list --env hetzner-plan --repo Shikoonet/change-ip          # HCLOUD_TOKEN, ROTATION_CONFIG
 gh secret list --env hetzner-production --repo Shikoonet/change-ip     # HCLOUD_TOKEN, ROTATION_CONFIG
-gh api repos/Shikoonet/change-ip/environments                       # 4 environment با reviewer
-# هفت سکرت زیر **هنوز تعریف نشده‌اند** و باید قبل از اولین `Run workflow → change-ip` اضافه شوند:
+gh api repos/Shikoonet/change-ip/environments   # 4 environment؛ فقط hetzner-production reviewer دارد
+# چهار سکرت زیر **هنوز تعریف نشده‌اند** و باید قبل از اولین `Run workflow → change-ip` اضافه شوند:
 #   CLOUDFLARE_API_TOKEN          (legacy single-account, on hetzner-production)
 #   SHIKOONET_REPO                (on cloudflare-production + hetzner-production)
 #   SSH_PRIVATE_KEY               (on cloudflare-production + hetzner-production)
@@ -234,7 +268,7 @@ gh api repos/Shikoonet/change-ip/environments                       # 4 environm
 `HCLOUD_TOKEN` و `ROTATION_CONFIG` روی **environment** باشند نه روی repo — یک سکرت
 repo-wide برای هر جابی روی هر برنچی قابل‌خواندن است. ماسک یک مرز نیست.
 
-> **هشدار**: هفت سکرت بالا در حال حاضر missing هستند. CI آفلاین (push+PR) آن‌ها را لازم
+> **هشدار**: چهار سکرت بالا در حال حاضر missing هستند. CI آفلاین (push+PR) آن‌ها را لازم
 > ندارد (مسیر dispatch اجرا نمی‌شود)، پس pipeline سبز می‌ماند؛ ولی **اولین** `Run workflow
 > → change-ip` بدون `git clone` موفق یا `ssh` کار، شکست می‌خورد. قبل از اولین
 > dispatch انسانی، `bash scripts/setup-secrets.sh` را اجرا کنید.
