@@ -214,7 +214,12 @@ set_secret() {
     # The source could not produce a value, but a good one is already
     # installed. Nothing broke; say so instead of raising an alarm that
     # sends someone looking for damage there isn't any of.
-    say "[keep]  $name on $env  (already set; source unavailable: $*)"
+    # "Already set" means the NAME exists. GitHub never returns a secret's
+    # value, so a blank one is indistinguishable from a good one from here.
+    # That is exactly how four Cloudflare tokens sat empty behind [keep] rows
+    # on 2026-09-08 until a job reported an empty token. Say the limit out
+    # loud rather than let [keep] read as "verified".
+    say "[keep]  $name on $env  (name exists; value NOT verifiable from here; source unavailable: $*)"
     ok=$((ok+1))
   else
     say "[FAIL]  $name on $env  (source: $*)"; problems=$((problems+1))
