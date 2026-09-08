@@ -60,15 +60,42 @@ jobs:
           ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
         run: |
           if [ -z "$ADMIN_PAT" ]; then
-            echo "ADMIN_PAT is not set on this environment."
-            echo
-            echo "GITHUB_TOKEN cannot write Actions secrets — the scope does not"
-            echo "exist for it — so this workflow needs a PAT with 'repo' scope."
-            echo "Add it once at:"
-            echo "  Settings -> Environments -> hetzner-production -> Add secret"
-            echo "  name: ADMIN_PAT"
-            echo
-            echo "That is the only manual step, and it is a web form."
+            cat <<'MSG'
+          ADMIN_PAT is not set on this environment.
+
+          GITHUB_TOKEN cannot write Actions secrets. The scope does not exist
+          for it and cannot be granted — deliberately, because a workflow that
+          could write secrets would let anyone able to merge code overwrite
+          every credential in the repo. So one token has to come from outside.
+          This is that token, and it is the only manual step left.
+
+          MAKE IT (fine-grained, so it reaches this repo and nothing else):
+
+            1. github.com/settings/personal-access-tokens/new
+            2. Token name:        change-ip-bootstrap
+               Resource owner:    Shikoonet
+               Expiration:        90 days
+               Repository access: Only select repositories
+                                  -> Shikoonet/change-ip
+               Permissions -> Repository permissions:
+                 Secrets       -> Read and write
+                 Environments  -> Read and write
+               (leave everything else alone)
+            3. Generate token, copy it — it is shown once.
+
+          INSTALL IT:
+
+            github.com/Shikoonet/change-ip/settings/environments
+              -> hetzner-production -> Add environment secret
+                 Name:  ADMIN_PAT
+                 Value: the token
+
+          If Shikoonet is an organisation, a fine-grained token may need org
+          approval. A classic token from github.com/settings/tokens/new with
+          the `repo` scope also works, at the cost of much wider access.
+
+          Then dispatch this workflow again with mode: report.
+          MSG
             exit 1
           fi
           echo "ADMIN_PAT present."
