@@ -131,6 +131,16 @@ def _stage_env( *, bindir: Path, paths: Dict[str, str],
     env["LANG"] = "C.UTF-8"
     env["DATAFOREST_API_TEST_MODE"] = "1"
     env["ROTATION_TEST_MODE"] = "1"
+    # The Cloudflare adapter accepts a loopback cf_api_base ONLY when BOTH
+    # markers are set (see test_cf_api_base_contract). This harness set the
+    # first and not the second, and passed anyway for as long as the whole
+    # suite ran in one process: test_cloudflare_playbook.setUp writes
+    # CF_PLAYBOOK_TEST_MODE=1 into os.environ and never restores it, and
+    # every later subprocess inherited it. Run this module alone, or in a CI
+    # shard without that module first, and every cf-preflight stage was
+    # refused as "production mode" pointing at 127.0.0.1 — the guard doing
+    # its job against a test that borrowed another test's environment.
+    env["CF_PLAYBOOK_TEST_MODE"] = "1"
     env["ANSIBLE_PLAYBOOK_BIN"] = str(FAKE_AP)
     env["ROTATION_FAKE_STATE"] = cf_state
     env["ROTATION_FAKE_CALLS_LOG"] = calls_log
