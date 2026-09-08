@@ -54,13 +54,35 @@ runs:
         EXPECT_IPV4: ${{ inputs.expect_ipv4 }}
       run: |
         python3 - <<'EOF'
-        import os, sys, yaml
+        import os, socket, sys, yaml
         cfg = yaml.safe_load(open("rotation.yml"))["server"]
         for field, typed in (("expected_ipv4", os.environ["EXPECT_IPV4"]),):
             if typed and typed.strip() != str(cfg[field]):
-                sys.exit(f"REFUSING: you typed {field}={typed.strip()!r}, but the "
+                typed = typed.strip()
+                # "Wrong server, or the config is stale" leaves a human holding
+                # an `or`. The two cases look nothing alike from outside and we
+                # can tell them apart cheaply: after a rotation the OLD address
+                # is detached and answers nothing, while the address the
+                # operator typed is the live one. That is not proof — a
+                # firewall looks the same — so it is phrased as a lead, never
+                # as a verdict.
+                def reachable(ip):
+                    try:
+                        with socket.create_connection((ip, 22), timeout=4):
+                            return True
+                    except OSError:
+                        return False
+                hint = ""
+                if reachable(typed) and not reachable(str(cfg[field])):
+                    hint = (f"\n\nLIKELY STALE CONFIG, not the wrong server: "
+                            f"{typed} answers on :22 and {cfg[field]} does not, "
+                            f"which is what a completed rotation looks like from "
+                            f"here. If that is right, set server.expected_ipv4 to "
+                            f"{typed} in ROTATION_CONFIG on both hetzner-plan and "
+                            f"hetzner-production and dispatch again.")
+                sys.exit(f"REFUSING: you typed {field}={typed!r}, but the "
                          f"config says {cfg[field]!r}. Wrong server, or the config "
-                         f"is stale — neither is safe to rotate.")
+                         f"is stale — neither is safe to rotate.{hint}")
         print(f"target agrees: {cfg['expected_name']} on {cfg['expected_ipv4']} "
               f"in {cfg['expected_location']} (id {cfg['id']})")
         EOF

@@ -37,12 +37,18 @@
 
   vars:
     _proj: "{{ playbook_dir | dirname }}"
+    # Only playbooks that are COMMITTED. `node-onboard.yml` and
+    # `monitoring-doctor.yml` were listed here while still untracked: they
+    # exist on the author's disk and not in the repo, so this passed locally
+    # and failed in CI with "the playbook could not be found" on every
+    # docs-only push — the tier where ci-fast is the whole gate. The Makefile
+    # already keeps that Milestone-A workstream out of the Cloudflare lint
+    # gate for the same reason. Add them back in the commit that adds the
+    # files, not before.
     _steps:
       - "{{ _proj }}/hcloud_step.yml"
       - "{{ _proj }}/cloudflare_replace_ip_step.yml"
       - "{{ _proj }}/dataforest_step.yml"
-      - "{{ _proj }}/node-onboard.yml"
-      - "{{ _proj }}/monitoring-doctor.yml"
 
   tasks:
 
@@ -54,6 +60,30 @@
       changed_when: false
       register: _workflow_structure
       failed_when: _workflow_structure.rc != 0
+
+    # A listed-but-absent playbook must say so in those words. The bare
+    # syntax-check reports "the playbook could not be found", which reads
+    # like a broken checkout rather than a file somebody forgot to commit.
+    - name: "structural | every listed step playbook is actually present"
+      ansible.builtin.stat:
+        path: "{{ step }}"
+      loop: "{{ _steps }}"
+      loop_control:
+        loop_var: step
+        label: "{{ step | basename }}"
+      register: _step_stats
+
+    - name: "structural | refuse a step playbook that is referenced but not committed"
+      ansible.builtin.assert:
+        that:
+          - (_step_stats.results | rejectattr('stat.exists') | list | length) == 0
+        fail_msg: >-
+          _steps names playbooks that are not on disk:
+          {{ _step_stats.results | rejectattr('stat.exists')
+             | map(attribute='step') | map('basename') | join(', ') }}.
+          On a fresh checkout that means they were referenced here but never
+          committed. Commit them, or drop them from _steps until they land.
+        quiet: true
 
     # ---- 2. every step playbook must pass ansible syntax-check ---------
     - name: "structural | ansible syntax check for every step playbook"

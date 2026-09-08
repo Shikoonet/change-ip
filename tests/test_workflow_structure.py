@@ -262,6 +262,76 @@ class WorkflowStructureTests(unittest.TestCase):
         # job, so nothing else in the job inherits them.
         self.assertNotIn("CLOUDFLARE", " ".join(job.get("env", {}) or {}))
 
+    def _setup_guard_src(self):
+        """The typed-address guard, lifted out of the composite action."""
+        import re as _re
+        import yaml as _yaml
+        act = _yaml.safe_load(
+            (Path(__file__).resolve().parents[1]
+             / ".github" / "actions" / "setup" / "action.yml").read_text())
+        step = [st for st in act["runs"]["steps"]
+                if "EXPECT_IPV4" in str(st.get("env", ""))][0]
+        return _re.search(r"python3 - <<'EOF'\n(.*?)\nEOF", step["run"], _re.S).group(1)
+
+    def _run_guard(self, typed, config_ip, reachable):
+        """Execute the guard with a stubbed network. Returns (exit_code, text)."""
+        import io, os, tempfile, contextlib
+        from unittest import mock
+        src = self._setup_guard_src()
+
+        def fake_conn(addr, timeout=None):
+            if addr[0] in reachable:
+                return contextlib.nullcontext(None).__enter__() or mock.MagicMock()
+            raise OSError("unreachable")
+
+        cfg = {"server": {"id": 1, "expected_name": "n",
+                          "expected_ipv4": config_ip, "expected_location": "fsn1"}}
+        with tempfile.TemporaryDirectory() as td:
+            import yaml as _yaml
+            with open(os.path.join(td, "rotation.yml"), "w") as fh:
+                _yaml.safe_dump(cfg, fh)
+            cwd = os.getcwd()
+            buf = io.StringIO()
+            try:
+                os.chdir(td)
+                with mock.patch.dict(os.environ, {"EXPECT_IPV4": typed}), \
+                     mock.patch("socket.create_connection", side_effect=fake_conn), \
+                     contextlib.redirect_stdout(buf):
+                    try:
+                        exec(compile(src, "guard", "exec"), {"__name__": "__main__"})
+                        return 0, buf.getvalue()
+                    except SystemExit as e:
+                        return 1, str(e.code)
+            finally:
+                os.chdir(cwd)
+
+    def test_typed_address_guard_tells_stale_config_from_wrong_server(self):
+        """"Wrong server, or the config is stale" leaves a human holding an `or`.
+
+        After a rotation the config always disagrees with reality, and the
+        operator meets a refusal that reads like they typed the wrong box.
+        The guard can tell the cases apart — the rotated-off address answers
+        nothing — and must say so, without ever claiming it when both
+        addresses are live.
+        """
+        NEW, OLD, OTHER = "138.199.229.27", "188.245.127.27", "89.167.41.234"
+
+        # stale config: they typed the live new address, config pins the dead old one
+        rc, msg = self._run_guard(NEW, OLD, reachable={NEW})
+        self.assertEqual(rc, 1)
+        self.assertIn("LIKELY STALE CONFIG", msg)
+        self.assertIn(NEW, msg)
+
+        # genuinely wrong server: both answer, so the hint must stay silent
+        rc, msg = self._run_guard(OTHER, NEW, reachable={OTHER, NEW})
+        self.assertEqual(rc, 1)
+        self.assertNotIn("LIKELY STALE CONFIG", msg)
+
+        # agreement passes, and says what it agreed on
+        rc, msg = self._run_guard(NEW, NEW, reachable={NEW})
+        self.assertEqual(rc, 0)
+        self.assertIn("target agrees", msg)
+
     # -- 6. No falsy-ternary token trick ------------------------------------
     def test_no_falsy_ternary_token_trick(self):
         """The empty-string ternary (`cond && '1' || ''`) is forbidden

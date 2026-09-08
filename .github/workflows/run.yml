@@ -258,6 +258,30 @@ jobs:
             echo "new_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['new_ip']['ip'])")"
             echo "alias=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['ansible']['host_alias'])")"
           } >> "$GITHUB_OUTPUT"
+      # The address just changed, so ROTATION_CONFIG now disagrees with the
+      # world. Nothing rewrites it: a secret cannot be written from inside the
+      # run, and silently editing the operator's stated intent is the wrong
+      # instinct anyway. What WAS wrong was leaving them to rediscover it on
+      # the next dispatch, from a refusal that says "wrong server, or the
+      # config is stale" without saying which. Say it here, while it is
+      # obvious and the number is on screen.
+      - name: ROTATION_CONFIG is now stale - say so
+        if: always() && steps.run.outputs.new_ip != ''
+        env:
+          NEW_IP: ${{ steps.run.outputs.new_ip }}
+        run: |
+          {
+            echo "### Update ROTATION_CONFIG before the next dispatch"
+            echo
+            echo "This box is now on \`$NEW_IP\`. The secret still pins the"
+            echo "address it was on before this run, so the next dispatch is"
+            echo "refused by the typed-address check - correctly, but for a"
+            echo "reason easy to misread as \"wrong server\"."
+            echo
+            echo "Set \`server.expected_ipv4\` to \`$NEW_IP\` in ROTATION_CONFIG"
+            echo "on BOTH \`hetzner-plan\` and \`hetzner-production\`, then"
+            echo "dispatch again."
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state, path: state/, retention-days: 3}
@@ -663,10 +687,15 @@ jobs:
           }))
           PY
           ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-b.json
+      # stdout, NOT $GITHUB_STEP_SUMMARY. tests/contract.yml bans every summary
+      # write in this workflow so that no future step can echo a token onto a
+      # surface anyone with read access can see. The ban is a bright line and
+      # bright lines only work without exceptions — including this one, whose
+      # content is merely DNS names.
       - name: What points at it
         if: always()
         run: |
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
           import json, os
           ip = os.environ["SEARCH_IP"]
           rows = []
