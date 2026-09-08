@@ -241,6 +241,39 @@ class WorkflowStructureTests(unittest.TestCase):
                     "would leak into the provider path",
             )
 
+    def test_every_cloudflare_capable_step_offers_all_three_token_names(self):
+        """A step that runs the Cloudflare half must carry every name it might read.
+
+        Which variable is read is decided by the CONFIG, not the workflow:
+        `cloudflare.accounts` names a `token_env` per account and the adapter
+        copies that one into the subprocess; a legacy single-account config
+        uses CLOUDFLARE_API_TOKEN. Until 2026-09-08 the hcloud dns job and both
+        rollback DNS steps referenced only the legacy name — which is not
+        defined on this repo at all. The first live change-ip would have
+        swapped the address and then died on an empty token, with the box
+        moved and DNS left behind. Unset names expand to empty and are never
+        selected, so offering all three costs nothing and removes the trap.
+        """
+        LEGACY = "secrets.CLOUDFLARE_API_TOKEN }}"
+        A = "CLOUDFLARE_API_TOKEN_ACCOUNT_A"
+        B = "CLOUDFLARE_API_TOKEN_ACCOUNT_B"
+        offenders = []
+        for job_name, job in self.jobs.items():
+            # A step inherits the job's env, so both levels count. Looking at
+            # the step alone flagged swap_dataforest_dns, which carries both
+            # account tokens on the JOB and only adds the legacy name per-step.
+            job_env = job.get("env") or {}
+            for st in (job.get("steps") or []):
+                env = {**job_env, **(st.get("env") or {})}
+                blob = "\n".join(f"{k}: {v}" for k, v in env.items())
+                if LEGACY not in blob:
+                    continue
+                if A not in blob or B not in blob:
+                    offenders.append(f"{job_name}/{st.get('name', '?')}")
+        self.assertEqual(offenders, [], msg=(
+            "these steps offer only the legacy CLOUDFLARE_API_TOKEN, which is "
+            f"not defined on this repo: {offenders}. Add {A} and {B} beside it."))
+
     def test_dns_scan_is_read_only(self):
         """dns_scan carries two Cloudflare tokens. It must never mutate.
 

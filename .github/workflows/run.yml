@@ -584,7 +584,7 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
-          # The Cloudflare token lives ONLY on this step. It is present
+          # The Cloudflare tokens live ONLY on this step. They are present
           # in the env only when:
           #   1. inputs.operation == 'change-ip' (the job-level `if:`
           #      gates off provider-only entirely)
@@ -592,7 +592,18 @@ jobs:
           #      (the step-level `if:` gates off throwaway test servers)
           # Both gates are positive (`==`) so a broken token never
           # reaches the env via a falsy short-circuit.
+          #
+          # ALL THREE NAMES, because the config decides which one is read.
+          # `cloudflare.accounts` names a `token_env` per account and the
+          # adapter copies THAT variable into the subprocess; a legacy
+          # single-account config uses CLOUDFLARE_API_TOKEN. Referencing only
+          # the legacy name — as this did until 2026-09-08 — meant the first
+          # live change-ip would swap the address and then die on an empty
+          # token, leaving the box moved and DNS behind. Unset names expand
+          # to empty and are simply never selected.
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_ed25519
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
@@ -1025,10 +1036,16 @@ jobs:
       # the previous step set needs_dns_rollback=false, this step is
       # skipped, the token is never exported, and the env block is
       # never evaluated against `secrets.CLOUDFLARE_API_TOKEN`.
+      # All three names for the same reason as the dns job: the config
+      # chooses which is read. A rollback that could not reach Cloudflare
+      # would fail at the worst possible moment — the address is already
+      # back and DNS is the half still pointing at the wrong box.
       - name: Roll back the DNS records
         if: steps.need_dns.outputs.needs_dns_rollback == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
         run: |
           python3 rotate.py rollback --config rotation.yml \
             --txid "${{ steps.cp.outputs.txid }}" \
@@ -1122,6 +1139,8 @@ jobs:
         if: steps.need_dns.outputs.needs_dns_rollback == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
         run: |
           python3 .github/scripts/stage.py \
             --expect-rc 5 \
