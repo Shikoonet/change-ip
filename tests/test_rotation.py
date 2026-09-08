@@ -159,6 +159,45 @@ class TestIdentity(Base):
         rot = self.build()
         cp = rot.plan()
         self.assertEqual(cp["server"]["id"], self.fake.server["id"])
+
+    def test_typed_address_is_checked_against_the_live_read(self):
+        """The dispatch form's address is a claim, and reality is the judge.
+
+        Comparing it against the config's copy only ever proved the two
+        guesses agreed. Comparing it against a fresh read catches a typo AND
+        a box that moved outside this tool — and needs no stored address to
+        go stale.
+        """
+        fake = FakeHcloud(old_ip="203.0.113.77")
+        cfg = example_config(fake)
+        cfg["server"].pop("expected_ipv4", None)
+
+        rot = self.build(fake=fake, cfg=dict(cfg), expect_ipv4="203.0.113.77")
+        cp = rot.plan()
+        self.assertEqual(cp["server"]["expected_ipv4"], "203.0.113.77")
+
+        rot = self.build(fake=FakeHcloud(old_ip="203.0.113.77"),
+                         cfg=dict(cfg), expect_ipv4="198.51.100.1")
+        with self.assertRaises(IdentityMismatch) as ctx:
+            rot.plan()
+        self.assertIn("198.51.100.1", str(ctx.exception))
+
+    def test_no_stated_address_still_pins_identity_and_records_the_truth(self):
+        """With nothing stated, id/name/location/fingerprint still have to agree.
+
+        And the checkpoint records what the box actually had, so resume and
+        rollback never depend on a human having kept a secret current.
+        """
+        fake = FakeHcloud(old_ip="203.0.113.99")
+        cfg = example_config(fake)
+        cfg["server"].pop("expected_ipv4", None)
+        cp = self.build(fake=fake, cfg=dict(cfg)).plan()
+        self.assertEqual(cp["server"]["expected_ipv4"], "203.0.113.99")
+
+        wrong = FakeHcloud(old_ip="203.0.113.99")
+        wrong.server["name"] = "somebody-elses-box"
+        with self.assertRaises(IdentityMismatch):
+            self.build(fake=wrong, cfg=dict(cfg)).plan()
         self.assertEqual(cp["old_ip"]["id"], DEFAULT_OLD_IP_ID)
         # the id, not the name, is what every call carries
         self.assertTrue(all(c["params"].get("server_id", self.fake.server["id"])
@@ -1018,13 +1057,41 @@ class TestRedaction(Base):
 # ---------------------------------------------------------------------------
 class TestConfig(Base):
     def test_every_required_key_is_named_in_the_error(self):
-        for missing in ("id", "expected_name", "expected_ipv4", "expected_location"):
+        for missing in ("id", "expected_name", "expected_location"):
             cfg = example_config(FakeHcloud())
             cfg["server"][missing] = None
             with self.subTest(missing=missing):
                 with self.assertRaises(rotate.ConfigError) as ctx:
                     rotate.validate_config(cfg)
                 self.assertIn(missing, str(ctx.exception))
+
+    def test_hcloud_config_needs_no_expected_ipv4(self):
+        """The one field a rotation changes must not live in the secret.
+
+        Pinning `expected_ipv4` there meant a human editing ROTATION_CONFIG
+        after every successful rotation before the next dispatch would be
+        accepted — the exact manual step this repo is trying to delete. The
+        address is stated per-run instead and checked against a live read;
+        identity is still pinned by id + name + location + fingerprint.
+        """
+        cfg = example_config(FakeHcloud())
+        cfg["server"].pop("expected_ipv4", None)
+        rotate.validate_config(cfg)  # must not raise
+
+    def test_dataforest_still_requires_expected_ipv4(self):
+        """On a Seed it is load-bearing: it names WHICH address is old_ip.
+
+        A Seed carries several addresses at once, so dropping this would make
+        the tool pick one. Optional on Hetzner, required here — the asymmetry
+        is the point, not an oversight.
+        """
+        cfg = example_config(FakeHcloud())
+        cfg["provider"] = "dataforest"
+        cfg["server"]["id"] = "11111111-2222-3333-4444-555555555555"
+        cfg["server"].pop("expected_ipv4", None)
+        with self.assertRaises(rotate.ConfigError) as ctx:
+            rotate.validate_config(cfg)
+        self.assertIn("expected_ipv4", str(ctx.exception))
 
     def test_retention_must_be_keep(self):
         cfg = example_config(FakeHcloud())

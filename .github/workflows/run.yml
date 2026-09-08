@@ -172,7 +172,12 @@ jobs:
         with:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
           expect_ipv4: "${{ inputs.server_ip }}"
-      - run: python3 rotate.py plan --config rotation.yml
+      # The typed address goes to the tool, which checks it against a fresh
+      # read of the server. Passing it here rather than pinning it in the
+      # secret is what stops ROTATION_CONFIG going stale after every rotation.
+      - run: |
+          python3 rotate.py plan --config rotation.yml \
+            --expect-ipv4 "${{ inputs.server_ip }}"
 
   plan_dataforest:
     name: 1 · plan (DataForest, read-only)
@@ -241,7 +246,8 @@ jobs:
         run: |
           set +e
           python3 rotate.py apply --config rotation.yml \
-            --confirm-server-id "${{ inputs.server_id }}" --until connectivity_ok
+            --confirm-server-id "${{ inputs.server_id }}" \
+            --expect-ipv4 "${{ inputs.server_ip }}" --until connectivity_ok
           rc=$?
           set -e
           # 6 = paused at --until, the expected end of this job. Green on
@@ -258,29 +264,21 @@ jobs:
             echo "new_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['new_ip']['ip'])")"
             echo "alias=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['ansible']['host_alias'])")"
           } >> "$GITHUB_OUTPUT"
-      # The address just changed, so ROTATION_CONFIG now disagrees with the
-      # world. Nothing rewrites it: a secret cannot be written from inside the
-      # run, and silently editing the operator's stated intent is the wrong
-      # instinct anyway. What WAS wrong was leaving them to rediscover it on
-      # the next dispatch, from a refusal that says "wrong server, or the
-      # config is stale" without saying which. Say it here, while it is
-      # obvious and the number is on screen.
-      - name: ROTATION_CONFIG is now stale - say so
+      # Nothing to update after this run. ROTATION_CONFIG carries only what
+      # cannot change under a rotation — id, name, location, project
+      # fingerprint — so it stays correct across any number of rotations. The
+      # address is stated per-run on the dispatch form and checked against a
+      # live read, which is why there is no "now edit the secret" step here
+      # any more. All the operator needs is the number for next time.
+      - name: The address for the next dispatch
         if: always() && steps.run.outputs.new_ip != ''
         env:
           NEW_IP: ${{ steps.run.outputs.new_ip }}
         run: |
           {
-            echo "### Update ROTATION_CONFIG before the next dispatch"
-            echo
-            echo "This box is now on \`$NEW_IP\`. The secret still pins the"
-            echo "address it was on before this run, so the next dispatch is"
-            echo "refused by the typed-address check - correctly, but for a"
-            echo "reason easy to misread as \"wrong server\"."
-            echo
-            echo "Set \`server.expected_ipv4\` to \`$NEW_IP\` in ROTATION_CONFIG"
-            echo "on BOTH \`hetzner-plan\` and \`hetzner-production\`, then"
-            echo "dispatch again."
+            echo "This box is now on $NEW_IP."
+            echo "Type that as 'server_ip' on the next dispatch. No secret,"
+            echo "config or environment needs editing — nothing went stale."
           }
       - uses: actions/upload-artifact@v4
         if: always()

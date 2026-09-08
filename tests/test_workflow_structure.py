@@ -274,7 +274,10 @@ class WorkflowStructureTests(unittest.TestCase):
         return _re.search(r"python3 - <<'EOF'\n(.*?)\nEOF", step["run"], _re.S).group(1)
 
     def _run_guard(self, typed, config_ip, reachable):
-        """Execute the guard with a stubbed network. Returns (exit_code, text)."""
+        """Execute the guard with a stubbed network. Returns (exit_code, text).
+
+        config_ip=None models the current config shape, which pins no address.
+        """
         import io, os, tempfile, contextlib
         from unittest import mock
         src = self._setup_guard_src()
@@ -285,7 +288,9 @@ class WorkflowStructureTests(unittest.TestCase):
             raise OSError("unreachable")
 
         cfg = {"server": {"id": 1, "expected_name": "n",
-                          "expected_ipv4": config_ip, "expected_location": "fsn1"}}
+                          "expected_location": "fsn1"}}
+        if config_ip is not None:
+            cfg["server"]["expected_ipv4"] = config_ip
         with tempfile.TemporaryDirectory() as td:
             import yaml as _yaml
             with open(os.path.join(td, "rotation.yml"), "w") as fh:
@@ -301,6 +306,12 @@ class WorkflowStructureTests(unittest.TestCase):
                         exec(compile(src, "guard", "exec"), {"__name__": "__main__"})
                         return 0, buf.getvalue()
                     except SystemExit as e:
+                        # sys.exit("message") is a failure with that message;
+                        # sys.exit(0) is a deliberate early success. Collapsing
+                        # both to 1 would have made "the guard stepped aside"
+                        # indistinguishable from "the guard refused".
+                        if isinstance(e.code, int):
+                            return e.code, buf.getvalue()
                         return 1, str(e.code)
             finally:
                 os.chdir(cwd)
@@ -331,6 +342,24 @@ class WorkflowStructureTests(unittest.TestCase):
         rc, msg = self._run_guard(NEW, NEW, reachable={NEW})
         self.assertEqual(rc, 0)
         self.assertIn("target agrees", msg)
+
+    def test_guard_steps_aside_when_the_config_pins_no_address(self):
+        """The shape that ended the manual step: no address in the secret.
+
+        There is nothing here to disagree with, so this guard must pass the
+        question along rather than invent an answer — rotate.py --expect-ipv4
+        checks the typed address against a live read, which is what actually
+        catches a wrong box. A guard that refused (or that silently accepted
+        while claiming to have checked) would be worse than no guard.
+        """
+        rc, msg = self._run_guard("138.199.229.27", None, reachable=set())
+        self.assertEqual(rc, 0)
+        self.assertIn("no expected_ipv4", msg)
+        # even a nonsense address: this step is not the judge any more
+        rc, msg = self._run_guard("1.2.3.4", None, reachable=set())
+        self.assertEqual(rc, 0)
+        self.assertNotIn("target agrees", msg,
+                         msg="must not claim it verified an address it never checked")
 
     # -- 6. No falsy-ternary token trick ------------------------------------
     def test_no_falsy_ternary_token_trick(self):

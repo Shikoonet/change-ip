@@ -530,7 +530,19 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
         )
 
     server = data.get("server") or {}
-    for key in ("id", "expected_name", "expected_ipv4", "expected_location"):
+    # `expected_ipv4` is required only where it is LOAD-BEARING. On a
+    # DataForest Seed it IS old_ip: the Seed carries several addresses at
+    # once and this names the one being replaced, so a wrong value picks the
+    # wrong address. On Hetzner it is a redundant snapshot — `plan` reads the
+    # Primary IP live, and identity is already pinned by id + name + location
+    # + project fingerprint. It was also the ONLY field that changed on every
+    # successful rotation, so a human had to edit the secret after each run
+    # before the next dispatch would be accepted. Optional here, and supplied
+    # per-run from the dispatch form via `--expect-ipv4`, it cannot go stale.
+    required = ("id", "expected_name", "expected_location")
+    if provider == "dataforest":
+        required = required + ("expected_ipv4",)
+    for key in required:
         if not server.get(key):
             raise ConfigError(
                 f"{path}: server.{key} is required. The numeric id is immutable and "
@@ -856,6 +868,7 @@ class Rotation:
         cloudflare_replace: Optional[Callable[..., Dict[str, Any]]] = None,
         guest_op: Optional[Callable[..., Dict[str, Any]]] = None,
         ssh_keyscan: Optional[Callable[..., Dict[str, Any]]] = None,
+        expect_ipv4: Optional[str] = None,
     ):
         # ROTATION_TEST_MODE=1 + ROTATION_PROBE=accept / refuse lets the
         # test harness short-circuit the real SSH probe. Production
@@ -873,6 +886,11 @@ class Rotation:
                     "rc": 0, "stdout_tail": "", "stderr_tail": "",
                     "result": {"ok": True}}
         self.cfg = config
+        # The address the operator states they mean, for THIS run. It beats
+        # the config's copy because it cannot be stale: the operator typed it
+        # while looking at the box. Either way it is only ever compared
+        # against a fresh live read — it is never a source of truth.
+        self.expect_ipv4 = (expect_ipv4 or "").strip() or None
         self.provider = provider
         self.provider_name = str(config.get("provider") or "hcloud")
         self.state_dir = state_dir
@@ -1095,7 +1113,13 @@ class Rotation:
             "server": {
                 "id": self.cfg["server"]["id"],
                 "expected_name": self.cfg["server"]["expected_name"],
-                "expected_ipv4": self.cfg["server"]["expected_ipv4"],
+                # `--expect-ipv4` wins over the config's copy, and when
+                # neither is given this is filled in below from the live
+                # read. The checkpoint always ends up recording the address
+                # the box ACTUALLY had, so resume and rollback never depend
+                # on whether a human kept the secret current.
+                "expected_ipv4": self.expect_ipv4
+                or self.cfg["server"].get("expected_ipv4"),
                 "expected_location": self.cfg["server"]["expected_location"],
             },
             "alias": alias,
@@ -1148,12 +1172,23 @@ class Rotation:
                 f"server {server.id} is in {server.location!r}, config expects "
                 f"{cp['server']['expected_location']!r}"
             )
-        if server.ipv4 != cp["server"]["expected_ipv4"]:
+        # An address expectation is checked when there is one, and there is
+        # one whenever the operator typed it on the dispatch form. What it is
+        # NOT is a source of truth: the comparison is always against this
+        # fresh read, so a typo is caught by reality rather than by a second
+        # copy of the same guess. With no expectation stated, id + name +
+        # location + project fingerprint still have to agree, and the address
+        # below is recorded rather than asserted.
+        want_ipv4 = cp["server"].get("expected_ipv4")
+        if want_ipv4 and server.ipv4 != want_ipv4:
             raise IdentityMismatch(
-                f"server {server.id} currently has {server.ipv4}, config expects "
-                f"{cp['server']['expected_ipv4']}. If the address already changed, "
-                "update the config rather than letting the tool assume."
+                f"server {server.id} currently has {server.ipv4}, but this run "
+                f"was told to expect {want_ipv4}. Either the wrong address was "
+                "typed on the dispatch form, or something moved this server "
+                "outside this tool. Nothing was contacted beyond this read."
             )
+        # Whatever it turned out to be, that is what the checkpoint carries.
+        cp["server"]["expected_ipv4"] = server.ipv4
         if server.ipv4_id is None:
             raise NonRetryableError(
                 f"server {server.id} has no Primary IPv4 id — nothing to rotate. "
@@ -4073,10 +4108,19 @@ def main(
 
     p_plan = sub.add_parser("plan", help="read everything, change nothing (default)")
     p_plan.add_argument("--config", required=True)
+    # The address the operator states this box is on right now. Compared
+    # against a fresh live read, never trusted as truth. Lives here rather
+    # than in the config because it is the one value that changes on every
+    # successful rotation — pinning it in a secret means editing that secret
+    # by hand after every run.
+    p_plan.add_argument("--expect-ipv4", default=None,
+                        help="assert the server is currently on this address")
 
     p_apply = sub.add_parser("apply", help="execute a rotation")
     p_apply.add_argument("--config", required=True)
     p_apply.add_argument("--confirm-server-id", default=None)
+    p_apply.add_argument("--expect-ipv4", default=None,
+                         help="assert the server is currently on this address")
     p_apply.add_argument("--until", choices=PAUSABLE, default=None,
                          help="stop cleanly at this state instead of running to done")
 
@@ -4312,6 +4356,9 @@ def _dispatch(
         repo_dir=_resolve_repo_dir(cfg, config_path),
         config_path=config_path,
         until=getattr(args, "until", None),
+        # resume/rollback/status do not take the flag: their expectation is
+        # already frozen in the checkpoint that plan wrote.
+        expect_ipv4=getattr(args, "expect_ipv4", None),
         # Every transition also lands in GitHub's job summary. Outside Actions
         # the hook writes nothing, so this costs a dict lookup on a terminal.
         **{"on_transition": github_summary, **(rotation_kwargs or {})},

@@ -45,17 +45,25 @@ runs:
         mkdir -p state
 
     - shell: bash
-      # The dispatch form asks for the server name and its current address so
-      # the operator states out loud which box they mean. Those answers are
-      # never a SOURCE — the secret config is, and a typed value that disagrees
-      # with it stops the run here, before plan has touched the API. Filling a
-      # form is not the same as knowing, and this is the difference.
+      # The dispatch form asks for the address so the operator states out loud
+      # which box they mean. Where that statement is CHECKED has moved: the
+      # config no longer has to carry `expected_ipv4`, because pinning it in a
+      # secret meant a human editing that secret after every successful
+      # rotation — the address is the one field a rotation changes. When the
+      # config omits it, the typed value goes to `rotate.py --expect-ipv4` and
+      # is asserted against a fresh live read, which is a stronger check than
+      # comparing two copies of the same guess. This step now only guards the
+      # legacy shape, where a config still pins an address.
       env:
         EXPECT_IPV4: ${{ inputs.expect_ipv4 }}
       run: |
         python3 - <<'EOF'
         import os, socket, sys, yaml
         cfg = yaml.safe_load(open("rotation.yml"))["server"]
+        if not cfg.get("expected_ipv4"):
+            print("config pins no expected_ipv4 (good: it cannot go stale). "
+                  "The typed address is asserted live by rotate.py instead.")
+            raise SystemExit(0)
         for field, typed in (("expected_ipv4", os.environ["EXPECT_IPV4"]),):
             if typed and typed.strip() != str(cfg[field]):
                 typed = typed.strip()
