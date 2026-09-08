@@ -114,6 +114,10 @@ jobs:
         env:
           # The PAT is what gh authenticates with. It is scoped to this step.
           GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          # Same value under its own name, so the script can mirror it onto the
+          # environments whose jobs reference it — the inventory gate clones a
+          # private repo with it and lives on a different environment.
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
           REPO: ${{ github.repository }}
           # Sources the script materialises into files on the runner. All are
           # already secrets here; none is echoed by the script.

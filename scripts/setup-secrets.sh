@@ -387,6 +387,18 @@ for env in hetzner-production cloudflare-production; do
   fi
 done
 
+head_ "the bootstrap credential itself"
+# ADMIN_PAT is what this script authenticates WITH, so on a runner it already
+# holds the value — and jobs on other environments reference it (the inventory
+# gate clones a private repo with it). Mirroring it is not circular: the copy
+# on hetzner-production is the one a human installed by hand, and this only
+# puts the same value where the other jobs can reach it.
+if [[ -n "${ADMIN_PAT:-}" ]]; then
+  set_secret ADMIN_PAT cloudflare-production emit_string "$ADMIN_PAT"
+else
+  say "[skip]  ADMIN_PAT is not in this process's env (a local run); nothing to mirror"
+fi
+
 head_ "coverage (what run.yml asks for, per environment)"
 # The lists above are written by hand and drifted: ROTATION_CONFIG was
 # installed on two environments while dns_scan, on a third, needed it and
@@ -396,16 +408,27 @@ head_ "coverage (what run.yml asks for, per environment)"
 # `environment` and every `secrets.X` it references (job env, step env, and
 # anywhere in a run: block), then checks each pair is actually installed.
 # A missing pair is a dispatch that will fail, found before dispatching.
-_pairs=$(python3 - <<'PY'
-import re, sys, yaml
+_pairs=$(CFG="$ROTATION_CONFIG_FILE" python3 - <<'PY'
+import os, re, sys, yaml
 try:
     wf = yaml.safe_load(open(".github/workflows/run.yml"))
 except OSError:
     sys.exit(0)
+# Only the provider this config actually uses. A job gated on the OTHER
+# provider can never run, so a secret it references is not a gap. Reporting it
+# anyway trains people to skim a list that is mostly noise, and a list nobody
+# reads is the same as no list.
+try:
+    provider = (yaml.safe_load(open(os.environ["CFG"])) or {}).get("provider")
+except (OSError, KeyError, ValueError):
+    provider = None
+other = "dataforest" if (provider or "hcloud") == "hcloud" else "hcloud"
 seen = set()
 for name, job in (wf.get("jobs") or {}).items():
     env_name = job.get("environment")
     if not isinstance(env_name, str):
+        continue
+    if f"provider == '{other}'" in str(job.get("if") or ""):
         continue
     blob = yaml.safe_dump(job)
     for secret in sorted(set(re.findall(r"secrets\.([A-Z0-9_]+)", blob))):
