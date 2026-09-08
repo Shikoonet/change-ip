@@ -1082,12 +1082,22 @@ class Rotation:
                 "old_ip.retention is 'keep' — this config never releases. Nothing was contacted."
             )
         address = str(address).strip()
-        matches = [ip for ip in self.with_retries("list_ips", self.provider.list_ips)
-                   if ip.ip == address]
+        seen = self.with_retries("list_ips", self.provider.list_ips)
+        matches = [ip for ip in seen if ip.ip == address]
         if len(matches) != 1:
+            # Say what IS there. "0 matches" alone leaves the operator unable to
+            # tell "already deleted" from "typo" from "wrong project"; the
+            # first live refusal was exactly that. Addresses are not secrets —
+            # every plan log prints them.
+            inventory = ", ".join(
+                f"{ip.ip}({'attached to ' + str(ip.assignee_id) if ip.assignee_id is not None else 'unassigned'})"
+                for ip in seen) or "none"
             raise IdentityMismatch(
                 f"{address} resolves to {len(matches)} Primary IP(s) in this project; "
-                "refusing unless it is exactly one"
+                f"refusing unless it is exactly one. IPv4 Primary IPs in the project "
+                f"(fingerprint {self.provider.fingerprint}): {inventory}. "
+                "0 usually means it was already deleted, or this token points at "
+                "a different project."
             )
         target = matches[0]
         if target.assignee_id is not None:

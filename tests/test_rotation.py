@@ -261,8 +261,15 @@ class TestReleaseOldIp(Base):
 
     def test_orphan_refuses_unknown_or_ambiguous_address(self):
         fake, rot = self._orphan_world()
-        with self.assertRaises(IdentityMismatch):
+        with self.assertRaises(IdentityMismatch) as ctx:
             rot.release_orphan_ip("203.0.113.1")            # nothing matches
+        # the refusal must show what the project DOES hold, so "0 matches" can
+        # be told apart from a typo or the wrong token — and must not include
+        # the IPv6 entry, which is out of scope
+        msg = str(ctx.exception)
+        self.assertIn("198.51.100.77(unassigned)", msg)
+        self.assertIn(f"{fake.server['ipv4_address']}(attached to {fake.server['id']})", msg)
+        self.assertNotIn("2001:db8", msg)
         fake.ips[779] = dict(fake.ips[777], id=779, name="dup")
         with self.assertRaises(IdentityMismatch):
             rot.release_orphan_ip("198.51.100.77")          # two ipv4 match
