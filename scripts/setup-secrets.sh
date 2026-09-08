@@ -168,9 +168,25 @@ set_secret() {
     fi
     return 0
   fi
-  if "$@" 2>/dev/null | gh secret set "$name" --env "$env" --repo "$REPO" >/dev/null 2>&1; then
+  # NEVER pipe the producer straight into `gh secret set`. Both sides of a
+  # pipe run at once: a producer that fails and writes nothing still lets gh
+  # read EOF and store an EMPTY secret, and `pipefail` then reports [FAIL]
+  # after the damage. That is not theory — it silently blanked HCLOUD_TOKEN on
+  # both Hetzner environments on 2026-09-08 and the next `plan` died with
+  # "HCLOUD_TOKEN is not set".
+  #
+  # Materialise first, check it is non-empty, and only then write. The value
+  # goes to a 0600 file inside a 0700 dir and is shredded immediately; it
+  # still never becomes a shell variable, so it cannot be echoed later.
+  local _vf; _vf="$(mktemp)"; chmod 600 "$_vf"
+  if "$@" >"$_vf" 2>/dev/null && [[ -s "$_vf" ]] \
+     && gh secret set "$name" --env "$env" --repo "$REPO" < "$_vf" >/dev/null 2>&1; then
+    rm -f "$_vf"
     say "[set]   $name on $env"; fixed=$((fixed+1))
-  elif secret_present "$name" "$env"; then
+    return 0
+  fi
+  rm -f "$_vf"
+  if secret_present "$name" "$env"; then
     # The source could not produce a value, but a good one is already
     # installed. Nothing broke; say so instead of raising an alarm that
     # sends someone looking for damage there isn't any of.
