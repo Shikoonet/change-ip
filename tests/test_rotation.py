@@ -233,6 +233,13 @@ class TestReleaseOldIp(Base):
         fake.ips[777] = {"id": 777, "name": "leftover", "ip": "198.51.100.77",
                          "type": "ipv4", "location": "nbg1", "assignee_id": None,
                          "assignee_type": None, "auto_delete": False}
+        # and the IPv6 /64 every Hetzner server carries. The first live
+        # by-address release died on this: the normaliser refused it and the
+        # whole listing failed before any guard ran.
+        fake.ips[778] = {"id": 778, "name": "primary_ip-778",
+                         "ip": "2001:db8:c013:4bf7::/64", "type": "ipv6",
+                         "location": "nbg1", "assignee_id": fake.server["id"],
+                         "assignee_type": "server", "auto_delete": True}
         cfg = example_config(fake)
         cfg["old_ip"] = {"retention": retention}
         return fake, self.build(fake=fake, cfg=cfg)
@@ -256,9 +263,9 @@ class TestReleaseOldIp(Base):
         fake, rot = self._orphan_world()
         with self.assertRaises(IdentityMismatch):
             rot.release_orphan_ip("203.0.113.1")            # nothing matches
-        fake.ips[778] = dict(fake.ips[777], id=778, name="dup")
+        fake.ips[779] = dict(fake.ips[777], id=779, name="dup")
         with self.assertRaises(IdentityMismatch):
-            rot.release_orphan_ip("198.51.100.77")          # two match
+            rot.release_orphan_ip("198.51.100.77")          # two ipv4 match
         self.assertIn(777, fake.ips)
 
     def test_orphan_refuses_under_keep(self):

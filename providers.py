@@ -390,9 +390,17 @@ class HcloudProvider:
         return self._ip(self._call("protect_ip", ip_id=int(ip_id)))
 
     def list_ips(self) -> List[PrimaryIP]:
-        """Every Primary IP in the project. Read-only."""
+        """Every IPv4 Primary IP in the project. Read-only.
+
+        Hetzner gives every server an IPv6 /64 Primary IP as well, and the
+        normaliser refuses anything that is not ipv4 — correctly, for a
+        rotation. Here that refusal would make the whole listing fail on any
+        real project, which is exactly what happened on the first live
+        by-address release. Non-IPv4 entries are skipped, not raised on.
+        """
         data = self._call("list_ips")
-        return [self._ip(raw) for raw in (data.get("ips") or [])]
+        return [self._ip(raw) for raw in (data.get("ips") or [])
+                if str(raw.get("type", "")).lower() == "ipv4"]
 
     def release_ip(self, ip_id: int, expect_ip: str) -> Dict[str, Any]:
         """Delete a Primary IP that is attached to nothing.
