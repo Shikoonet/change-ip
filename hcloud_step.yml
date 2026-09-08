@@ -24,7 +24,8 @@
 # address at all.
 #
 # -----------------------------------------------------------------------------
-# ⚠ FOUR THINGS ABOUT hetzner.hcloud 6.2.1 THAT ARE NOT IN ITS DOCUMENTATION
+# ⚠ FOUR THINGS ABOUT hetzner.hcloud THAT ARE NOT IN ITS DOCUMENTATION
+# (read at 6.2.1; CI pins >=7.0.0,<8.0.0 — see the `location` note at `allocate`)
 # Verified 2026-08-26 by reading the installed source at
 # /usr/lib/python3/dist-packages/ansible_collections/hetzner/hcloud/, not from
 # memory. Each one is a GREEN run that did the wrong thing.

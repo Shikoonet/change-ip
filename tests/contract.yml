@@ -597,6 +597,28 @@
           Ansible playbook that touches Cloudflare.
         quiet: true
 
+    # ---- 7b. the in_scope gate must assign, not just echo -------------------
+    # `echo "in_scope=true"` writes stdout, not a variable. A step that then
+    # writes `${in_scope:-false}` to $GITHUB_OUTPUT emits `false` on EVERY
+    # run, so the step gated on it is silently skipped forever. That shipped
+    # in the hcloud `dns` job: the provider half swapped the address and the
+    # DNS half never ran, and nothing went red. Assert the assignment form.
+    - name: "ip-rotation | run.yml in_scope gates assign in shell scope"
+      vars:
+        _run_nc: "{{ lookup('file', _proj ~ '/.github/workflows/run.yml')
+                     | regex_replace('(?m)#.*$', '') }}"
+        _emit: 'echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"'
+      ansible.builtin.assert:
+        that:
+          - "'${in_scope:-' not in _run_nc"
+          - "_run_nc.count('id: in_scope') == _run_nc.count(_emit)"
+        fail_msg: >-
+          Every `id: in_scope` step must assign `in_scope=true|false` as a
+          shell variable and write `{{ _emit }}`. Echoing `in_scope=true`
+          only prints it; `${in_scope:-false}` then expands to `false` and
+          the gated step never runs again.
+        quiet: true
+
     - name: "ip-rotation | run.yml never unconditionally injects CLOUDFLARE_API_TOKEN (lines)"
       ansible.builtin.set_fact:
         _run_yml_lines: "{{ lookup('file', _proj ~ '/.github/workflows/run.yml') | regex_replace('(?m)#.*$', '') | split('\n') }}"

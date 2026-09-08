@@ -232,12 +232,11 @@ jobs:
         with:
           rotation_config: "${{ secrets.ROTATION_CONFIG }}"
           expect_ipv4: "${{ inputs.server_ip }}"
+      # provider-only needs no flag here: this job already stops at
+      # `--until connectivity_ok`, and the `dns` job is gated off by
+      # `inputs.operation == 'change-ip'`. The old ROTATION_PROVIDER_ONLY env
+      # was read by nothing in rotate.py — a flag that looked like a control.
       - id: run
-        env:
-          # The provider-only flag is a literal '1' or '0' string, never
-          # an empty string — the previous `${{ cond && '1' || '' }}`
-          # pattern is forbidden by the same expression-falsy rule.
-          ROTATION_PROVIDER_ONLY: ${{ inputs.operation == 'provider-only' && '1' || '0' }}
         run: |
           set +e
           python3 rotate.py apply --config rotation.yml \
@@ -539,17 +538,24 @@ jobs:
           SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
         run: |
           set -e
+          # Assign in_scope in the shell scope — NOT just stdout. The earlier
+          # version only echoed `in_scope=true`, never assigned it, so
+          # `${in_scope:-false}` always expanded to `false` and the Cloudflare
+          # + inventory step below was skipped on EVERY Hetzner rotation. The
+          # DataForest job already carries this fix; this one did not.
+          in_scope=false
           if [ -z "$SHIKOONET_REPO" ]; then
-            echo "in_scope=false  (SHIKOONET_REPO is empty)"
+            echo "SHIKOONET_REPO is empty -> out of scope"
           else
             git clone --depth 1 "$SHIKOONET_REPO" /tmp/shikoonet
             if grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml; then
-              echo "in_scope=true"
+              in_scope=true
             else
-              echo "in_scope=false  ($NEW_IP is not in shikoonet inventory/hosts.yml)"
+              echo "$NEW_IP is not in shikoonet inventory/hosts.yml -> out of scope"
             fi
           fi
-          echo "in_scope=${in_scope:-false}" >> "$GITHUB_OUTPUT"
+          echo "in_scope=$in_scope"
+          echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"
       - name: Resume the rotation in shikoonet
         if: steps.in_scope.outputs.in_scope == 'true'
         env:
