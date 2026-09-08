@@ -122,8 +122,13 @@ ci-fast:
 # still exercising every behaviour.
 ci-provider:
 	@echo "ci-provider: complete offline unit + staged + real-playbook suite"
-	python3 -m unittest discover -s tests -t .
-	python3 rotate.py --self-test
+	# The unittest suite and `rotate.py --self-test` are NOT invoked here.
+	# tests/contract.yml runs both as its first two tasks, so calling them
+	# directly ran all 462 tests twice — about six minutes of a fifteen
+	# minute CI budget, which is what finally tipped the job over its
+	# timeout. One invocation, and it is the contract's. Same rule the
+	# ci-fast target already documents for tests/structural.yml.
+	#
 	# Invoke the contract playbook WITHOUT overriding
 	# `ANSIBLE_PLAYBOOK_BIN` — the contract only reads the
 	# playbooks as text and runs the Python suite, so the
