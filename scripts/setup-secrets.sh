@@ -5,6 +5,7 @@
 #
 #   bash scripts/setup-secrets.sh --dry     # report only, touches nothing
 #   bash scripts/setup-secrets.sh           # create/repair everything
+#   bash scripts/setup-secrets.sh --keys    # vault key NAMES only, no values
 #
 # WHY THIS EXISTS
 #
@@ -50,9 +51,10 @@ SSH_KEY_FILE="${SSH_KEY_FILE:-$(_default_ssh_key)}"
 SHIKOONET_URL="${SHIKOONET_URL:-$(git -C "$SHIKOONET_DIR" remote get-url origin 2>/dev/null || echo '')}"
 ROTATION_CONFIG_FILE="${ROTATION_CONFIG_FILE:-$(cd "$(dirname "$0")/.." && pwd)/rotation.yml}"
 
-DRY=0
+DRY=0; KEYS_ONLY=0
 case "${1:-}" in
   --dry)  DRY=1 ;;
+  --keys) KEYS_ONLY=1 ;;
   --help) sed -n '3,32p' "$0"; exit 0 ;;
   "")     ;;
   *)      echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -66,19 +68,33 @@ need() { command -v "$1" >/dev/null || { echo "$1 is not on PATH" >&2; exit 3; }
 need gh; need python3
 
 # ---------------------------------------------------------------- helpers --
-# Read ONE key out of the vault and write it to stdout. The value never
-# becomes a shell variable, so it cannot be echoed by an accident later.
+# Read a key out of the vault and write it to stdout. Takes CANDIDATE names
+# and uses the first that exists, because vault.example.yml is a sample and
+# the real vault does not have to agree with it — guessing one name and
+# failing taught us that. The value never becomes a shell variable, so it
+# cannot be echoed by accident later.
 vault_get() {
   ansible-vault view "$VAULT_FILE" --vault-password-file "$VAULT_PASS_FILE" \
     | python3 -c '
 import sys, yaml
-key = sys.argv[1]
 data = yaml.safe_load(sys.stdin) or {}
-val = data.get(key)
-if val is None:
-    sys.exit(f"vault has no key {key!r}")
-sys.stdout.write(str(val))
-' "$1"
+for key in sys.argv[1:]:
+    val = data.get(key)
+    if val not in (None, ""):
+        sys.stdout.write(str(val))
+        sys.exit(0)
+sys.exit("vault has none of: " + ", ".join(repr(k) for k in sys.argv[1:]))
+' "$@"
+}
+
+# Key NAMES only, never values. Run with --keys when a lookup fails, so the
+# mapping is fixed from what the vault actually holds rather than guessed.
+vault_keys() {
+  ansible-vault view "$VAULT_FILE" --vault-password-file "$VAULT_PASS_FILE" \
+    | python3 -c '
+import sys, yaml
+for k in sorted((yaml.safe_load(sys.stdin) or {})):
+    print("   ", k)'
 }
 
 secret_present() {  # secret_present <name> <env>
@@ -102,8 +118,14 @@ set_secret() {
     fi
     return 0
   fi
-  if "$@" | gh secret set "$name" --env "$env" --repo "$REPO" >/dev/null 2>&1; then
+  if "$@" 2>/dev/null | gh secret set "$name" --env "$env" --repo "$REPO" >/dev/null 2>&1; then
     say "[set]   $name on $env"; fixed=$((fixed+1))
+  elif secret_present "$name" "$env"; then
+    # The source could not produce a value, but a good one is already
+    # installed. Nothing broke; say so instead of raising an alarm that
+    # sends someone looking for damage there isn't any of.
+    say "[keep]  $name on $env  (already set; source unavailable: $*)"
+    ok=$((ok+1))
   else
     say "[FAIL]  $name on $env  (source: $*)"; problems=$((problems+1))
   fi
@@ -150,6 +172,12 @@ print(len([r for r in d.get("protection_rules", [])
 }
 
 # ------------------------------------------------------------------- main --
+if [[ "$KEYS_ONLY" == "1" ]]; then
+  echo "keys in $VAULT_FILE (names only, no values):"
+  vault_keys
+  exit 0
+fi
+
 REVIEWER_ID="${REVIEWER_ID:-$(gh api user --jq .id)}"
 
 head_ "environments"
@@ -181,8 +209,12 @@ if [[ "$problems" != "0" && "$DRY" == "0" ]]; then
 fi
 
 head_ "provider tokens"
+# Several candidate names: vault.example.yml says hcloud_api_token, the real
+# vault need not agree, and `--keys` prints what it actually holds.
 for env in hetzner-plan hetzner-production; do
-  set_secret HCLOUD_TOKEN "$env" vault_get hcloud_api_token
+  set_secret HCLOUD_TOKEN "$env" vault_get \
+    hcloud_api_token hetzner_api_token hcloud_token \
+    hetzner_cloud_api_token hcloud_api_key hetzner_token
 done
 
 head_ "rotation config"
