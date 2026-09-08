@@ -594,6 +594,8 @@
               {{ {'ok': true,
                   'operation': 'discover',
                   'invocation_id': invocation_id,
+                  'old_ip': old_ip,
+                  'zones_seen': (_zones | length),
                   'manifest': _manifest,
                   'manifest_digest': (_manifest | to_json)} | to_nice_json }}
             dest: "{{ result_file }}"

@@ -391,8 +391,9 @@ class WorkflowStructureTests(unittest.TestCase):
         dns_rel = [s for s in self.jobs["dns"]["steps"]
                    if "Release the old address" in s.get("name", "")]
         self.assertEqual(len(dns_rel), 1)
-        self.assertIn("steps.in_scope.outputs.in_scope == 'true'", dns_rel[0]["if"])
         self.assertIn("success()", dns_rel[0]["if"])
+        self.assertIn("steps.decide.outputs.dns_scope == 'none'", dns_rel[0]["if"])
+        self.assertIn("steps.in_scope.outputs.in_scope == 'true'", dns_rel[0]["if"])
         self.assertIn("--txid", dns_rel[0]["run"])
         for jn in callers:
             self.assertEqual(self.jobs[jn].get("environment"), "hetzner-production",
@@ -402,6 +403,40 @@ class WorkflowStructureTests(unittest.TestCase):
         body = " ".join(s.get("run", "") for s in rel["steps"])
         self.assertIn('"$retention" != "release"', body)
         self.assertIn("--ip", body)
+
+    def test_change_ip_dns_half_decides_from_scans_and_never_skips_records(self):
+        """One button for every box, with no silent skip.
+
+        The dns job scans both accounts for the OLD address first. Two empty
+        scans that each saw a zone -> declare DNS out of scope and finish.
+        Any records -> the inventory gate; not in inventory -> a red step,
+        not a skip. The steps that hold Cloudflare credentials write nothing
+        to $GITHUB_OUTPUT; the step that writes the decision holds none.
+        """
+        steps = {s.get("name"): s for s in self.jobs["dns"]["steps"] if s.get("name")}
+        for acct in ("A", "B"):
+            st = steps[f"Scan account {acct} for the old address"]
+            self.assertIn("CLOUDFLARE_API_TOKEN", st["env"])
+            self.assertNotIn("GITHUB_OUTPUT", st["run"])
+            self.assertIn("scan_only", st["run"])
+        dec = steps["Decide the DNS scope from the scans"]
+        self.assertEqual(dec.get("id"), "decide")
+        self.assertNotIn("CLOUDFLARE", " ".join(dec.get("env") or {}))
+        self.assertIn("GITHUB_OUTPUT", dec["run"])
+        for bad in ("token", "secret", "CLOUDFLARE"):
+            self.assertNotIn(bad, dec["run"], f"decide step must not mention {bad!r}")
+        # zero zones seen is a failure, not "none"
+        self.assertIn("saw 0 zones", dec["run"])
+        refuse = steps["Refuse — records exist but the inventory commit is missing"]
+        self.assertIn("dns_scope == 'records'", refuse["if"])
+        self.assertIn("in_scope != 'true'", refuse["if"])
+        self.assertIn("exit 1", refuse["run"])
+        declare = steps["Declare DNS out of scope and finish"]
+        self.assertIn("dns_scope == 'none'", declare["if"])
+        self.assertIn("declare-dns-out-of-scope", declare["run"])
+        self.assertIn("--scan /tmp/scan-a.json --scan /tmp/scan-b.json", declare["run"])
+        # the swap job exports old_ip for the scans
+        self.assertIn("old_ip", self.jobs["swap"]["outputs"])
 
     def test_every_test_module_is_in_exactly_one_ci_shard(self):
         """The CI matrix is the only list of what runs. It must be complete.

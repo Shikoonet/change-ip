@@ -226,6 +226,7 @@ jobs:
     outputs:
       txid: ${{ steps.run.outputs.txid }}
       new_ip: ${{ steps.run.outputs.new_ip }}
+      old_ip: ${{ steps.run.outputs.old_ip }}
       alias: ${{ steps.run.outputs.alias }}
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
@@ -263,6 +264,7 @@ jobs:
           {
             echo "txid=$TXID"
             echo "new_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['new_ip']['ip'])")"
+            echo "old_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['old_ip']['ip'])")"
             echo "alias=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['ansible']['host_alias'])")"
           } >> "$GITHUB_OUTPUT"
       # Nothing to update after this run. ROTATION_CONFIG carries only what
@@ -598,12 +600,100 @@ jobs:
       # inventory. An empty SHIKOONET_REPO or an absent inventory line is the
       # "right answer is skip, not fail" case: a throwaway test server is not
       # in shikoonet, and refusing to skip made every test run look red.
+      # ---- scan first, then decide ---------------------------------------
+      # change-ip used to assume every box has DNS to move, and gated the DNS
+      # half on the shikoonet inventory alone: a box not in the inventory was
+      # "out of scope" and skipped, then verify went red because the
+      # checkpoint never reached done. Now the DNS half decides from
+      # EVIDENCE:
+      #   * both accounts scanned, both empty, both saw >=1 zone
+      #       -> DNS out of scope: declared into the checkpoint, run finishes
+      #          at done, old address released. Nothing skipped silently — the
+      #          checkpoint carries which scans said so.
+      #   * any records on the old address
+      #       -> the inventory gate applies. Not in inventory = the commit is
+      #          missing = RED, never a skip. In inventory = full DNS path.
+      #   * any scan failed
+      #       -> red. No conclusion from no evidence.
+      # Scan account A for A records on the OLD address. Read-only;
+      # carries only this account's Cloudflare credential; writes no output
+      # file the gate reads and no $GITHUB_OUTPUT.
+      - name: Scan account A for the old address
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          OLD_IP: ${{ needs.swap.outputs.old_ip }}
+        run: |
+          set -e
+          python3 - <<'PYX' > /tmp/ev-a.json
+          import json, os
+          print(json.dumps({
+              "operation": "discover", "scan_only": True,
+              "invocation_id": "dns-gate-a-" + os.environ["GITHUB_RUN_ID"],
+              "result_file": "/tmp/scan-a.json",
+              "old_ip": os.environ["OLD_IP"], "new_ip": os.environ["OLD_IP"],
+              "allowed_records": "[]", "expected_count": 0, "manifest": "[]",
+          }))
+          PYX
+          ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-a.json
+      # Scan account B for A records on the OLD address. Read-only;
+      # carries only this account's Cloudflare credential; writes no output
+      # file the gate reads and no $GITHUB_OUTPUT.
+      - name: Scan account B for the old address
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+          OLD_IP: ${{ needs.swap.outputs.old_ip }}
+        run: |
+          set -e
+          python3 - <<'PYX' > /tmp/ev-b.json
+          import json, os
+          print(json.dumps({
+              "operation": "discover", "scan_only": True,
+              "invocation_id": "dns-gate-b-" + os.environ["GITHUB_RUN_ID"],
+              "result_file": "/tmp/scan-b.json",
+              "old_ip": os.environ["OLD_IP"], "new_ip": os.environ["OLD_IP"],
+              "allowed_records": "[]", "expected_count": 0, "manifest": "[]",
+          }))
+          PYX
+          ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-b.json
+      # No credentials in this step: it only reads the two result files and
+      # writes the decision. The contract forbids output-writing steps from
+      # holding credential-shaped text.
+      - name: Decide the DNS scope from the scans
+        id: decide
+        run: |
+          python3 - <<'PYX'
+          import json, os, sys
+          scope, notes = "none", []
+          for acct in ("a", "b"):
+              try:
+                  res = json.load(open(f"/tmp/scan-{acct}.json"))
+              except (OSError, ValueError):
+                  print(f"::error::account {acct.upper()}: no scan result — cannot decide")
+                  sys.exit(1)
+              if not res.get("ok"):
+                  print(f"::error::account {acct.upper()}: scan not ok — cannot decide")
+                  sys.exit(1)
+              n, z = len(res.get("manifest") or []), int(res.get("zones_seen") or 0)
+              notes.append(f"{acct.upper()}: {n} record(s), {z} zone(s) seen")
+              if n:
+                  scope = "records"
+              elif z < 1:
+                  print(f"::error::account {acct.upper()} saw 0 zones; that proves nothing")
+                  sys.exit(1)
+          print("; ".join(notes))
+          print(f"dns_scope={scope}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"dns_scope={scope}\n")
+          PYX
+
+      # ---- records exist: the inventory gate --------------------------------
       # TWO steps on purpose. The contract forbids a step that writes
       # $GITHUB_OUTPUT from also holding token-shaped data, so a step that
       # can leak a credential into an output cannot exist. The clone carries
       # the credentials and writes no output; the decision reads the checkout
       # and carries no credentials.
       - name: Fetch shikoonet (credentials live here, no outputs)
+        if: steps.decide.outputs.dns_scope == 'records'
         env:
           SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
           # shikoonet is a PRIVATE repo, so an anonymous clone gets
@@ -644,6 +734,7 @@ jobs:
           rm -f "$tokf"
       - name: Is this node in shikoonet's inventory?
         id: in_scope
+        if: steps.decide.outputs.dns_scope == 'records'
         env:
           NEW_IP: ${{ needs.swap.outputs.new_ip }}
         run: |
@@ -662,8 +753,20 @@ jobs:
           fi
           echo "in_scope=$in_scope"
           echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"
+      # Records point at the old address and the node is NOT in the inventory:
+      # the human commit is missing. This is the gate the whole CD design
+      # keeps on purpose. It fails; it does not skip.
+      - name: Refuse — records exist but the inventory commit is missing
+        if: steps.decide.outputs.dns_scope == 'records' && steps.in_scope.outputs.in_scope != 'true'
+        env:
+          NEW_IP: ${{ needs.swap.outputs.new_ip }}
+        run: |
+          echo "::error::DNS records point at the old address, but $NEW_IP is not in"
+          echo "::error::shikoonet's inventory/hosts.yml. Commit the inventory change,"
+          echo "::error::then dispatch 'resume' — or roll back. Nothing was moved."
+          exit 1
       - name: Resume the rotation in shikoonet
-        if: steps.in_scope.outputs.in_scope == 'true'
+        if: steps.decide.outputs.dns_scope == 'records' && steps.in_scope.outputs.in_scope == 'true'
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
@@ -699,14 +802,23 @@ jobs:
             --label "dns.hcloud_resume" \
             -- python3 rotate.py resume --config rotation.yml \
               --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
-      # The change-ip release. Same guards as the provider-only one, but the
-      # finish line here is `done`: rotate.py refuses unless the checkpoint is
-      # done, the server is re-read on the new address, and the old Primary IP
-      # is re-read as the same address attached to nothing. Runs only if the
-      # resume step succeeded (the `if:` on the step outcome), so a rotation
-      # that stopped short never loses its way back. Same job, same reviewer.
+      # ---- no records anywhere: finish without the DNS half ----------------
+      - name: Declare DNS out of scope and finish
+        if: steps.decide.outputs.dns_scope == 'none'
+        run: |
+          python3 rotate.py declare-dns-out-of-scope --config rotation.yml \
+            --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}" \
+            --scan /tmp/scan-a.json --scan /tmp/scan-b.json
+          python3 rotate.py status --config rotation.yml --txid "$TXID" | grep -E '"(state|outcome)"'
+
+      # ---- the change-ip release ---------------------------------------------
+      # Same guards as the provider-only one, but the finish line here is
+      # `done` — reached by the DNS path or by the declaration above.
+      # rotate.py refuses unless the checkpoint is done, the server is re-read
+      # on the new address, and the old Primary IP is re-read as the same
+      # address attached to nothing. success() means nothing before it failed.
       - name: Release the old address (retention=release, change-ip)
-        if: steps.in_scope.outputs.in_scope == 'true' && success()
+        if: success() && (steps.decide.outputs.dns_scope == 'none' || steps.in_scope.outputs.in_scope == 'true')
         run: |
           set -e
           retention=$(python3 -c "import yaml;print((yaml.safe_load(open('rotation.yml')).get('old_ip') or {}).get('retention','keep'))")

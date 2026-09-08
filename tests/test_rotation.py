@@ -290,6 +290,84 @@ class TestReleaseOldIp(Base):
             rotate.validate_config(cfg)
 
 
+class TestDeclareDnsOutOfScope(Base):
+    """A change-ip may finish without the DNS half only on evidence."""
+
+    def _paused(self):
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        cfg["old_ip"] = {"retention": "release"}
+        rot = self.build(fake=fake, cfg=cfg, until="connectivity_ok")
+        cp = self.full_run(rot)
+        self.assertEqual(cp["state"], "connectivity_ok")
+        return fake, rot, cp
+
+    def _scan(self, cp, manifest=(), zones_seen=3, ok=True, old_ip=None):
+        import json, tempfile
+        path = os.path.join(self.tmp.name, f"scan-{len(os.listdir(self.tmp.name))}.json")
+        with open(path, "w") as fh:
+            json.dump({"ok": ok, "operation": "discover", "invocation_id": "t",
+                       "old_ip": old_ip or cp["old_ip"]["ip"],
+                       "zones_seen": zones_seen, "manifest": list(manifest)}, fh)
+        return path
+
+    def test_two_empty_scans_finish_the_run_and_release_becomes_possible(self):
+        fake, rot, cp = self._paused()
+        a, b = self._scan(cp), self._scan(cp)
+        rot.declare_dns_out_of_scope(cp, [a, b])
+        self.assertEqual(cp["state"], "done")
+        self.assertEqual(cp["outcome"], "done")
+        self.assertTrue(cp["cloudflare_preflight"]["skipped"])
+        self.assertEqual(len(cp["dns_out_of_scope"]["scans"]), 2)
+        self.assertEqual(rot.load(cp["txid"])["state"], "done", "must be persisted")
+        # and the finished run can now release its old address
+        old_id = cp["old_ip"]["id"]
+        rot.release_old_ip(cp)
+        self.assertNotIn(old_id, fake.ips)
+
+    def test_refuses_when_any_scan_has_records(self):
+        fake, rot, cp = self._paused()
+        a = self._scan(cp)
+        b = self._scan(cp, manifest=[{"name": "x.example", "record_id": "r1"}])
+        with self.assertRaises(IdentityMismatch):
+            rot.declare_dns_out_of_scope(cp, [a, b])
+        self.assertEqual(cp["state"], "connectivity_ok")
+
+    def test_refuses_when_a_scan_saw_no_zones(self):
+        """Zero zones is a blind token, not an empty DNS."""
+        fake, rot, cp = self._paused()
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.declare_dns_out_of_scope(cp, [self._scan(cp, zones_seen=0)])
+        self.assertEqual(cp["state"], "connectivity_ok")
+
+    def test_refuses_a_scan_for_a_different_address(self):
+        fake, rot, cp = self._paused()
+        with self.assertRaises(IdentityMismatch):
+            rot.declare_dns_out_of_scope(cp, [self._scan(cp, old_ip="203.0.113.9")])
+
+    def test_refuses_a_failed_scan_and_no_scans(self):
+        fake, rot, cp = self._paused()
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.declare_dns_out_of_scope(cp, [self._scan(cp, ok=False)])
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.declare_dns_out_of_scope(cp, [])
+
+    def test_refuses_unless_paused_at_connectivity_ok(self):
+        fake = FakeHcloud()
+        rot = self.build(fake=fake, cfg=example_config(fake))
+        cp = rot.plan()
+        rot._transition(cp, "server_off")
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.declare_dns_out_of_scope(cp, [self._scan(cp)])
+
+    def test_refuses_when_the_server_is_not_on_the_new_address(self):
+        fake, rot, cp = self._paused()
+        fake.server["ipv4_address"] = "198.51.100.7"
+        with self.assertRaises(IdentityMismatch):
+            rot.declare_dns_out_of_scope(cp, [self._scan(cp)])
+        self.assertEqual(cp["state"], "connectivity_ok")
+
+
 class TestIdentity(Base):
     """Nothing is ever mutated without re-proving what it is, from a fresh read."""
 

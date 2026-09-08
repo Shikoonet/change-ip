@@ -1109,6 +1109,89 @@ class Rotation:
         self.out(f"released orphan {address} (Primary IP {target.id}). No rollback to it remains.")
         return {"id": target.id, "ip": address, "released": True}
 
+    # -- finish a change-ip whose DNS half has nothing to do -------------------
+    def declare_dns_out_of_scope(self, cp: Dict[str, Any],
+                                 scan_paths: List[str]) -> Dict[str, Any]:
+        """Take a change-ip from connectivity_ok to done WITHOUT the DNS half.
+
+        Only when the DNS half provably has no work: every account was
+        scanned by `discover --scan_only` for the OLD address, every scan came
+        back ok with an EMPTY manifest, and every scan SAW at least one zone —
+        the last one is what separates "no records point here" from "this
+        token could not see anything". Then the same checks _step_verify
+        would make: the server re-read on the new address and answering.
+
+        This is the one way a rotation ends without touching DNS that is not
+        `provider_only`. It is declared from evidence files, never inferred,
+        and the checkpoint records exactly which scans said so. A box that HAS
+        records never gets here: the caller must refuse before this, and this
+        refuses again on the manifest.
+        """
+        if cp.get("provider") != "hcloud":
+            raise NonRetryableError("declare-dns-out-of-scope is hcloud-only")
+        if cp.get("state") != "connectivity_ok":
+            raise NonRetryableError(
+                f"transaction is at {cp.get('state')!r}; only a run paused at "
+                "connectivity_ok can be declared DNS-out-of-scope"
+            )
+        if not scan_paths:
+            raise NonRetryableError("at least one --scan result file is required")
+        old_ip = (cp.get("old_ip") or {}).get("ip")
+        evidence = []
+        for path in scan_paths:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    res = json.load(fh)
+            except (OSError, ValueError) as exc:
+                raise NonRetryableError(f"scan result {path}: unreadable ({exc})") from exc
+            if not res.get("ok"):
+                raise NonRetryableError(f"scan result {path}: not ok — the scan failed, "
+                                        "so nothing can be concluded")
+            if res.get("operation") != "discover":
+                raise NonRetryableError(f"scan result {path}: not a discover result")
+            if res.get("old_ip") != old_ip:
+                raise IdentityMismatch(
+                    f"scan result {path} searched for {res.get('old_ip')!r}, "
+                    f"this transaction's old address is {old_ip!r}"
+                )
+            if int(res.get("zones_seen") or 0) < 1:
+                raise NonRetryableError(
+                    f"scan result {path}: saw 0 zones. A token that sees no zones "
+                    "proves nothing about records; refusing to call that 'none'"
+                )
+            if res.get("manifest"):
+                raise IdentityMismatch(
+                    f"scan result {path}: {len(res['manifest'])} A record(s) point at "
+                    f"{old_ip}; DNS is IN scope and must be moved, not declared away"
+                )
+            evidence.append({"path": os.path.basename(path),
+                             "invocation_id": res.get("invocation_id"),
+                             "zones_seen": int(res.get("zones_seen") or 0)})
+        # Same proof _step_verify demands: fresh read on the new address, and it answers.
+        self.assert_identity(cp, expect_ip="new")
+        reachable = self.probe(cp["new_ip"]["ip"], self.ssh_port, self.ssh_timeout)
+        if not reachable:
+            raise NonRetryableError(
+                f"{cp['new_ip']['ip']}:{self.ssh_port} does not answer; not finishing"
+            )
+        cp["cloudflare_preflight"] = {
+            "ts": utcnow(), "skipped": True,
+            "reason": f"no A record points at {old_ip} in any scanned account",
+            "scans": evidence,
+        }
+        cp["dns_out_of_scope"] = {"ts": utcnow(), "old_ip": old_ip, "scans": evidence}
+        cp["verification"] = {
+            "ts": utcnow(), "ipv4": cp["new_ip"]["ip"], "ssh_reachable": True,
+            "cloudflare_verified": True, "dns_out_of_scope": True,
+        }
+        cp["outcome"] = "done"
+        self.record(cp, "dns_out_of_scope",
+                    f"{len(evidence)} scan(s), {sum(e['zones_seen'] for e in evidence)} "
+                    f"zone(s) seen, 0 records on {old_ip}")
+        self._transition(cp, "done")
+        self.out(f"DONE without the DNS half: nothing in DNS pointed at {old_ip}.")
+        return cp
+
     def load(self, txid: str) -> Dict[str, Any]:
         try:
             with open(self._path(txid), "r", encoding="utf-8") as handle:
@@ -4269,6 +4352,16 @@ def main(
     p_release.add_argument("--config", default=None)
     p_release.add_argument("--confirm-server-id", default=None)
 
+    p_declare = sub.add_parser(
+        "declare-dns-out-of-scope",
+        help="finish a change-ip paused at connectivity_ok when scan results "
+             "prove no A record points at the old address")
+    p_declare.add_argument("--txid", required=True)
+    p_declare.add_argument("--config", default=None)
+    p_declare.add_argument("--confirm-server-id", default=None)
+    p_declare.add_argument("--scan", action="append", default=[],
+                           help="a discover --scan_only result file; repeat per account")
+
     p_status = sub.add_parser("status", help="print a checkpoint")
     p_status.add_argument("--txid", required=True)
     p_status.add_argument("--config", default=None)
@@ -4506,6 +4599,22 @@ def _dispatch(
                 rotation.release_orphan_ip(args.ip)
         except (NonRetryableError, IdentityMismatch) as exc:
             print(f"release refused: {exc}", file=sys.stderr)
+            return EXIT_IDENTITY
+        return EXIT_OK
+
+    if args.command == "declare-dns-out-of-scope":
+        expected_id = cfg["server"]["id"]
+        if args.confirm_server_id is None or str(args.confirm_server_id) != str(expected_id):
+            print(
+                f"refusing: --confirm-server-id must be {expected_id} "
+                "(the config's server.id). Nothing was contacted.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        try:
+            rotation.declare_dns_out_of_scope(rotation.load(args.txid), list(args.scan))
+        except (NonRetryableError, IdentityMismatch) as exc:
+            print(f"declare refused: {exc}", file=sys.stderr)
             return EXIT_IDENTITY
         return EXIT_OK
 
