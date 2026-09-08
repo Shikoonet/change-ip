@@ -63,8 +63,24 @@ if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
     chmod 600 "$_ci_tmp/rotation.yml"; ROTATION_CONFIG_FILE="$_ci_tmp/rotation.yml"
   fi
   if [[ -n "${SHIKOONET_REPO:-}" && ! -d "${SHIKOONET_DIR:-/nonexistent}" ]]; then
-    git clone --depth 1 --quiet "$SHIKOONET_REPO" "$_ci_tmp/shikoonet" \
-      && SHIKOONET_DIR="$_ci_tmp/shikoonet"
+    # The vault lives in a private repo, so an anonymous clone gets nothing.
+    # Authenticate through a credential helper that exists for this one
+    # command and is never written to any .git/config — CLAUDE.md forbids a
+    # token inside the URL, and for good reason: a URL ends up in remotes,
+    # reflogs and error messages.
+    _clone_err="$_ci_tmp/clone.err"
+    if [[ -n "${SHIKOONET_PAT:-${ADMIN_PAT:-}}" ]]; then
+      printf '%s' "${SHIKOONET_PAT:-$ADMIN_PAT}" > "$_ci_tmp/gitpat"
+      chmod 600 "$_ci_tmp/gitpat"
+      GIT_ASKPASS=/bin/echo \
+      git -c "credential.helper=!f() { echo username=x-access-token; echo password=$(cat "$_ci_tmp/gitpat"); }; f" \
+        clone --depth 1 --quiet "$SHIKOONET_REPO" "$_ci_tmp/shikoonet" 2>"$_clone_err" \
+        && SHIKOONET_DIR="$_ci_tmp/shikoonet"
+      rm -f "$_ci_tmp/gitpat"
+    else
+      git clone --depth 1 --quiet "$SHIKOONET_REPO" "$_ci_tmp/shikoonet" 2>"$_clone_err" \
+        && SHIKOONET_DIR="$_ci_tmp/shikoonet"
+    fi
   fi
   trap 'rm -rf "$_ci_tmp"' EXIT
 fi
@@ -226,15 +242,30 @@ for env in hetzner-production cloudflare-production dataforest-production; do
 done
 
 head_ "preconditions"
+# The vault is a SOURCE, not a requirement. Without it the secrets whose
+# values live there cannot be REFRESHED — but the ones already installed stay
+# installed and correct, and set_secret reports those as [keep]. Treating an
+# unreachable vault as fatal made a run where every secret was already right
+# exit non-zero, which says "broken" about a repo that is fine. A secret that
+# is neither in the vault nor on GitHub still fails, below, where it matters.
+_vault_ok=1
 for f in "$VAULT_FILE" "$VAULT_PASS_FILE"; do
-  [[ -r "$f" ]] && say "[ok]    $f" || { say "[MISS]  $f"; problems=$((problems+1)); }
+  if [[ -r "$f" ]]; then
+    say "[ok]    $f"
+  else
+    say "[warn]  $f is not readable — vault-sourced secrets can only be kept, not refreshed"
+    _vault_ok=0
+  fi
 done
+if [[ "$_vault_ok" == "0" && -s "${_clone_err:-/nonexistent}" ]]; then
+  say "        clone said: $(head -1 "$_clone_err")"
+fi
 [[ -r "$SSH_KEY_FILE" ]] && say "[ok]    $SSH_KEY_FILE" \
   || { say "[MISS]  $SSH_KEY_FILE (set SSH_KEY_FILE=...)"; problems=$((problems+1)); }
 [[ -r "$ROTATION_CONFIG_FILE" ]] && say "[ok]    $ROTATION_CONFIG_FILE" \
   || { say "[MISS]  $ROTATION_CONFIG_FILE"; problems=$((problems+1)); }
 [[ -n "$SHIKOONET_URL" ]] && say "[ok]    shikoonet URL from git remote" \
-  || say "[warn]  no shikoonet remote found; set SHIKOONET_URL=..."
+  || say "[warn]  no shikoonet checkout to read a remote from (harmless if SHIKOONET_REPO is already set)"
 
 if [[ "$problems" != "0" && "$DRY" == "0" ]]; then
   echo
@@ -275,7 +306,18 @@ head_ "shikoonet access (the inventory half)"
 for env in hetzner-production cloudflare-production; do
   set_secret SSH_PRIVATE_KEY        "$env" emit_file "$SSH_KEY_FILE"
   set_secret ANSIBLE_VAULT_PASSWORD "$env" emit_file "$VAULT_PASS_FILE"
-  [[ -n "$SHIKOONET_URL" ]] && set_secret SHIKOONET_REPO "$env" emit_string "$SHIKOONET_URL"
+  # Only when a URL was actually discovered. On a runner with no checkout
+  # there is nothing to derive it FROM, and the secret is already set — an
+  # empty write would replace a good value with nothing.
+  if [[ -n "$SHIKOONET_URL" ]]; then
+    set_secret SHIKOONET_REPO "$env" emit_string "$SHIKOONET_URL"
+  elif secret_present SHIKOONET_REPO "$env"; then
+    say "[keep]  SHIKOONET_REPO on $env  (already set; nothing here to derive it from)"
+    ok=$((ok+1))
+  else
+    say "[FAIL]  SHIKOONET_REPO on $env  (not set, and no checkout to read it from)"
+    problems=$((problems+1))
+  fi
 done
 
 head_ "summary"
