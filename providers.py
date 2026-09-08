@@ -254,6 +254,8 @@ class HcloudProvider:
         "allocate",
         "assign",
         "start",
+        "release",
+        "list_ips",
     )
 
     def __init__(self, runner: Runner, fingerprint: Optional[str] = None):
@@ -386,6 +388,20 @@ class HcloudProvider:
         behind our back and turn a rollback into an escalation.
         """
         return self._ip(self._call("protect_ip", ip_id=int(ip_id)))
+
+    def list_ips(self) -> List[PrimaryIP]:
+        """Every Primary IP in the project. Read-only."""
+        data = self._call("list_ips")
+        return [self._ip(raw) for raw in (data.get("ips") or [])]
+
+    def release_ip(self, ip_id: int, expect_ip: str) -> Dict[str, Any]:
+        """Delete a Primary IP that is attached to nothing.
+
+        The only delete this project performs. `expect_ip` is asserted by the
+        playbook against a fresh read, so an id that no longer means the
+        address the checkpoint remembers is refused there, not trusted here.
+        """
+        return self._call("release", ip_id=int(ip_id), expect_ip=str(expect_ip))
 
     def stop_server(self, server_id: int) -> Server:
         return self._server(self._call("stop", server_id=int(server_id)))

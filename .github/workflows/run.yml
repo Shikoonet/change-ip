@@ -92,6 +92,7 @@ on:
           - change-ip
           - provider-only
           - dns-scan
+          - release-old-ip
           - rollback
           - finalize
       provider:
@@ -280,6 +281,27 @@ jobs:
             echo "Type that as 'server_ip' on the next dispatch. No secret,"
             echo "config or environment needs editing — nothing went stale."
           }
+      # THE ONE DELETE. Only when the config says old_ip.retention: release,
+      # only on a provider-only run (the DNS half is out of scope by design,
+      # so connectivity_ok IS the finish line), and only after rotate.py has
+      # re-read the server on the new address and the old Primary IP attached
+      # to nothing. A change-ip run releases in `verify` instead, after `done`.
+      # Same job, same reviewer: the person who approved the swap approved
+      # this. After it there is no rollback to the old address.
+      - name: Release the old address (retention=release, provider-only)
+        if: steps.run.outputs.txid != '' && inputs.operation == 'provider-only'
+        env:
+          TXID: ${{ steps.run.outputs.txid }}
+        run: |
+          set -e
+          retention=$(python3 -c "import yaml;print((yaml.safe_load(open('rotation.yml')).get('old_ip') or {}).get('retention','keep'))")
+          echo "old_ip.retention = $retention"
+          if [ "$retention" != "release" ]; then
+            echo "keep: the old address stays retained. Nothing deleted."
+            exit 0
+          fi
+          python3 rotate.py release-old-ip --config rotation.yml \
+            --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state, path: state/, retention-days: 3}
@@ -805,6 +827,44 @@ jobs:
           path: /tmp/scan-account-*.json
           retention-days: 7
           if-no-files-found: warn
+
+  # 3''. release-old-ip — delete ONE retained Primary IP, by address.
+  #
+  #      For addresses that predate release existing, or whose checkpoint
+  #      artifact has expired. `server_ip` is the address to delete. Guards,
+  #      each from a fresh read: config must say old_ip.retention: release;
+  #      the address must resolve to exactly one Primary IP in the project;
+  #      it must be attached to NOTHING. The server's own current address can
+  #      never pass the last one. After this there is no rollback to it.
+  #
+  #      `dns-scan` first. This job does not check DNS; it checks Hetzner.
+  release_old_ip:
+    name: release · delete a retained Primary IP (by address)
+    if: inputs.operation == 'release-old-ip' && inputs.provider == 'hcloud'
+    runs-on: ubuntu-latest
+    environment: hetzner-production
+    timeout-minutes: 15
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      RELEASE_IP: ${{ inputs.server_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      # No expect_ipv4: the address being released is, by definition, not
+      # the one the server is on.
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+      - name: Release it
+        run: |
+          set -e
+          retention=$(python3 -c "import yaml;print((yaml.safe_load(open('rotation.yml')).get('old_ip') or {}).get('retention','keep'))")
+          echo "old_ip.retention = $retention  address = $RELEASE_IP"
+          if [ "$retention" != "release" ]; then
+            echo "::error::config says old_ip.retention: $retention — this config never releases."
+            exit 1
+          fi
+          python3 rotate.py release-old-ip --config rotation.yml \
+            --ip "$RELEASE_IP" --confirm-server-id "${{ inputs.server_id }}"
 
   # 4. verify — the checkpoint says done, and says so on its own terms.
   # verify is gated on (a) operation == change-ip (NOT provider-only, NOT

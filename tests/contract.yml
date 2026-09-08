@@ -41,12 +41,10 @@
     # stripped before the scan, because that file EXPLAINS several of these in
     # a comment right above the safe version.
     forbidden:
-      - pattern: 'state:\s*absent'
-        why: >-
-          Nothing this tool runs may delete a server or a Primary IP. The
-          rollback path RETAINS the new address and the old one is never
-          removed — deleting either is a separate operator decision.
-
+      # `state: absent` is no longer forbidden outright — the operator chose to
+      # release retained addresses (2026-09-08). It is instead constrained
+      # STRUCTURALLY below: exactly one occurrence, inside the `release` op,
+      # after a fresh-read assert that the address is attached to nothing.
       - pattern: 'auto_delete:\s*true'
         why: >-
           auto_delete lets Hetzner reclaim a Primary IP when the resource it is
@@ -260,6 +258,48 @@
           see the messages above.
         success_msg: >-
           hcloud_step.yml is clean against {{ forbidden | length }} rules.
+
+    # ---- the ONE delete, and the shape it must keep --------------------
+    # Rule One used to be "nothing is ever deleted". What remains of it is a
+    # structural contract on hcloud_step.yml read AS YAML, not as text:
+    #   * `state: absent` appears in exactly ONE task in the whole file;
+    #   * that task lives inside the block gated on `op == 'release'`;
+    #   * an assert task that mentions `assignee_id` comes BEFORE it in that
+    #     block — the fresh read that proves the address is attached to nothing.
+    # A `state: absent` anywhere else, or one not preceded by that assert, fails.
+    - name: "ip-rotation | locate every state:absent in hcloud_step.yml (as YAML)"
+      ansible.builtin.set_fact:
+        _absent_sites: >-
+          {%- set out = [] -%}
+          {%- for play in (lookup('file', _step_file) | from_yaml) -%}
+          {%-   for t in (play.tasks | default([])) -%}
+          {%-     set gate = (t.when | default('') | string) -%}
+          {%-     set ns = namespace(saw_guard=false) -%}
+          {%-     for sub in (t.block | default([t])) -%}
+          {%-       if 'ansible.builtin.assert' in sub and 'assignee_id' in (sub['ansible.builtin.assert'] | to_json) -%}
+          {%-         set ns.saw_guard = true -%}
+          {%-       endif -%}
+          {%-       for mod, args in sub.items() -%}
+          {%-         if args is mapping and (args.state | default('')) == 'absent' -%}
+          {%-           set _ = out.append({'task': sub.name | default('?'), 'gate': gate, 'guarded': ns.saw_guard}) -%}
+          {%-         endif -%}
+          {%-       endfor -%}
+          {%-     endfor -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: "ip-rotation | the one delete is in `release`, after the unassigned assert"
+      ansible.builtin.assert:
+        that:
+          - (_absent_sites | length) == 1
+          - "'release' in _absent_sites[0].gate"
+          - _absent_sites[0].guarded
+        fail_msg: >-
+          hcloud_step.yml must carry exactly one `state: absent`, inside the
+          block gated on op == 'release', preceded in that block by an assert
+          on assignee_id. Found: {{ _absent_sites | to_json }}.
+        quiet: true
 
     # ---- 3. trap #2/#3: every `server` task is explicit about its address ---
     # Parsed as YAML rather than grepped: "the task two lines below has an

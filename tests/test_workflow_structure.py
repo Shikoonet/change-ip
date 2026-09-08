@@ -63,7 +63,9 @@ JOB_LEVEL_TOKEN_BUDGETS = {
                     "cloudflare_finalize_precheck"},
     DF_TOKEN: {"plan_dataforest", "swap_dataforest", "swap_dataforest_guest",
                "dataforest_provider_finalize", "rollback_dataforest"},
-    HC_TOKEN: {"plan", "swap", "dns", "verify", "rollback"},
+    # release_old_ip added 2026-09-08: it lists and deletes Primary IPs, so it
+    # needs the Hetzner token and sits on hetzner-production like swap.
+    HC_TOKEN: {"plan", "swap", "dns", "verify", "rollback", "release_old_ip"},
 }
 
 # Within `finalize`, the CF token lives ONLY on the finalize-precheck
@@ -352,6 +354,43 @@ class WorkflowStructureTests(unittest.TestCase):
                        "/tmp/scan-account-b.json": empty_ok})
         self.assertEqual(rc, 0)
         self.assertIn("Nothing. Both accounts scanned", out)
+
+    def test_release_step_is_gated_and_reads_retention(self):
+        """The one delete in the workflow must be conditional three ways.
+
+        It runs only in the swap job (same reviewer that approved the swap),
+        only for provider-only (change-ip finishes at `done`, not here),
+        and only when the config's old_ip.retention says release — read at
+        run time from rotation.yml, never assumed. A `keep` config must exit 0
+        having deleted nothing.
+        """
+        job = self.jobs["swap"]
+        steps = [s for s in job["steps"] if "Release the old address" in s.get("name", "")]
+        self.assertEqual(len(steps), 1, "exactly one release step in swap")
+        st = steps[0]
+        self.assertIn("inputs.operation == 'provider-only'", st["if"])
+        self.assertIn("steps.run.outputs.txid != ''", st["if"])
+        run = st["run"]
+        self.assertIn("retention", run)
+        self.assertIn('"$retention" != "release"', run)
+        self.assertIn("release-old-ip", run)
+        self.assertIn("--confirm-server-id", run)
+        # The delete is reachable from exactly two places: the swap job's
+        # post-pause step (checkpoint mode) and the release_old_ip job
+        # (by-address mode). Both sit on hetzner-production behind its
+        # reviewer. Anywhere else is a new, unreviewed path to a delete.
+        callers = sorted({jn for jn, j in self.jobs.items()
+                          for s in (j.get("steps") or [])
+                          if "release-old-ip" in (s.get("run") or "")})
+        self.assertEqual(callers, ["release_old_ip", "swap"], callers)
+        for jn in callers:
+            self.assertEqual(self.jobs[jn].get("environment"), "hetzner-production",
+                             f"{jn} must sit behind hetzner-production's reviewer")
+        rel = self.jobs["release_old_ip"]
+        self.assertIn("inputs.operation == 'release-old-ip'", rel["if"])
+        body = " ".join(s.get("run", "") for s in rel["steps"])
+        self.assertIn('"$retention" != "release"', body)
+        self.assertIn("--ip", body)
 
     def test_dns_scan_is_read_only(self):
         """dns_scan carries two Cloudflare tokens. It must never mutate.

@@ -98,6 +98,8 @@
       - allocate
       - assign
       - start
+      - release
+      - list_ips
 
   tasks:
 
@@ -154,6 +156,64 @@
                      | selectattr('assignee_id', 'equalto', (_srv.hcloud_server_info | first).id)
                      | map(attribute='id') | list | first | default(none)
                    )}) }}
+
+    # THE ONE DELETE IN THIS FILE. Rule One said nothing is ever deleted; the
+    # operator changed that rule on 2026-09-08 because a retained Primary IP is
+    # billed forever and three had piled up. What survives of Rule One is the
+    # shape of this block: a FRESH read first, an assert that the address is
+    # attached to NOTHING, and only then `state: absent`. An address that is
+    # still assigned — to this server, to any server — is never deleted here;
+    # the assert fails and nothing runs. tests/contract.yml checks that this
+    # is the only `state: absent` in the file and that the assert precedes it.
+    - name: "hcloud | release"
+      when: op == 'release'
+      block:
+
+        - name: "hcloud | release | fresh read of the address"
+          hetzner.hcloud.primary_ip_info:
+            id: "{{ ip_id | int }}"
+          register: _rel
+
+        - name: "hcloud | release | it must exist and be attached to nothing"
+          ansible.builtin.assert:
+            that:
+              - (_rel.hcloud_primary_ip_info | length) == 1
+              - (_rel.hcloud_primary_ip_info[0].assignee_id | default(none)) is none
+              - (_rel.hcloud_primary_ip_info[0].ip) == expect_ip
+            fail_msg: >-
+              Refusing to release Primary IP {{ ip_id }}: it must exist, be
+              unassigned, and be {{ expect_ip }}. Got
+              {{ _rel.hcloud_primary_ip_info | default([]) | to_json }}.
+              An address that is still attached is never deleted by this tool.
+            quiet: true
+
+        - name: "hcloud | release | delete the Primary IP"
+          hetzner.hcloud.primary_ip:
+            id: "{{ ip_id | int }}"
+            state: absent
+
+        - name: "hcloud | release | shape it"
+          ansible.builtin.set_fact:
+            _data:
+              id: "{{ ip_id | int }}"
+              ip: "{{ expect_ip }}"
+              released: true
+
+    # Every Primary IP in the project, unfiltered. Read-only. Used to resolve
+    # an ADDRESS to an id when there is no checkpoint to remember it — the
+    # retained addresses that predate release existing.
+    - name: "hcloud | list_ips"
+      when: op == 'list_ips'
+      block:
+
+        - name: "hcloud | list_ips | all of them"
+          hetzner.hcloud.primary_ip_info: {}
+          register: _all
+
+        - name: "hcloud | list_ips | shape it"
+          ansible.builtin.set_fact:
+            _data:
+              ips: "{{ _all.hcloud_primary_ip_info }}"
 
     - name: "hcloud | read_ip"
       when: op == 'read_ip'

@@ -613,10 +613,16 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
             "An empty allow-list means nothing is allowed, which is a stop, not a pass."
         )
 
-    if (data.get("old_ip") or {}).get("retention", "keep") != "keep":
+    # `keep` retains the old address after success (billed until someone
+    # decides). `release` deletes it — but only via `release-old-ip`, only
+    # once the rotation is complete, and only after a fresh read proves it is
+    # attached to nothing. The operator chose release on 2026-09-08 because
+    # retained addresses were piling up on the bill; the guards are what is
+    # left of the old "nothing is ever deleted" rule.
+    retention = (data.get("old_ip") or {}).get("retention", "keep")
+    if retention not in ("keep", "release"):
         raise ConfigError(
-            f"{path}: old_ip.retention must be 'keep'. Deleting the previous address "
-            "is a separate operator decision and this tool does not implement it."
+            f"{path}: old_ip.retention must be 'keep' or 'release', got {retention!r}."
         )
 
     cf = data.get("cloudflare") or {}
@@ -1003,6 +1009,95 @@ class Rotation:
             if os.path.exists(tmp):
                 os.remove(tmp)
             raise
+
+    # -- release the old address -------------------------------------------
+    def release_old_ip(self, cp: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete the OLD Primary IP of a finished rotation. The one delete.
+
+        Refuses unless every one of these holds, each from a FRESH read:
+          * config says old_ip.retention: release (a keep config never gets here)
+          * the transaction is finished — `done`, or paused at connectivity_ok
+            with provider_only (there the DNS half is out of scope by design)
+          * the server is on the NEW address right now
+          * the old Primary IP still exists, is the address the checkpoint
+            remembers, and is attached to NOTHING
+          * it has not already been released
+        Anything else is a refusal, not a skip. Once released there is no
+        rollback to the old address; that is the price the operator accepted.
+        """
+        retention = (self.cfg.get("old_ip") or {}).get("retention", "keep")
+        if retention != "release":
+            raise NonRetryableError(
+                "old_ip.retention is 'keep' — this config never releases. Set "
+                "old_ip.retention: release to allow it; nothing was contacted."
+            )
+        if cp.get("old_ip", {}).get("released_at"):
+            self.out(f"already released at {cp['old_ip']['released_at']}; nothing to do")
+            return cp
+        state = cp.get("state")
+        finished = state == "done" or (state == "connectivity_ok" and self.provider_only)
+        if not finished:
+            raise NonRetryableError(
+                f"transaction is at {state!r}; release needs `done`, or "
+                "`connectivity_ok` under provider_only. Releasing mid-rotation "
+                "would delete the only way back."
+            )
+        old = cp.get("old_ip") or {}
+        if not old.get("id") or not old.get("ip"):
+            raise NonRetryableError("checkpoint has no old_ip id/ip to release")
+        # The server must be living on the NEW address — a fresh read.
+        self.assert_identity(cp, expect_ip="new")
+        # And the old address must be exactly what we remember, attached to nothing.
+        cur = self.with_retries("read_ip", self.provider.get_primary_ip, int(old["id"]))
+        if cur.ip != old["ip"]:
+            raise IdentityMismatch(
+                f"Primary IP {old['id']} is now {cur.ip}, not {old['ip']}; refusing"
+            )
+        if cur.assignee_id is not None:
+            raise IdentityMismatch(
+                f"Primary IP {old['id']} ({old['ip']}) is still assigned to "
+                f"{cur.assignee_id}; an attached address is never released"
+            )
+        self.with_retries("release", self.provider.release_ip, int(old["id"]), old["ip"])
+        cp["old_ip"]["released_at"] = utcnow()
+        cp["old_ip"]["retention"] = "released"
+        self.record(cp, "release", f"{old['ip']} (id {old['id']}) deleted from Hetzner")
+        self.save(cp)
+        self.out(f"released {old['ip']} (Primary IP {old['id']}). No rollback to it remains.")
+        return cp
+
+    def release_orphan_ip(self, address: str) -> Dict[str, Any]:
+        """Delete a retained Primary IP by ADDRESS when no checkpoint remembers it.
+
+        For the addresses that piled up before release existed, or whose
+        checkpoint artifact has expired. Fewer guards are available without a
+        transaction — no server to re-read — so the ones that remain are
+        absolute: config must say release; the address must resolve to exactly
+        one Primary IP in this project; and that IP must be attached to
+        NOTHING. The playbook re-asserts the last two on its own fresh read.
+        """
+        retention = (self.cfg.get("old_ip") or {}).get("retention", "keep")
+        if retention != "release":
+            raise NonRetryableError(
+                "old_ip.retention is 'keep' — this config never releases. Nothing was contacted."
+            )
+        address = str(address).strip()
+        matches = [ip for ip in self.with_retries("list_ips", self.provider.list_ips)
+                   if ip.ip == address]
+        if len(matches) != 1:
+            raise IdentityMismatch(
+                f"{address} resolves to {len(matches)} Primary IP(s) in this project; "
+                "refusing unless it is exactly one"
+            )
+        target = matches[0]
+        if target.assignee_id is not None:
+            raise IdentityMismatch(
+                f"{address} (Primary IP {target.id}) is assigned to {target.assignee_id}; "
+                "an attached address is never released"
+            )
+        self.with_retries("release", self.provider.release_ip, int(target.id), address)
+        self.out(f"released orphan {address} (Primary IP {target.id}). No rollback to it remains.")
+        return {"id": target.id, "ip": address, "released": True}
 
     def load(self, txid: str) -> Dict[str, Any]:
         try:
@@ -4151,6 +4246,19 @@ def main(
              "workflow has the CLOUDFLARE_API_TOKEN available.",
     )
 
+    p_release = sub.add_parser(
+        "release-old-ip",
+        help="delete the OLD Primary IP of a finished rotation (needs "
+             "old_ip.retention: release; refuses if it is attached to anything)")
+    # Two modes. --txid: the checkpoint remembers the address and every guard
+    # applies. --ip: no checkpoint (predates release, or the artifact expired);
+    # the address is resolved in the project and must be attached to nothing.
+    p_release.add_argument("--txid", default=None)
+    p_release.add_argument("--ip", default=None,
+                           help="release this retained address without a checkpoint")
+    p_release.add_argument("--config", default=None)
+    p_release.add_argument("--confirm-server-id", default=None)
+
     p_status = sub.add_parser("status", help="print a checkpoint")
     p_status.add_argument("--txid", required=True)
     p_status.add_argument("--config", default=None)
@@ -4366,6 +4474,29 @@ def _dispatch(
 
     if args.command == "status":
         print(json.dumps(rotation.load(args.txid), indent=2, sort_keys=True))
+        return EXIT_OK
+
+    if args.command == "release-old-ip":
+        # Mutating, so it takes the same identity gate as apply/rollback.
+        expected_id = cfg["server"]["id"]
+        if args.confirm_server_id is None or str(args.confirm_server_id) != str(expected_id):
+            print(
+                f"refusing to release: --confirm-server-id must be {expected_id} "
+                "(the config's server.id). Nothing was contacted.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        if bool(args.txid) == bool(args.ip):
+            print("release-old-ip needs exactly one of --txid or --ip", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            if args.txid:
+                rotation.release_old_ip(rotation.load(args.txid))
+            else:
+                rotation.release_orphan_ip(args.ip)
+        except (NonRetryableError, IdentityMismatch) as exc:
+            print(f"release refused: {exc}", file=sys.stderr)
+            return EXIT_IDENTITY
         return EXIT_OK
 
     if args.command == "plan":

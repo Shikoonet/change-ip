@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 DEFAULT_SERVER_ID = 12345678
 DEFAULT_OLD_IP_ID = 900001
 
-WRITE_OPS = ("protect_ip", "stop", "unassign", "allocate", "assign", "start")
+WRITE_OPS = ("protect_ip", "stop", "unassign", "allocate", "assign", "start", "release")
 
 
 class FakeHcloud:
@@ -167,6 +167,26 @@ class FakeHcloud:
     def _op_find_ip(self, params: Dict[str, Any]) -> Dict[str, Any]:
         matches = [ip for ip in self.ips.values() if ip["name"] == params.get("ip_name")]
         return self._ok({"matches": matches})
+
+    def _op_list_ips(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._ok({"ips": [dict(ip) for ip in self.ips.values()]})
+
+    def _op_release(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Mirror of the playbook's release block: refuse anything attached."""
+        ip = self.ips.get(int(params["ip_id"]))
+        if ip is None:
+            return self._err("No Primary IP matched", "not_found")
+        if ip.get("assignee_id") is not None:
+            return self._err(
+                f"Refusing to release Primary IP {ip['id']}: still assigned to "
+                f"{ip['assignee_id']}", "validation")
+        if ip["ip"] != params.get("expect_ip"):
+            return self._err(
+                f"Refusing to release: id {ip['id']} is {ip['ip']}, not "
+                f"{params.get('expect_ip')}", "validation")
+        del self.ips[ip["id"]]
+        self.released = getattr(self, "released", []) + [ip["id"]]
+        return self._ok({"id": ip["id"], "ip": ip["ip"], "released": True})
 
     def _op_protect_ip(self, params: Dict[str, Any]) -> Dict[str, Any]:
         ip = self.ips.get(int(params["ip_id"]))

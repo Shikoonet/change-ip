@@ -152,6 +152,130 @@ class Base(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+class TestReleaseOldIp(Base):
+    """The one delete. Every guard is a fresh read; every miss is a refusal."""
+
+    def _finished_provider_only(self, retention="release"):
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        cfg["old_ip"] = {"retention": retention}
+        cfg.setdefault("cloudflare", {})["mode"] = "provider_only"
+        cfg["cloudflare"].pop("allowed_records", None)
+        cfg["cloudflare"].pop("expected_record_count", None)
+        rot = self.build(fake=fake, cfg=cfg)
+        cp = self.full_run(rot)
+        self.assertEqual(cp["state"], "connectivity_ok")
+        return fake, rot, cp
+
+    def test_releases_the_old_address_after_a_finished_provider_only_run(self):
+        fake, rot, cp = self._finished_provider_only()
+        old_id, old_ip = cp["old_ip"]["id"], cp["old_ip"]["ip"]
+        self.assertIn(old_id, fake.ips)
+        rot.release_old_ip(cp)
+        self.assertNotIn(old_id, fake.ips, "the old Primary IP must be gone")
+        self.assertEqual(cp["old_ip"]["retention"], "released")
+        self.assertTrue(cp["old_ip"]["released_at"])
+        self.assertEqual(rot.load(cp["txid"])["old_ip"]["retention"], "released",
+                         "the release must be persisted, not just in memory")
+        # the NEW address is untouched and still on the server
+        self.assertEqual(fake.server["ipv4_address"], cp["new_ip"]["ip"])
+        # a second call is a no-op, never a second delete or an error
+        n = fake.write_count
+        rot.release_old_ip(cp)
+        self.assertEqual(fake.write_count, n)
+
+    def test_keep_config_never_releases(self):
+        fake, rot, cp = self._finished_provider_only(retention="keep")
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.release_old_ip(cp)
+        self.assertIn(cp["old_ip"]["id"], fake.ips)
+
+    def test_refuses_mid_rotation(self):
+        """A checkpoint that is not finished must never lose its way back."""
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        cfg["old_ip"] = {"retention": "release"}
+        rot = self.build(fake=fake, cfg=cfg)
+        cp = rot.plan()
+        rot._transition(cp, "server_off")          # somewhere in the middle
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.release_old_ip(cp)
+        self.assertIn(cp["old_ip"]["id"], fake.ips)
+
+    def test_refuses_when_the_old_address_is_still_attached(self):
+        """Even a finished checkpoint does not override reality."""
+        fake, rot, cp = self._finished_provider_only()
+        # somebody re-attached the old address to some other server meanwhile
+        fake.ips[cp["old_ip"]["id"]]["assignee_id"] = 424242
+        fake.ips[cp["old_ip"]["id"]]["assignee_type"] = "server"
+        with self.assertRaises(IdentityMismatch):
+            rot.release_old_ip(cp)
+        self.assertIn(cp["old_ip"]["id"], fake.ips)
+
+    def test_refuses_when_the_id_no_longer_means_that_address(self):
+        fake, rot, cp = self._finished_provider_only()
+        fake.ips[cp["old_ip"]["id"]]["ip"] = "203.0.113.250"
+        with self.assertRaises(IdentityMismatch):
+            rot.release_old_ip(cp)
+        self.assertIn(cp["old_ip"]["id"], fake.ips)
+
+    def test_refuses_when_the_server_is_not_on_the_new_address(self):
+        fake, rot, cp = self._finished_provider_only()
+        fake.server["ipv4_address"] = "198.51.100.7"   # drifted outside the tool
+        with self.assertRaises(IdentityMismatch):
+            rot.release_old_ip(cp)
+        self.assertIn(cp["old_ip"]["id"], fake.ips)
+
+    # -- orphan mode: by address, no checkpoint --------------------------------
+    def _orphan_world(self, retention="release"):
+        fake = FakeHcloud()
+        # a retained, unassigned leftover from before release existed
+        fake.ips[777] = {"id": 777, "name": "leftover", "ip": "198.51.100.77",
+                         "type": "ipv4", "location": "nbg1", "assignee_id": None,
+                         "assignee_type": None, "auto_delete": False}
+        cfg = example_config(fake)
+        cfg["old_ip"] = {"retention": retention}
+        return fake, self.build(fake=fake, cfg=cfg)
+
+    def test_orphan_release_by_address(self):
+        fake, rot = self._orphan_world()
+        out = rot.release_orphan_ip("198.51.100.77")
+        self.assertEqual(out["id"], 777)
+        self.assertNotIn(777, fake.ips)
+        # the server's own address is untouched
+        self.assertEqual(fake.server["ipv4_address"], "46.224.67.245")
+
+    def test_orphan_refuses_an_attached_address(self):
+        """The server's CURRENT address is attached; asking for it must refuse."""
+        fake, rot = self._orphan_world()
+        with self.assertRaises(IdentityMismatch):
+            rot.release_orphan_ip(fake.server["ipv4_address"])
+        self.assertEqual(fake.server["ipv4_address"], "46.224.67.245")
+
+    def test_orphan_refuses_unknown_or_ambiguous_address(self):
+        fake, rot = self._orphan_world()
+        with self.assertRaises(IdentityMismatch):
+            rot.release_orphan_ip("203.0.113.1")            # nothing matches
+        fake.ips[778] = dict(fake.ips[777], id=778, name="dup")
+        with self.assertRaises(IdentityMismatch):
+            rot.release_orphan_ip("198.51.100.77")          # two match
+        self.assertIn(777, fake.ips)
+
+    def test_orphan_refuses_under_keep(self):
+        fake, rot = self._orphan_world(retention="keep")
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.release_orphan_ip("198.51.100.77")
+        self.assertIn(777, fake.ips)
+
+    def test_retention_release_validates_and_others_do_not(self):
+        cfg = example_config(FakeHcloud())
+        cfg["old_ip"] = {"retention": "release"}
+        rotate.validate_config(cfg)
+        cfg["old_ip"] = {"retention": "delete"}
+        with self.assertRaises(rotate.ConfigError):
+            rotate.validate_config(cfg)
+
+
 class TestIdentity(Base):
     """Nothing is ever mutated without re-proving what it is, from a fresh read."""
 
