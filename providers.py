@@ -184,6 +184,10 @@ class NotFound(NonRetryableError):
     """The named server or Primary IP does not exist in this project."""
 
 
+class QuotaExceeded(NonRetryableError):
+    """The project is out of Primary IPs. Not weather: nothing changes between attempts."""
+
+
 class IdentityMismatch(ProviderError):
     """The thing we are about to mutate is not the thing we were told to mutate.
 
@@ -282,6 +286,8 @@ class HcloudProvider:
         kind = result.get("error_kind") or "retryable"
         if kind == "not_found":
             raise NotFound(message)
+        if kind == "quota":
+            raise QuotaExceeded(message)
         if kind in ("auth", "validation"):
             raise NonRetryableError(message)
         raise RetryableError(message)

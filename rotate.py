@@ -101,6 +101,7 @@ from providers import (  # noqa: E402
     NonRetryableError,
     NotFound,
     ProviderError,
+    QuotaExceeded,
     RetryableError,
     Seed,
     cf_token_present,
@@ -855,7 +856,7 @@ def classify_failure(text: str) -> str:
     # looking for flakiness instead of at the retained addresses filling the
     # project. Nothing about a limit changes between attempts.
     if any(marker in low for marker in ("resource_limit_exceeded", "limit exceeded")):
-        return "validation"
+        return "quota"
     return "retryable"
 
 
@@ -1073,6 +1074,24 @@ class Rotation:
         self.out(f"released {old['ip']} (Primary IP {old['id']}). No rollback to it remains.")
         return cp
 
+    def _release_unassigned(self, seen) -> list:
+        """Release every IPv4 Primary IP in `seen` that is attached to nothing.
+
+        Callers check old_ip.retention first. The playbook re-asserts
+        "assigned to nothing" on its own fresh read before the delete.
+        """
+        targets = [ip for ip in seen if ip.assignee_id is None]
+        if not targets:
+            self.out("no unassigned IPv4 Primary IP in the project; nothing to release")
+            return []
+        done = []
+        for ip in targets:
+            self.with_retries("release", self.provider.release_ip, int(ip.id), ip.ip)
+            self.out(f"released {ip.ip} (Primary IP {ip.id})")
+            done.append({"id": ip.id, "ip": ip.ip})
+        self.out(f"released {len(done)} unassigned address(es). No rollback to them remains.")
+        return done
+
     def release_orphan_ip(self, address: str) -> Dict[str, Any]:
         """Delete a retained Primary IP by ADDRESS when no checkpoint remembers it.
 
@@ -1097,17 +1116,7 @@ class Rotation:
             # retained addresses filled the project's Primary IP quota and
             # `allocate` started failing — three leftovers, three dispatches
             # and three approvals was the alternative.
-            targets = [ip for ip in seen if ip.assignee_id is None]
-            if not targets:
-                self.out("no unassigned IPv4 Primary IP in the project; nothing to release")
-                return {"released": []}
-            done = []
-            for ip in targets:
-                self.with_retries("release", self.provider.release_ip, int(ip.id), ip.ip)
-                self.out(f"released {ip.ip} (Primary IP {ip.id})")
-                done.append({"id": ip.id, "ip": ip.ip})
-            self.out(f"released {len(done)} unassigned address(es). No rollback to them remains.")
-            return {"released": done}
+            return {"released": self._release_unassigned(seen)}
         matches = [ip for ip in seen if ip.ip == address]
         if len(matches) != 1:
             # Say what IS there. "0 matches" alone leaves the operator unable to
@@ -1915,9 +1924,35 @@ class Rotation:
             self.log(f"  {name} already exists ({existing.ip}) — adopting it")
             allocated = existing
         else:
-            allocated = self.with_retries(
-                "allocate", self.provider.allocate_ip, name, cp["snapshot"]["datacenter"]
-            )
+            try:
+                allocated = self.with_retries(
+                    "allocate", self.provider.allocate_ip, name, cp["snapshot"]["datacenter"]
+                )
+            except QuotaExceeded as exc:
+                # The project is full of this tool's own leftovers (run
+                # 34277270480 died here). Under old_ip.retention: release
+                # they were going to be deleted anyway; doing it now, before
+                # the box is touched, turns "dispatch release-old-ip, approve,
+                # dispatch again" into one run. Unassigned IPv4 only — the
+                # server's own address is attached and can never be in the set.
+                retention = (self.cfg.get("old_ip") or {}).get("retention", "keep")
+                if retention != "release":
+                    raise NonRetryableError(
+                        f"{exc}. Unassigned Primary IPs stay under old_ip.retention: keep — "
+                        "release them, or raise the project's Primary IP limit at Hetzner."
+                    ) from exc
+                self.log("  allocate: Primary IP limit reached — releasing unassigned addresses first")
+                seen = self.with_retries("list_ips", self.provider.list_ips)
+                released = self._release_unassigned(seen)
+                if not released:
+                    raise NonRetryableError(
+                        f"{exc}. Nothing unassigned to release — raise the project's Primary IP "
+                        "limit at Hetzner (Cloud Console → Limits)."
+                    ) from exc
+                self.record(cp, "release", "quota: " + ", ".join(r["ip"] for r in released))
+                allocated = self.with_retries(
+                    "allocate", self.provider.allocate_ip, name, cp["snapshot"]["datacenter"]
+                )
         if not same_place(allocated.datacenter, cp["snapshot"]["datacenter"]):
             raise NonRetryableError(
                 f"{name} landed in {allocated.datacenter}, not {cp['snapshot']['datacenter']}"

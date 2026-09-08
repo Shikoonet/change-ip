@@ -298,6 +298,50 @@ class TestReleaseOldIp(Base):
             rot.release_orphan_ip("all-unassigned")
         self.assertIn(777, fake.ips)
 
+    # -- quota: the tool clears its own leftovers before allocate ------------
+    def _full_project(self, retention="release", limit=2):
+        """One box on its address, one retained leftover, quota exactly full."""
+        fake = FakeHcloud(primary_ip_limit=limit)
+        fake.ips[777] = {"id": 777, "name": "leftover", "ip": "198.51.100.77",
+                         "type": "ipv4", "location": "nbg1", "assignee_id": None,
+                         "assignee_type": None, "auto_delete": False}
+        cfg = example_config(fake)
+        cfg["old_ip"] = {"retention": retention}
+        cfg.setdefault("cloudflare", {})["mode"] = "provider_only"
+        cfg["cloudflare"].pop("allowed_records", None)
+        cfg["cloudflare"].pop("expected_record_count", None)
+        return fake, self.build(fake=fake, cfg=cfg)
+
+    def test_allocate_at_quota_releases_leftovers_and_rotates(self):
+        """Live run 34277270480 died on the quota. Now the run clears it itself."""
+        fake, rot = self._full_project()
+        cp = self.full_run(rot)
+        self.assertEqual(cp["state"], "connectivity_ok")
+        self.assertNotIn(777, fake.ips, "the leftover must be released")
+        self.assertEqual(fake.server["ipv4_address"], cp["new_ip"]["ip"])
+        self.assertIn(cp["old_ip"]["id"], fake.ips, "the OLD address is not a leftover yet")
+        ops = [c["op"] for c in fake.calls]
+        self.assertLess(ops.index("release"), ops.index("stop"),
+                        "leftovers go before the box is touched")
+        self.assertIn("quota: 198.51.100.77", [h["detail"] for h in cp["history"]])
+
+    def test_allocate_at_quota_with_nothing_to_release_fails_before_touching_the_box(self):
+        fake, rot = self._full_project(limit=1)
+        del fake.ips[777]
+        cp = self.full_run(rot)
+        self.assertEqual(cp["outcome"], "rolled_back")
+        self.assertEqual(fake.server["status"], "running")
+        self.assertEqual(fake.server["ipv4_address"], "46.224.67.245")
+        self.assertNotIn("stop", [c["op"] for c in fake.calls])
+        self.assertIn("raise the project's Primary IP limit", "\n".join(self.lines))
+
+    def test_allocate_at_quota_under_keep_releases_nothing(self):
+        fake, rot = self._full_project(retention="keep")
+        cp = self.full_run(rot)
+        self.assertEqual(cp["outcome"], "rolled_back")
+        self.assertIn(777, fake.ips)
+        self.assertNotIn("release", [c["op"] for c in fake.calls])
+
     def test_primary_ip_quota_is_not_retried(self):
         """The exact text Hetzner returned when the project was full."""
         text = ('fatal: [localhost]: FAILED! => {"changed": false, "failure": '

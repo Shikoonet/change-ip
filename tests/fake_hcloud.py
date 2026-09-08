@@ -46,7 +46,9 @@ class FakeHcloud:
         location: str = "nbg1",
         old_ip: str = "46.224.67.245",
         stop_delay: int = 0,
+        primary_ip_limit: Optional[int] = None,
     ):
+        self.primary_ip_limit = primary_ip_limit
         self.server: Dict[str, Any] = {
             "id": server_id,
             "name": name,
@@ -215,6 +217,11 @@ class FakeHcloud:
         existing = next((ip for ip in self.ips.values() if ip["name"] == name), None)
         if existing is not None:
             return self._ok(dict(existing))
+        if self.primary_ip_limit is not None and sum(
+                1 for ip in self.ips.values() if ip["type"] == "ipv4") >= self.primary_ip_limit:
+            # the exact shape Hetzner returned on 2026-09-08: unassigned
+            # leftovers count, so a full project cannot allocate at all
+            return self._err("Primary IP limit exceeded (resource_limit_exceeded)", "quota")
         new_id = self._next_ip_id
         self._next_ip_id += 1
         self._next_octet += 1

@@ -57,8 +57,10 @@ content scan، token per account) اثبات شده. مسیر **PATCH** — `app
   خوانده می‌شود؛ کانفیگ `keep` با exit 0 و بدون حذف رد می‌شود.
 - **آدرس نگه‌داشته‌شده سهمیه می‌خورد.** `primary_ip_limit` هتزنر آدرس‌های وصل‌نشده را هم
   می‌شمارد؛ ۲۰۲۶-۰۹-۰۸ `allocate` با `resource_limit_exceeded` رد شد چون سه آدرس قدیمی
-  مانده بود. `classify_failure` آن را non-retryable می‌کند — قبل از چرخش بعدی
-  `release-old-ip` با `all-unassigned` را بزن، نه retry.
+  مانده بود. `classify_failure` آن را `quota` می‌کند (non-retryable) و `_step_allocate` زیر
+  `retention: release` خودش همه‌ی IPv4های وصل‌نشده را آزاد می‌کند و یک بار دیگر allocate
+  می‌زند — **پیش از** آنکه باکس لمس شود. هیچ‌چیز برای آزادکردن نبود؟ رد با «limit را در
+  هتزنر بالا ببر». زیر `keep` هیچ‌چیز آزاد نمی‌شود و همان رد را می‌گیری.
 - **بعد از release، rollback به آدرس قبلی وجود ندارد.** این هزینه‌ای است که اپراتور پذیرفت.
 
 سرور و رکورد DNS همچنان هرگز حذف نمی‌شوند.
