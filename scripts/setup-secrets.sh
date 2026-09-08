@@ -35,6 +35,40 @@
 set -euo pipefail
 
 REPO="${REPO:-Shikoonet/change-ip}"
+
+# ---- running inside GitHub Actions ---------------------------------------
+# The operator asked for this to live on CI and never be typed again. Every
+# input it needs is already a secret there, so on a runner we materialise the
+# same files this script reads locally: the vault comes from a clone of
+# shikoonet, the password and key from env. Files land in a private temp dir
+# at 0600 and the runner is destroyed with them.
+#
+# The one thing CI cannot supply itself is the token that WRITES secrets:
+# GITHUB_TOKEN has no secrets:write scope and none can be granted. That is
+# `ADMIN_PAT`, added once through the GitHub web UI — no command, and never
+# again.
+_ci_tmp=""
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  _ci_tmp="$(mktemp -d)"; chmod 700 "$_ci_tmp"
+  if [[ -n "${ANSIBLE_VAULT_PASSWORD:-}" ]]; then
+    printf '%s' "$ANSIBLE_VAULT_PASSWORD" > "$_ci_tmp/vault_pass"
+    chmod 600 "$_ci_tmp/vault_pass"; VAULT_PASS_FILE="$_ci_tmp/vault_pass"
+  fi
+  if [[ -n "${SSH_PRIVATE_KEY:-}" ]]; then
+    printf '%s\n' "$SSH_PRIVATE_KEY" > "$_ci_tmp/ssh_key"
+    chmod 600 "$_ci_tmp/ssh_key"; SSH_KEY_FILE="$_ci_tmp/ssh_key"
+  fi
+  if [[ -n "${ROTATION_CONFIG:-}" ]]; then
+    printf '%s' "$ROTATION_CONFIG" > "$_ci_tmp/rotation.yml"
+    chmod 600 "$_ci_tmp/rotation.yml"; ROTATION_CONFIG_FILE="$_ci_tmp/rotation.yml"
+  fi
+  if [[ -n "${SHIKOONET_REPO:-}" && ! -d "${SHIKOONET_DIR:-/nonexistent}" ]]; then
+    git clone --depth 1 --quiet "$SHIKOONET_REPO" "$_ci_tmp/shikoonet" \
+      && SHIKOONET_DIR="$_ci_tmp/shikoonet"
+  fi
+  trap 'rm -rf "$_ci_tmp"' EXIT
+fi
+
 SHIKOONET_DIR="${SHIKOONET_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/shikoonet-ansible}"
 VAULT_FILE="${VAULT_FILE:-$SHIKOONET_DIR/vault.yml}"
 VAULT_PASS_FILE="${VAULT_PASS_FILE:-$HOME/.vault_pass_pasarguard}"
@@ -209,8 +243,11 @@ if [[ "$problems" != "0" && "$DRY" == "0" ]]; then
 fi
 
 head_ "provider tokens"
-# Several candidate names: vault.example.yml says hcloud_api_token, the real
-# vault need not agree, and `--keys` prints what it actually holds.
+# The shikoonet vault does NOT hold a Hetzner token — `--keys` on 2026-09-08
+# listed nine keys and none of them was one. HCLOUD_TOKEN was installed
+# directly on both environments on 2026-08-27 and is the source of truth for
+# itself. The candidate list stays so a vault that later grows the key is
+# picked up; until then this reports [keep], which is the honest answer.
 for env in hetzner-plan hetzner-production; do
   set_secret HCLOUD_TOKEN "$env" vault_get \
     hcloud_api_token hetzner_api_token hcloud_token \

@@ -141,6 +141,28 @@
           here would let a code push reach a mutation job.
         quiet: true
 
+    # bootstrap.yml can rewrite every secret in the repo, so the same rule
+    # binds it. A push trigger there would mean merging a branch is enough to
+    # overwrite credentials — a worse outcome than reaching a rotation job.
+    - name: "structural | read bootstrap.yml"
+      ansible.builtin.set_fact:
+        _boot_yml: "{{ lookup('file', _proj ~ '/.github/workflows/bootstrap.yml') | from_yaml }}"
+
+    - name: "structural | assert bootstrap.yml only triggers on workflow_dispatch"
+      vars:
+        _boot_triggers: "{{ (_boot_yml['on'] if 'on' in _boot_yml else _boot_yml[True]) }}"
+      ansible.builtin.assert:
+        that:
+          - _boot_triggers.workflow_dispatch is defined
+          - _boot_triggers.push is not defined
+          - _boot_triggers.pull_request is not defined
+          - _boot_yml.jobs.bootstrap.environment is defined
+        fail_msg: >-
+          bootstrap.yml installs secrets and reviewers. It must be dispatch-only
+          and sit behind a protected environment; a push trigger or a missing
+          environment would let a merge rewrite every credential in the repo.
+        quiet: true
+
     # ---- 4. rotation.example.yml MUST exist and parse as YAML ----------
     - name: "structural | rotation.example.yml parses as YAML"
       ansible.builtin.set_fact:

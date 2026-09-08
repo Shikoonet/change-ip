@@ -1,0 +1,96 @@
+---
+# =============================================================================
+# bootstrap — bring this repo's Actions configuration to the state a live
+# rotation needs, FROM GITHUB. Nothing is typed on anyone's laptop.
+#
+# It runs scripts/setup-secrets.sh on a runner: creates any missing
+# environment, installs the required reviewers, and re-syncs the secrets whose
+# values live in the shikoonet Ansible vault. The same script runs locally;
+# there is one implementation, not a copy that drifts.
+#
+# ⚠ THE ONE THING THAT CANNOT BE AUTOMATED
+#
+# `GITHUB_TOKEN` has no `secrets:write` scope and none can be granted, so no
+# workflow can install a secret — including this one. It needs a Personal
+# Access Token with `repo` scope, stored as the secret `ADMIN_PAT`.
+#
+# Add ADMIN_PAT once, through the GitHub web UI:
+#   Settings → Environments → hetzner-production → Add environment secret
+# That is a form, not a command, and it is the last manual act. Every secret
+# after it is installed by this workflow.
+#
+# Run with `mode: report` first. It writes nothing and prints what it would do.
+# =============================================================================
+name: bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'report = show what would change, nothing written. apply = do it.'
+        required: true
+        type: choice
+        default: report
+        options:
+          - report
+          - apply
+
+# Read-only for the default token. The PAT below is what writes, and only
+# where the script uses it.
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: configure environments, reviewers and secrets
+    runs-on: ubuntu-latest
+    # Gated: this job can rewrite every secret in the repo. It sits behind the
+    # same reviewer as a rotation, for the same reason.
+    environment: hetzner-production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - name: Install ansible-core (for ansible-vault)
+        run: pip install --quiet --disable-pip-version-check ansible-core pyyaml
+
+      - name: Refuse without ADMIN_PAT, and say why
+        env:
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
+        run: |
+          if [ -z "$ADMIN_PAT" ]; then
+            echo "ADMIN_PAT is not set on this environment."
+            echo
+            echo "GITHUB_TOKEN cannot write Actions secrets — the scope does not"
+            echo "exist for it — so this workflow needs a PAT with 'repo' scope."
+            echo "Add it once at:"
+            echo "  Settings -> Environments -> hetzner-production -> Add secret"
+            echo "  name: ADMIN_PAT"
+            echo
+            echo "That is the only manual step, and it is a web form."
+            exit 1
+          fi
+          echo "ADMIN_PAT present."
+
+      - name: Run the bootstrap
+        env:
+          # The PAT is what gh authenticates with. It is scoped to this step.
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          REPO: ${{ github.repository }}
+          # Sources the script materialises into files on the runner. All are
+          # already secrets here; none is echoed by the script.
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
+          ROTATION_CONFIG: ${{ secrets.ROTATION_CONFIG }}
+          # Reviewer to install on any environment that lacks one. Defaults to
+          # the PAT's own identity, which is the operator.
+          REVIEWER_ID: ${{ vars.REVIEWER_ID }}
+        run: |
+          set -e
+          if [ "${{ inputs.mode }}" = "report" ]; then
+            bash scripts/setup-secrets.sh --dry
+          else
+            bash scripts/setup-secrets.sh
+          fi
