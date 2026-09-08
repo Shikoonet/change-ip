@@ -26,23 +26,24 @@ name: bootstrap
 on:
   workflow_dispatch:
     inputs:
+      # ONE dropdown, not a dropdown plus a checkbox. The checkbox arrived as
+      # false twice while the operator believed it was ticked, and there is no
+      # way to tell "not ticked" from "not delivered" after the fact. A choice
+      # you must make cannot be a choice you missed.
       mode:
-        description: 'report = show what would change, nothing written. apply = do it.'
+        description: >
+          report = show what would change, write nothing.
+          apply = install everything, refuse if the Hetzner token no longer
+          matches the pinned project.
+          apply-and-repin = also accept the new token's fingerprint (only when
+          it points at the SAME Hetzner project).
         required: true
         type: choice
         default: report
         options:
           - report
           - apply
-      repin_fingerprint:
-        description: >
-          Only if you rotated the Hetzner token. Re-pins project_fingerprint in
-          ROTATION_CONFIG to the token now installed. Say yes only when you
-          know the new token points at the SAME project — the pin exists so a
-          production rotation cannot be resumed with a staging token.
-        required: false
-        type: boolean
-        default: false
+          - apply-and-repin
 
 # Read-only for the default token. The PAT below is what writes, and only
 # where the script uses it.
@@ -123,16 +124,22 @@ jobs:
           # Only to fingerprint it — sha256(token)[:12]. The value is never
           # printed and never leaves the runner.
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          # Passed straight through as "true"/"false". The `cond && 'a' || 'b'`
-          # shape this repo forbids is avoided rather than argued about.
-          REPIN: ${{ inputs.repin_fingerprint }}
           # Reviewer to install on any environment that lacks one. Defaults to
           # the PAT's own identity, which is the operator.
           REVIEWER_ID: ${{ vars.REVIEWER_ID }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -e
-          if [ "${{ inputs.mode }}" = "report" ]; then
-            bash scripts/setup-secrets.sh --dry
-          else
-            bash scripts/setup-secrets.sh
-          fi
+          # Derived from the one dropdown, in the shell, where it can be
+          # printed. The previous version read a separate boolean input that
+          # arrived false twice while the operator believed it was set — and
+          # nothing in the log distinguished "not ticked" from "not delivered".
+          echo "mode = '$MODE'"
+          case "$MODE" in
+            report)          exec bash scripts/setup-secrets.sh --dry ;;
+            apply)           export REPIN=false ;;
+            apply-and-repin) export REPIN=true  ;;
+            *) echo "unknown mode '$MODE'" >&2; exit 2 ;;
+          esac
+          echo "REPIN = '$REPIN'"
+          bash scripts/setup-secrets.sh
