@@ -379,10 +379,21 @@ class WorkflowStructureTests(unittest.TestCase):
         # post-pause step (checkpoint mode) and the release_old_ip job
         # (by-address mode). Both sit on hetzner-production behind its
         # reviewer. Anywhere else is a new, unreviewed path to a delete.
+        # Three callers: swap (provider-only, after the pause), dns (change-ip,
+        # after `done`), and release_old_ip (by address). All on
+        # hetzner-production. The dns one must be gated on the inventory gate
+        # AND on the resume step having succeeded — a rotation that stopped
+        # short keeps its way back.
         callers = sorted({jn for jn, j in self.jobs.items()
                           for s in (j.get("steps") or [])
                           if "release-old-ip" in (s.get("run") or "")})
-        self.assertEqual(callers, ["release_old_ip", "swap"], callers)
+        self.assertEqual(callers, ["dns", "release_old_ip", "swap"], callers)
+        dns_rel = [s for s in self.jobs["dns"]["steps"]
+                   if "Release the old address" in s.get("name", "")]
+        self.assertEqual(len(dns_rel), 1)
+        self.assertIn("steps.in_scope.outputs.in_scope == 'true'", dns_rel[0]["if"])
+        self.assertIn("success()", dns_rel[0]["if"])
+        self.assertIn("--txid", dns_rel[0]["run"])
         for jn in callers:
             self.assertEqual(self.jobs[jn].get("environment"), "hetzner-production",
                              f"{jn} must sit behind hetzner-production's reviewer")

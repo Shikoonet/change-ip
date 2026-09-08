@@ -699,6 +699,24 @@ jobs:
             --label "dns.hcloud_resume" \
             -- python3 rotate.py resume --config rotation.yml \
               --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
+      # The change-ip release. Same guards as the provider-only one, but the
+      # finish line here is `done`: rotate.py refuses unless the checkpoint is
+      # done, the server is re-read on the new address, and the old Primary IP
+      # is re-read as the same address attached to nothing. Runs only if the
+      # resume step succeeded (the `if:` on the step outcome), so a rotation
+      # that stopped short never loses its way back. Same job, same reviewer.
+      - name: Release the old address (retention=release, change-ip)
+        if: steps.in_scope.outputs.in_scope == 'true' && success()
+        run: |
+          set -e
+          retention=$(python3 -c "import yaml;print((yaml.safe_load(open('rotation.yml')).get('old_ip') or {}).get('retention','keep'))")
+          echo "old_ip.retention = $retention"
+          if [ "$retention" != "release" ]; then
+            echo "keep: the old address stays retained. Nothing deleted."
+            exit 0
+          fi
+          python3 rotate.py release-old-ip --config rotation.yml \
+            --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state-final, path: state/, retention-days: 3}
