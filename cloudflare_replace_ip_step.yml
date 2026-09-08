@@ -147,12 +147,31 @@
           are split into separate ansible-playbook calls.
         quiet: true
 
+    # `scan_only` is a DECLARED intent, not a degenerate case of zero. A
+    # rotation can never set it: validate_config refuses an empty
+    # cloudflare.allowed_records, and rotate.py never passes this var. It
+    # exists for one question a human asks by hand — "what still points at
+    # this address?" — after a provider-only run, or before releasing an
+    # address. It relaxes the FLOOR only; it cannot make apply or rollback
+    # touch anything, because those work from the manifest and never re-run
+    # discovery.
+    - name: "cloudflare | scan_only is discover-only and must be a real boolean"
+      ansible.builtin.assert:
+        that:
+          - (scan_only | default(false)) | bool == false or operation == 'discover'
+        fail_msg: >-
+          scan_only is only meaningful for `discover`. apply, rollback and
+          verify read the manifest that discover already wrote; there is no
+          floor left for them to relax.
+        quiet: true
+
     - name: "cloudflare | only A records are in scope"
       ansible.builtin.assert:
         that:
           - expected_count | int >= 1
         fail_msg: "expected_count must be a positive integer (allow-list zero is a stop, not a pass)."
         quiet: true
+      when: not ((scan_only | default(false)) | bool)
 
     # --------------------------------------------------------------- API base
     # TWO-MODE CONTRACT — production vs test, NO shared default URL.
@@ -543,6 +562,10 @@
         - name: "cloudflare | discover | assert expected count"
           ansible.builtin.assert:
             that:
+              # scan_only has no floor by construction: the caller is asking
+              # what exists, not asserting what must exist. Both clauses are
+              # vacuous with an empty allowlist anyway; the `when` below keeps
+              # the task from reading as if a floor were being checked.
               - (_manifest | length) >= (expected_count | int)
               - ((allowed_records | from_json | map('lower') | reject('in',
                    (_manifest | map(attribute='name') | map('lower') | list))
@@ -561,7 +584,9 @@
               expected and intended — they are A records that point at
               old_ip and were never listed in the config.
             quiet: true
-          when: operation == 'discover'
+          when:
+            - operation == 'discover'
+            - not ((scan_only | default(false)) | bool)
 
         - name: "cloudflare | discover | write the result"
           ansible.builtin.copy:

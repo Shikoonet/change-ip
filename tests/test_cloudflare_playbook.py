@@ -307,6 +307,7 @@ def _run_playbook(base: str, *, op: str, old_ip: str, new_ip: str,
 def _run_playbook_full(base: str, *, op: str, old_ip: str, new_ip: str,
                         allowed: List[str], manifest: Optional[List[Dict[str, Any]]] = None,
                         env_extra: Optional[Dict[str, str]] = None,
+                        scan_only: bool = False,
                         verbose: bool = False) -> Tuple[int, str, str, Dict[str, Any]]:
     with tempfile.NamedTemporaryFile(prefix="cf_result_", suffix=".json", delete=False) as out:
         result_path = out.name
@@ -339,6 +340,8 @@ def _run_playbook_full(base: str, *, op: str, old_ip: str, new_ip: str,
             "-e", f"manifest='{json.dumps(manifest or [])}'",
             "-e", "invocation_id=11111111-1111-1111-1111-111111111111",
         ]
+        if scan_only:
+            args += ["-e", "scan_only=true"]
         cp = subprocess.run(
             args, capture_output=True, text=True, timeout=120, check=False, env=env,
         )
@@ -568,6 +571,56 @@ class TestCloudflarePlaybook(unittest.TestCase):
         # and it must name the record it could not find, or the operator is
         # left diffing a config against a zone by hand.
         self.assertIn(ALLOWLIST_8[-1], stdout + stderr)
+
+    def test_pure_content_scan_with_an_empty_allowlist(self):
+        """Empty allowlist = no floor = "show me everything on this address".
+
+        This is the shape the `dns-scan` workflow operation uses to answer
+        "what still points at the address we just rotated off?". A rotation
+        can never reach it — validate_config refuses an empty
+        cloudflare.allowed_records — so it is only reachable by a human
+        invoking the playbook deliberately.
+        """
+        zr = _zone_records_for(ALLOWLIST_8)
+        pages = _records_pages_one(zr, ALLOWLIST_8)
+        # one record on a DIFFERENT address, to prove the filter filters
+        other = {"id": "rec-other", "name": "elsewhere.tinooer.top",
+                 "type": "A", "content": "9.9.9.9", "ttl": 300, "proxied": False}
+        zr = zr + [("zone-tinooer.top", other)]
+        pages[("zone-tinooer.top", other["name"])] = [[other]]
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(ALLOWLIST_8)],
+                          records_pages=pages)
+
+        rc, stdout, stderr, result = _run_playbook_full(
+            self.base, op="discover", old_ip="1.1.1.1", new_ip="1.1.1.1",
+            allowed=[], scan_only=True, verbose=True)
+        if rc != 0:
+            print("STDOUT:", stdout[-2500:])
+            print("STDERR:", stderr[-1500:])
+        self.assertEqual(rc, 0)
+        names = sorted(r["name"] for r in result["manifest"])
+        self.assertEqual(names, sorted(ALLOWLIST_8))
+        self.assertNotIn("elsewhere.tinooer.top", names)
+
+    def test_scan_only_cannot_be_smuggled_into_apply(self):
+        """scan_only relaxes a discover-time floor. Nothing else.
+
+        If it were accepted on apply it would read like a flag that widens
+        what apply may touch. It does not — apply works from the manifest —
+        but a flag that LOOKS like it grants permission is how the next
+        person reasons wrongly under pressure. Refuse it at the door.
+        """
+        zr = self._seed(ALLOWLIST_8)
+        rc, _, _, discovered = _run_playbook_full(
+            self.base, op="discover", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8)
+        self.assertEqual(rc, 0)
+        rc, stdout, stderr, _ = _run_playbook_full(
+            self.base, op="apply", old_ip="1.1.1.1", new_ip="2.2.2.2",
+            allowed=ALLOWLIST_8, manifest=discovered["manifest"],
+            scan_only=True)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("scan_only", stdout + stderr)
 
     def test_discover_more_than_50_zones(self):
         """Seed 60 zones across 2 pages; the playbook must walk both.

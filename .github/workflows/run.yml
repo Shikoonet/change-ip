@@ -91,6 +91,7 @@ on:
           - plan
           - change-ip
           - provider-only
+          - dns-scan
           - rollback
           - finalize
       provider:
@@ -105,7 +106,7 @@ on:
         description: 'Hetzner server id OR DataForest Seed UUID. Must equal server.id in the config.'
         required: true
       server_ip:
-        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip.'
+        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip. dns-scan: the address to SEARCH DNS for — it does not have to be a current address, and that is the point.'
         required: true
 
 concurrency:
@@ -585,6 +586,118 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state-final, path: state/, retention-days: 3}
+
+  # 3'. dns-scan — READ-ONLY. "What in DNS still points at this address?"
+  #
+  #      The question that had no tool. After a provider-only rotation the
+  #      box has moved and DNS has not; before releasing a Primary IP you
+  #      need to know nothing still resolves to it, because Hetzner can hand
+  #      a released address to another customer. Guessing is not an answer
+  #      and neither is a `dig` of the names you happen to remember.
+  #
+  #      `discover` with `scan_only=true` and an empty allow-list: no floor,
+  #      no PATCH, no manifest consumed. It asks each zone the token can see
+  #      for A records whose content is the address, and writes the list.
+  #      Both accounts are scanned in separate steps so each token only ever
+  #      sees its own zones.
+  #
+  #      This job CANNOT change DNS. The playbook's only mutating verb is
+  #      PATCH, reached from `apply` and `rollback`; `discover` is GET-only.
+  dns_scan:
+    name: DNS scan · what still points at an address (read-only)
+    if: inputs.operation == 'dns-scan'
+    runs-on: ubuntu-latest
+    environment: cloudflare-production
+    timeout-minutes: 15
+    env:
+      SEARCH_IP: ${{ inputs.server_ip }}
+    steps:
+      - uses: actions/checkout@v4
+      # No expect_ipv4 here, deliberately. A scan asks about an address the
+      # config may no longer name — after a rotation, the interesting address
+      # is precisely the one the config has stopped pointing at.
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+      - name: Scan account A
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+        run: |
+          set -e
+          # Extra vars via a JSON file, not -e key=value: the allow-list and
+          # manifest are JSON strings and ansible's -e parser splits unquoted
+          # values on commas. A file has no quoting to get wrong.
+          python3 - <<'PY' > /tmp/ev-a.json
+          import json, os
+          print(json.dumps({
+              "operation": "discover",
+              "scan_only": True,
+              "invocation_id": "dns-scan-a-" + os.environ["GITHUB_RUN_ID"],
+              "result_file": "/tmp/scan-account-a.json",
+              "old_ip": os.environ["SEARCH_IP"],
+              "new_ip": os.environ["SEARCH_IP"],
+              "allowed_records": "[]",
+              "expected_count": 0,
+              "manifest": "[]",
+          }))
+          PY
+          ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-a.json
+        # SEARCH_IP is read from the env, never interpolated into the shell.
+      - name: Scan account B
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+        run: |
+          set -e
+          python3 - <<'PY' > /tmp/ev-b.json
+          import json, os
+          print(json.dumps({
+              "operation": "discover",
+              "scan_only": True,
+              "invocation_id": "dns-scan-b-" + os.environ["GITHUB_RUN_ID"],
+              "result_file": "/tmp/scan-account-b.json",
+              "old_ip": os.environ["SEARCH_IP"],
+              "new_ip": os.environ["SEARCH_IP"],
+              "allowed_records": "[]",
+              "expected_count": 0,
+              "manifest": "[]",
+          }))
+          PY
+          ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-b.json
+      - name: What points at it
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          ip = os.environ["SEARCH_IP"]
+          rows = []
+          for acct, path in (("A", "/tmp/scan-account-a.json"),
+                             ("B", "/tmp/scan-account-b.json")):
+              try:
+                  with open(path) as fh:
+                      for r in json.load(fh).get("manifest", []):
+                          rows.append((acct, r["name"], r["zone_name"]))
+              except (OSError, ValueError):
+                  print(f"- account {acct}: no result file (the scan step failed)")
+          print(f"### DNS records pointing at `{ip}`\n")
+          if rows:
+              print("| account | record | zone |")
+              print("|---|---|---|")
+              for a, n, z in sorted(rows):
+                  print(f"| {a} | `{n}` | {z} |")
+              print(f"\n**{len(rows)} record(s).** Releasing this address "
+                    "while these exist points them at whoever Hetzner gives "
+                    "it to next.")
+          else:
+              print("Nothing. No A record in either account resolves to this "
+                    "address, so releasing it strands nothing.")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dns-scan
+          path: /tmp/scan-account-*.json
+          retention-days: 7
+          if-no-files-found: warn
 
   # 4. verify — the checkpoint says done, and says so on its own terms.
   # verify is gated on (a) operation == change-ip (NOT provider-only, NOT

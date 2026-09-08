@@ -241,6 +241,27 @@ class WorkflowStructureTests(unittest.TestCase):
                     "would leak into the provider path",
             )
 
+    def test_dns_scan_is_read_only(self):
+        """dns_scan carries two Cloudflare tokens. It must never mutate.
+
+        The playbook's only mutating verb is PATCH, reached from `apply` and
+        `rollback`. This job may therefore invoke `discover` and nothing
+        else. The check is on the job's own steps, not on the playbook: a
+        future edit that adds `operation=apply` here would hand a reviewer-
+        gated production token to a write path that nobody reviewed.
+        """
+        job = self.jobs.get("dns_scan")
+        self.assertIsNotNone(job, "dns_scan job is missing")
+        body = " ".join(st.get("run", "") for st in job["steps"])
+        self.assertIn('"operation": "discover"', body)
+        for mutating in ('"operation": "apply"', '"operation": "rollback"',
+                         "operation=apply", "operation=rollback"):
+            self.assertNotIn(mutating, body,
+                             msg=f"dns_scan must stay read-only; found {mutating}")
+        # The tokens belong on the steps that call Cloudflare, never on the
+        # job, so nothing else in the job inherits them.
+        self.assertNotIn("CLOUDFLARE", " ".join(job.get("env", {}) or {}))
+
     # -- 6. No falsy-ternary token trick ------------------------------------
     def test_no_falsy_ternary_token_trick(self):
         """The empty-string ternary (`cond && '1' || ''`) is forbidden
