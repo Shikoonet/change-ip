@@ -433,6 +433,10 @@
           loop: "{{ _recs_p1.results | default([]) }}"
           loop_control:
             loop_var: _r
+            # Without a label Ansible prints the whole uri result per item:
+            # every record body, every response cookie, into the log of a
+            # PUBLIC repo. Run 34278767506 did exactly that.
+            label: "{{ _r.item.name | default('?') }}"
           when: operation == 'discover'
 
         # Deterministic lookups: one dict per (pair, page) with the
