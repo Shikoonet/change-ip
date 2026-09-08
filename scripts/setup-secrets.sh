@@ -351,9 +351,11 @@ yaml.safe_dump(d, open(p, "w"), sort_keys=False, default_flow_style=False)
 fi
 
 head_ "rotation config"
-# Carries NO expected_ipv4 on purpose: the address is stated per-run on the
-# dispatch form, so this file never goes stale and never needs re-uploading.
-for env in hetzner-plan hetzner-production; do
+# Every environment whose jobs run the setup action needs this, and that list
+# is NOT hand-maintained here — it is read out of run.yml below. The hand
+# list said hetzner-plan and hetzner-production; dns_scan sits on
+# cloudflare-production and died with "ROTATION_CONFIG secret is empty".
+for env in hetzner-plan hetzner-production cloudflare-production dataforest-production; do
   set_secret ROTATION_CONFIG "$env" emit_file "$ROTATION_CONFIG_FILE"
 done
 
@@ -362,7 +364,7 @@ head_ "cloudflare tokens"
 # `dns` job sits on hetzner-production and cannot read cloudflare-production,
 # so the same values are needed in both places; a job has exactly one
 # environment and this half needs a Hetzner token in the same process.
-for env in cloudflare-production hetzner-production; do
+for env in cloudflare-production hetzner-production dataforest-production; do
   set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_A "$env" vault_get cloudflare_miragerunner_api_token
   set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_B "$env" vault_get cloudflare_samsos_api_token
 done
@@ -384,6 +386,60 @@ for env in hetzner-production cloudflare-production; do
     problems=$((problems+1))
   fi
 done
+
+head_ "coverage (what run.yml asks for, per environment)"
+# The lists above are written by hand and drifted: ROTATION_CONFIG was
+# installed on two environments while dns_scan, on a third, needed it and
+# died with "ROTATION_CONFIG secret is empty" — after being dispatched.
+#
+# This reads the workflow instead of trusting the lists: for every job, its
+# `environment` and every `secrets.X` it references (job env, step env, and
+# anywhere in a run: block), then checks each pair is actually installed.
+# A missing pair is a dispatch that will fail, found before dispatching.
+_pairs=$(python3 - <<'PY'
+import re, sys, yaml
+try:
+    wf = yaml.safe_load(open(".github/workflows/run.yml"))
+except OSError:
+    sys.exit(0)
+seen = set()
+for name, job in (wf.get("jobs") or {}).items():
+    env_name = job.get("environment")
+    if not isinstance(env_name, str):
+        continue
+    blob = yaml.safe_dump(job)
+    for secret in sorted(set(re.findall(r"secrets\.([A-Z0-9_]+)", blob))):
+        seen.add((env_name, secret))
+for env_name, secret in sorted(seen):
+    print(f"{env_name} {secret}")
+PY
+)
+_gap=0
+while read -r _env _sec; do
+  [[ -z "${_env:-}" ]] && continue
+  if secret_present "$_sec" "$_env"; then
+    :
+  elif [[ " CLOUDFLARE_API_TOKEN SHIKOONET_PAT DATAFOREST_API_TOKEN " == *" $_sec "* ]]; then
+    # Deliberately optional. The legacy single-account CF name is unused when
+    # cloudflare.accounts is set, SHIKOONET_PAT falls back to ADMIN_PAT, and
+    # DataForest is a provider this operator does not run. An absent secret
+    # expands to an empty string, which each of these paths already handles.
+    say "[opt]   $_sec absent on $_env (optional on this path)"
+  else
+    say "[GAP]   $_sec is referenced by a job on $_env but is not installed there"
+    _gap=$((_gap+1))
+  fi
+done <<< "$_pairs"
+if [[ "$_gap" == "0" ]]; then
+  say "[ok]    every secret run.yml references exists in the environment that needs it"
+  ok=$((ok+1))
+else
+  say ""
+  say "        $_gap gap(s). Each is a dispatch that would fail partway."
+  say "        Optional ones (SHIKOONET_PAT, legacy CLOUDFLARE_API_TOKEN) are"
+  say "        listed too — a job referencing an absent secret gets an empty"
+  say "        string, which is only safe where the code expects that."
+fi
 
 head_ "summary"
 say "ok=$ok  changed=$fixed  pending=$skipped  problems=$problems"
