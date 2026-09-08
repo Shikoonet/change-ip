@@ -101,6 +101,30 @@ SSH_KEY_FILE="${SSH_KEY_FILE:-$(_default_ssh_key)}"
 SHIKOONET_URL="${SHIKOONET_URL:-$(git -C "$SHIKOONET_DIR" remote get-url origin 2>/dev/null || echo '')}"
 ROTATION_CONFIG_FILE="${ROTATION_CONFIG_FILE:-$(cd "$(dirname "$0")/.." && pwd)/rotation.yml}"
 
+# Which provider this config drives decides which environments matter. The
+# coverage check already skipped jobs gated on the other provider; the install
+# loops did not, and kept trying to put Cloudflare tokens on
+# dataforest-production for an operator who runs hcloud — failing there on
+# every CI run, where the vault is unreachable. One decision, made once.
+PROVIDER=$(python3 -c '
+import sys, yaml
+try:
+    print((yaml.safe_load(open(sys.argv[1])) or {}).get("provider") or "hcloud")
+except Exception:
+    print("hcloud")
+' "$ROTATION_CONFIG_FILE" 2>/dev/null || echo hcloud)
+if [[ "$PROVIDER" == "dataforest" ]]; then
+  PROVIDER_ENVS="dataforest-production"       # provider token + config
+  PROD_ENV="dataforest-production"            # where the DNS half runs
+else
+  PROVIDER_ENVS="hetzner-plan hetzner-production"
+  PROD_ENV="hetzner-production"
+fi
+# The DNS half (Cloudflare tokens, SSH, vault, shikoonet URL) runs on
+# cloudflare-production and on the active provider's production env — never
+# on a plan env, which is read-only and never reaches DNS.
+DNS_ENVS="cloudflare-production $PROD_ENV"
+
 DRY=0; KEYS_ONLY=0
 case "${1:-}" in
   --dry)  DRY=1 ;;
@@ -295,7 +319,7 @@ head_ "provider tokens"
 # directly on both environments on 2026-08-27 and is the source of truth for
 # itself. The candidate list stays so a vault that later grows the key is
 # picked up; until then this reports [keep], which is the honest answer.
-for env in hetzner-plan hetzner-production; do
+for env in $PROVIDER_ENVS; do
   set_secret HCLOUD_TOKEN "$env" vault_get \
     hcloud_api_token hetzner_api_token hcloud_token \
     hetzner_cloud_api_token hcloud_api_key hetzner_token
@@ -355,7 +379,7 @@ head_ "rotation config"
 # is NOT hand-maintained here — it is read out of run.yml below. The hand
 # list said hetzner-plan and hetzner-production; dns_scan sits on
 # cloudflare-production and died with "ROTATION_CONFIG secret is empty".
-for env in hetzner-plan hetzner-production cloudflare-production dataforest-production; do
+for env in $PROVIDER_ENVS cloudflare-production; do
   set_secret ROTATION_CONFIG "$env" emit_file "$ROTATION_CONFIG_FILE"
 done
 
@@ -364,13 +388,13 @@ head_ "cloudflare tokens"
 # `dns` job sits on hetzner-production and cannot read cloudflare-production,
 # so the same values are needed in both places; a job has exactly one
 # environment and this half needs a Hetzner token in the same process.
-for env in cloudflare-production hetzner-production dataforest-production; do
+for env in $DNS_ENVS; do
   set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_A "$env" vault_get cloudflare_miragerunner_api_token
   set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_B "$env" vault_get cloudflare_samsos_api_token
 done
 
 head_ "shikoonet access (the inventory half)"
-for env in hetzner-production cloudflare-production; do
+for env in $DNS_ENVS; do
   set_secret SSH_PRIVATE_KEY        "$env" emit_file "$SSH_KEY_FILE"
   set_secret ANSIBLE_VAULT_PASSWORD "$env" emit_file "$VAULT_PASS_FILE"
   # Only when a URL was actually discovered. On a runner with no checkout
