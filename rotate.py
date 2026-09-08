@@ -849,6 +849,13 @@ def classify_failure(text: str) -> str:
         return "auth"
     if any(marker in low for marker in ("not found", "404", "no primary ip matched")):
         return "not_found"
+    # A quota is not weather. "Primary IP limit exceeded" was retried three
+    # times on 2026-09-08 and reported as "transient" — thirty seconds of
+    # pointless retries on a live run, and a message that sent the operator
+    # looking for flakiness instead of at the retained addresses filling the
+    # project. Nothing about a limit changes between attempts.
+    if any(marker in low for marker in ("resource_limit_exceeded", "limit exceeded")):
+        return "validation"
     return "retryable"
 
 
@@ -1083,6 +1090,24 @@ class Rotation:
             )
         address = str(address).strip()
         seen = self.with_retries("list_ips", self.provider.list_ips)
+        if address == "all-unassigned":
+            # Every IPv4 Primary IP in the project that is attached to nothing.
+            # Same guard as the single-address path, applied to each; the
+            # server's own address can never be in this set. Exists because
+            # retained addresses filled the project's Primary IP quota and
+            # `allocate` started failing — three leftovers, three dispatches
+            # and three approvals was the alternative.
+            targets = [ip for ip in seen if ip.assignee_id is None]
+            if not targets:
+                self.out("no unassigned IPv4 Primary IP in the project; nothing to release")
+                return {"released": []}
+            done = []
+            for ip in targets:
+                self.with_retries("release", self.provider.release_ip, int(ip.id), ip.ip)
+                self.out(f"released {ip.ip} (Primary IP {ip.id})")
+                done.append({"id": ip.id, "ip": ip.ip})
+            self.out(f"released {len(done)} unassigned address(es). No rollback to them remains.")
+            return {"released": done}
         matches = [ip for ip in seen if ip.ip == address]
         if len(matches) != 1:
             # Say what IS there. "0 matches" alone leaves the operator unable to

@@ -275,6 +275,39 @@ class TestReleaseOldIp(Base):
             rot.release_orphan_ip("198.51.100.77")          # two ipv4 match
         self.assertIn(777, fake.ips)
 
+    def test_all_unassigned_releases_every_leftover_and_nothing_attached(self):
+        """One dispatch clears the quota; the server's own address is untouchable."""
+        fake, rot = self._orphan_world()
+        fake.ips[790] = dict(fake.ips[777], id=790, name="leftover-2", ip="198.51.100.90")
+        attached_before = {i for i, ip in fake.ips.items() if ip["assignee_id"] is not None}
+        out = rot.release_orphan_ip("all-unassigned")
+        self.assertEqual(sorted(r["ip"] for r in out["released"]),
+                         ["198.51.100.77", "198.51.100.90"])
+        self.assertNotIn(777, fake.ips)
+        self.assertNotIn(790, fake.ips)
+        # everything that was attached — the server's IPv4 and its IPv6 — remains
+        self.assertEqual({i for i, ip in fake.ips.items() if ip["assignee_id"] is not None},
+                         attached_before)
+        self.assertEqual(fake.server["ipv4_address"], "46.224.67.245")
+        # and running it again is a no-op, not an error
+        self.assertEqual(rot.release_orphan_ip("all-unassigned"), {"released": []})
+
+    def test_all_unassigned_refuses_under_keep(self):
+        fake, rot = self._orphan_world(retention="keep")
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.release_orphan_ip("all-unassigned")
+        self.assertIn(777, fake.ips)
+
+    def test_primary_ip_quota_is_not_retried(self):
+        """The exact text Hetzner returned when the project was full."""
+        text = ('fatal: [localhost]: FAILED! => {"changed": false, "failure": '
+                '{"code": "resource_limit_exceeded", "details": {"limits": '
+                '[{"name": "primary_ip_limit"}]}, "message": "Primary IP limit '
+                'exceeded"}, "msg": "Primary IP limit exceeded (resource_limit_exceeded, 471aa)"}')
+        self.assertNotEqual(rotate.classify_failure(text), "retryable")
+        # and a plain transient-looking failure is still retryable
+        self.assertEqual(rotate.classify_failure("connection reset by peer"), "retryable")
+
     def test_orphan_refuses_under_keep(self):
         fake, rot = self._orphan_world(retention="keep")
         with self.assertRaises(rotate.NonRetryableError):

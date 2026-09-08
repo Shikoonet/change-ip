@@ -975,7 +975,10 @@ jobs:
   # 3''. release-old-ip — delete ONE retained Primary IP, by address.
   #
   #      For addresses that predate release existing, or whose checkpoint
-  #      artifact has expired. `server_ip` is the address to delete. Guards,
+  #      artifact has expired. `server_ip` is the address to delete — or the
+  #      literal `all-unassigned` to delete EVERY IPv4 Primary IP in the
+  #      project that is attached to nothing (added when retained addresses
+  #      filled the project's Primary IP quota and allocate began failing). Guards,
   #      each from a fresh read: config must say old_ip.retention: release;
   #      the address must resolve to exactly one Primary IP in the project;
   #      it must be attached to NOTHING. The server's own current address can
