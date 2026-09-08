@@ -50,9 +50,15 @@ content scan، token per account) اثبات شده. مسیر **PATCH** — `app
   `provider_only`); سرور همین حالا روی آدرس نو باشد؛ آدرس قدیم هنوز همان آدرس باشد و
   assignee نداشته باشد؛ قبلاً آزاد نشده باشد. هر کدام از یک خواندن تازه، هر شکست یک رد است
   نه یک skip.
-- در `run.yml` فقط جاب `swap` (همان reviewer که swap را تأیید کرد) و فقط برای
-  `provider-only` آن را صدا می‌زند، و `retention` را از خود `rotation.yml` در زمان اجرا
-  می‌خواند. کانفیگ `keep` با exit 0 و بدون حذف رد می‌شود.
+- در `run.yml` سه جاب آن را صدا می‌زنند، هر سه زیر reviewer `hetzner-production`: `swap`
+  برای `provider-only`؛ `dns` بعد از `done` یا «DNS خارج از scope»؛ و `release_old_ip`
+  (`operation: release-old-ip`، `server_ip` = آدرس بی‌صاحب، یا `all-unassigned` برای
+  همه‌ی IPv4های وصل‌نشده در یک dispatch). `retention` در زمان اجرا از خود `rotation.yml`
+  خوانده می‌شود؛ کانفیگ `keep` با exit 0 و بدون حذف رد می‌شود.
+- **آدرس نگه‌داشته‌شده سهمیه می‌خورد.** `primary_ip_limit` هتزنر آدرس‌های وصل‌نشده را هم
+  می‌شمارد؛ ۲۰۲۶-۰۹-۰۸ `allocate` با `resource_limit_exceeded` رد شد چون سه آدرس قدیمی
+  مانده بود. `classify_failure` آن را non-retryable می‌کند — قبل از چرخش بعدی
+  `release-old-ip` با `all-unassigned` را بزن، نه retry.
 - **بعد از release، rollback به آدرس قبلی وجود ندارد.** این هزینه‌ای است که اپراتور پذیرفت.
 
 سرور و رکورد DNS همچنان هرگز حذف نمی‌شوند.
