@@ -34,6 +34,15 @@ on:
         options:
           - report
           - apply
+      repin_fingerprint:
+        description: >
+          Only if you rotated the Hetzner token. Re-pins project_fingerprint in
+          ROTATION_CONFIG to the token now installed. Say yes only when you
+          know the new token points at the SAME project — the pin exists so a
+          production rotation cannot be resumed with a staging token.
+        required: false
+        type: boolean
+        default: false
 
 # Read-only for the default token. The PAT below is what writes, and only
 # where the script uses it.
@@ -111,6 +120,12 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
           ROTATION_CONFIG: ${{ secrets.ROTATION_CONFIG }}
+          # Only to fingerprint it — sha256(token)[:12]. The value is never
+          # printed and never leaves the runner.
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          # Passed straight through as "true"/"false". The `cond && 'a' || 'b'`
+          # shape this repo forbids is avoided rather than argued about.
+          REPIN: ${{ inputs.repin_fingerprint }}
           # Reviewer to install on any environment that lacks one. Defaults to
           # the PAT's own identity, which is the operator.
           REVIEWER_ID: ${{ vars.REVIEWER_ID }}

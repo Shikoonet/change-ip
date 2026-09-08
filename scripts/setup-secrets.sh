@@ -301,6 +301,44 @@ for env in hetzner-plan hetzner-production; do
     hetzner_cloud_api_token hcloud_api_key hetzner_token
 done
 
+head_ "project fingerprint"
+# `project_fingerprint` pins the config to ONE Hetzner project: it is
+# sha256(HCLOUD_TOKEN)[:12], and every run asserts against it so a rotation
+# aimed at production cannot be resumed with a staging token. Rotating the
+# Hetzner token is a legitimate event that changes it — and the tool must not
+# absorb that silently, or the pin means nothing.
+#
+# So: always REPORT a mismatch, and only rewrite when REPIN=1 says a human
+# decided the new token is the right one. That keeps the guard while removing
+# the need to hand-edit a secret.
+if [[ -n "${HCLOUD_TOKEN:-}" && -r "$ROTATION_CONFIG_FILE" ]]; then
+  _live_fp=$(printf '%s' "$HCLOUD_TOKEN" | python3 -c '
+import hashlib, sys
+print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])')
+  _cfg_fp=$(python3 -c '
+import sys, yaml
+print((yaml.safe_load(open(sys.argv[1])) or {}).get("project_fingerprint") or "")
+' "$ROTATION_CONFIG_FILE")
+  if [[ "$_cfg_fp" == "$_live_fp" ]]; then
+    say "[ok]    config pins $_cfg_fp and the token agrees"; ok=$((ok+1))
+  elif [[ "${REPIN:-}" == "1" || "${REPIN:-}" == "true" ]]; then
+    python3 -c '
+import sys, yaml
+p, fp = sys.argv[1], sys.argv[2]
+d = yaml.safe_load(open(p)) or {}
+d["project_fingerprint"] = fp
+yaml.safe_dump(d, open(p, "w"), sort_keys=False, default_flow_style=False)
+' "$ROTATION_CONFIG_FILE" "$_live_fp"
+    say "[set]   re-pinned $_cfg_fp -> $_live_fp (REPIN was requested)"
+    fixed=$((fixed+1))
+  else
+    say "[MISS]  config pins ${_cfg_fp:-<empty>} but HCLOUD_TOKEN is $_live_fp"
+    say "        The Hetzner token changed. If that was intended, re-run with"
+    say "        REPIN=1 (workflow input: repin_fingerprint) to pin the new one."
+    problems=$((problems+1))
+  fi
+fi
+
 head_ "rotation config"
 # Carries NO expected_ipv4 on purpose: the address is stated per-run on the
 # dispatch form, so this file never goes stale and never needs re-uploading.
