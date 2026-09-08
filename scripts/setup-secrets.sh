@@ -333,8 +333,19 @@ yaml.safe_dump(d, open(p, "w"), sort_keys=False, default_flow_style=False)
     fixed=$((fixed+1))
   else
     say "[MISS]  config pins ${_cfg_fp:-<empty>} but HCLOUD_TOKEN is $_live_fp"
-    say "        The Hetzner token changed. If that was intended, re-run with"
-    say "        REPIN=1 (workflow input: repin_fingerprint) to pin the new one."
+    say "        The Hetzner token changed. Nothing is broken; this pin is what"
+    say "        stops a production rotation resuming with a staging token, so"
+    say "        it will not update itself."
+    say ""
+    # Say what arrived, not just what is wanted. "re-run with REPIN=1" reads
+    # like an instruction that was followed when the box simply was not ticked.
+    say "        REPIN is currently: '${REPIN:-<unset>}'"
+    say "        To accept the new token, dispatch bootstrap again with BOTH:"
+    say "            mode:              apply"
+    say "            repin_fingerprint: checked"
+    say "        Only do that if the new token points at the SAME Hetzner"
+    say "        project. If it points at a different one, this refusal is the"
+    say "        tool working."
     problems=$((problems+1))
   fi
 fi
