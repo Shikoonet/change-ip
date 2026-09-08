@@ -752,18 +752,40 @@ jobs:
         if: always()
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, sys
           ip = os.environ["SEARCH_IP"]
-          rows = []
+          rows, failed = [], []
           for acct, path in (("A", "/tmp/scan-account-a.json"),
                              ("B", "/tmp/scan-account-b.json")):
               try:
                   with open(path) as fh:
-                      for r in json.load(fh).get("manifest", []):
-                          rows.append((acct, r["name"], r["zone_name"]))
+                      res = json.load(fh)
               except (OSError, ValueError):
-                  print(f"- account {acct}: no result file (the scan step failed)")
+                  failed.append(acct)
+                  continue
+              # A result file that exists but says ok=false is a failed scan
+              # too, not an empty one.
+              if not res.get("ok", False):
+                  failed.append(acct)
+                  continue
+              for r in res.get("manifest", []):
+                  rows.append((acct, r["name"], r["zone_name"]))
           print(f"### DNS records pointing at `{ip}`\n")
+          if failed:
+              # A scan that did not run is NOT a scan that found nothing.
+              # This step once printed "Nothing ... releasing it strands
+              # nothing" after both scans had died on an empty token — a
+              # confident, wrong instruction to release an address. No
+              # conclusion is the only honest output here, and the job
+              # stays red so nobody reads green as "checked".
+              print(f"SCAN INCOMPLETE — account(s) {', '.join(failed)} did "
+                    "not produce a result. NOTHING can be concluded about "
+                    "this address. Do not release it on the strength of "
+                    "this run.")
+              if rows:
+                  print(f"\n(Partial: {len(rows)} record(s) seen in the "
+                        "account(s) that did run — a lower bound, not a list.)")
+              sys.exit(1)
           if rows:
               print("| account | record | zone |")
               print("|---|---|---|")
@@ -773,8 +795,8 @@ jobs:
                     "while these exist points them at whoever Hetzner gives "
                     "it to next.")
           else:
-              print("Nothing. No A record in either account resolves to this "
-                    "address, so releasing it strands nothing.")
+              print("Nothing. Both accounts scanned; no A record resolves to "
+                    "this address, so releasing it strands nothing.")
           PY
       - uses: actions/upload-artifact@v4
         if: always()

@@ -304,6 +304,55 @@ class WorkflowStructureTests(unittest.TestCase):
             "these steps clone shikoonet without an authenticated credential "
             f"helper: {offenders}"))
 
+    def test_dns_scan_summary_never_says_nothing_when_a_scan_did_not_run(self):
+        """A scan that did not happen is not a scan that found nothing.
+
+        With both account scans dead on an empty token, this step once printed
+        "Nothing ... releasing it strands nothing" — a confident instruction
+        to release an address, produced by a run that had checked nothing.
+        Missing or not-ok result files must yield no conclusion and a red job.
+        """
+        import os, re, subprocess, tempfile
+        import yaml as _yaml
+        wf = _yaml.safe_load(open(WORKFLOW))
+        step = [s for s in wf["jobs"]["dns_scan"]["steps"]
+                if s.get("name") == "What points at it"][0]
+        src = re.search(r"python3 - <<'PY'\n(.*?)\nPY", step["run"], re.S).group(1)
+        env = dict(os.environ, SEARCH_IP="203.0.113.9")
+
+        def run(files):
+            for p in ("/tmp/scan-account-a.json", "/tmp/scan-account-b.json"):
+                try:
+                    os.remove(p)
+                except FileNotFoundError:
+                    pass
+            for p, body in files.items():
+                with open(p, "w") as fh:
+                    fh.write(body)
+            cp = subprocess.run(["python3", "-"], input=src, capture_output=True,
+                                text=True, env=env, timeout=30)
+            return cp.returncode, cp.stdout
+
+        empty_ok = '{"ok": true, "manifest": []}'
+        # neither scan ran
+        rc, out = run({})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("SCAN INCOMPLETE", out)
+        self.assertNotIn("strands nothing", out)
+        # one ran, one did not — still no conclusion
+        rc, out = run({"/tmp/scan-account-a.json": empty_ok})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("SCAN INCOMPLETE", out)
+        # a result file that says ok=false is a failure, not an empty scan
+        rc, out = run({"/tmp/scan-account-a.json": empty_ok,
+                       "/tmp/scan-account-b.json": '{"ok": false}'})
+        self.assertNotEqual(rc, 0)
+        # only when BOTH ran and BOTH are empty may it say Nothing
+        rc, out = run({"/tmp/scan-account-a.json": empty_ok,
+                       "/tmp/scan-account-b.json": empty_ok})
+        self.assertEqual(rc, 0)
+        self.assertIn("Nothing. Both accounts scanned", out)
+
     def test_dns_scan_is_read_only(self):
         """dns_scan carries two Cloudflare tokens. It must never mutate.
 
