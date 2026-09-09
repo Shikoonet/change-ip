@@ -761,7 +761,10 @@
         - name: "cloudflare | apply | PATCH old -> new (content only, classified)"
           ansible.builtin.uri:
             url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
-            method: PUT
+            # Cloudflare's partial-record update endpoint is PATCH.  PUT is
+            # the full overwrite endpoint and rejects this intentionally
+            # minimal, content-only body with HTTP 400.
+            method: PATCH
             headers:
               Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
               Content-Type: "application/json"
@@ -971,7 +974,9 @@
         - name: "cloudflare | rollback | PATCH new -> old (content only, classified)"
           ansible.builtin.uri:
             url: "{{ cf_api_base }}/zones/{{ cf_record.zone_id }}/dns_records/{{ cf_record.record_id }}"
-            method: PUT
+            # Keep rollback partial as well, so metadata that is not part of
+            # our manifest (comments, tags, settings, etc.) is preserved.
+            method: PATCH
             headers:
               Authorization: "Bearer {{ lookup('ansible.builtin.env', 'CLOUDFLARE_API_TOKEN') }}"
               Content-Type: "application/json"

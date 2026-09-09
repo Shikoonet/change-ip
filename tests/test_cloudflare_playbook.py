@@ -111,11 +111,11 @@ class _CloudflareHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"success": False, "errors": [{"message": "not found"}]}, 404)
 
-    def do_PUT(self):  # noqa: N802
+    def do_PATCH(self):  # noqa: N802
         self._check_marker()
         # Class-level counter — see do_GET for the rationale.
         _CloudflareHandler.request_count += 1
-        _CloudflareHandler.request_log.append(f"PUT {self.path}")
+        _CloudflareHandler.request_log.append(f"PATCH {self.path}")
         if self.fail_status and _CloudflareHandler.request_count > _CloudflareHandler.fail_after:
             self._send_json({"success": False, "errors": [{"message": "injected"}]}, self.fail_status)
             return
@@ -756,8 +756,8 @@ class TestCloudflarePlaybook(unittest.TestCase):
             )
             # Dump the fake server's request log for debugging.
             get_count = sum(1 for r in _CloudflareHandler.request_log if r.startswith("GET"))
-            put_count = sum(1 for r in _CloudflareHandler.request_log if r.startswith("PUT"))
-            print(f"FAKE SERVER REQUEST LOG: {get_count} GET, {put_count} PUT")
+            patch_count = sum(1 for r in _CloudflareHandler.request_log if r.startswith("PATCH"))
+            print(f"FAKE SERVER REQUEST LOG: {get_count} GET, {patch_count} PATCH")
             get_logs = [r for r in _CloudflareHandler.request_log if r.startswith("GET")]
             for r in get_logs[:5]:
                 print(" ", r)
@@ -852,6 +852,16 @@ class TestCloudflarePlaybook(unittest.TestCase):
             print("STDERR:", stderr[-2000:])
         self.assertEqual(rc, 0)
         self.assertTrue(result.get("ok"))
+        mutation_requests = [
+            request for request in _CloudflareHandler.request_log
+            if request.startswith("PATCH ")
+        ]
+        self.assertEqual(len(mutation_requests), len(manifest))
+        self.assertFalse(
+            any(request.startswith("PUT ")
+                for request in _CloudflareHandler.request_log),
+            "content-only DNS updates must use Cloudflare PATCH, not full-overwrite PUT",
+        )
         # every record now points at new_ip with ttl/proxied preserved
         for (z, r) in zr:
             stored = _CloudflareHandler.records[(z, r["id"])]
@@ -1124,10 +1134,10 @@ class TestCloudflarePlaybook(unittest.TestCase):
                 # The playbook must refuse.
                 self.assertNotEqual(rc, 0, f"{name}: playbook must refuse")
                 # Zero PATCH requests — discover never mutates.
-                put_count = sum(
-                    1 for r in _CloudflareHandler.request_log if r.startswith("PUT")
+                patch_count = sum(
+                    1 for r in _CloudflareHandler.request_log if r.startswith("PATCH")
                 )
-                self.assertEqual(put_count, 0, f"{name}: discover must not PATCH")
+                self.assertEqual(patch_count, 0, f"{name}: discover must not PATCH")
                 # Zero provider mutation: every allowlisted record still
                 # points at OLD_IP — discover never writes.
                 for (z, r) in zr:
@@ -1160,10 +1170,10 @@ class TestCloudflarePlaybook(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(result.get("ok"))
         # Zero PATCHes when every record is already at the target.
-        put_count = sum(
-            1 for r in _CloudflareHandler.request_log if r.startswith("PUT")
+        patch_count = sum(
+            1 for r in _CloudflareHandler.request_log if r.startswith("PATCH")
         )
-        self.assertEqual(put_count, 0, "already-NEW apply must not PATCH")
+        self.assertEqual(patch_count, 0, "already-NEW apply must not PATCH")
 
     def test_apply_partial_failure_aborts(self):
         """Apply injects a partial failure: 2 records PATCH OK, the 3rd
@@ -1257,10 +1267,10 @@ class TestCloudflarePlaybook(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertTrue(result.get("ok"))
-        put_count = sum(
-            1 for r in _CloudflareHandler.request_log if r.startswith("PUT")
+        patch_count = sum(
+            1 for r in _CloudflareHandler.request_log if r.startswith("PATCH")
         )
-        self.assertEqual(put_count, 0, "already-at-target rollback must not PATCH")
+        self.assertEqual(patch_count, 0, "already-at-target rollback must not PATCH")
 
     def test_rollback_third_party_content_refuses_with_zero_patch(self):
         """Rollback sees third-party content for one record — must refuse

@@ -560,7 +560,7 @@ class TestRealPlaybookMultiAccount(RealPlaybookBase):
         # PATCH for B (the THIRD mutation in the apply
         # sequence after A's two). We arrange this by
         # hot-swapping the server: write a flag into the
-        # state file that the server reads on every PUT.
+        # state file that the server reads on every PATCH.
         # The simplest approach: kill the server, edit
         # state, restart.
         self._stop_server()

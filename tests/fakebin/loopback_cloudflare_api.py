@@ -7,7 +7,7 @@ Speaks a strict subset of the real Cloudflare API surface that
   GET    /zones?per_page=N&page=P
   GET    /zones/{zone_id}/dns_records?type=A&name=FQDN&per_page=N&page=P
   GET    /zones/{zone_id}/dns_records/{record_id}
-  PUT    /zones/{zone_id}/dns_records/{record_id}
+  PATCH  /zones/{zone_id}/dns_records/{record_id}
 
 Per-token zone ownership: the server is configured with
 `{account_name: {token: str, zones: [zone_id, ...]}}`. A request
@@ -246,8 +246,8 @@ def make_handler(state: Dict[str, Any], accounts: Dict[str, Dict[str, Any]],
                                reason="no_route", route="<none>",
                                method=method, query_keys=qkeys)
 
-        def do_PUT(self):  # noqa: N802
-            method = "PUT"
+        def do_PATCH(self):  # noqa: N802
+            method = "PATCH"
             u = urlparse(self.path)
             qs = parse_qs(u.query)
             qkeys = sorted(qs.keys())
