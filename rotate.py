@@ -3714,7 +3714,10 @@ class Rotation:
             self.save(cp)
 
         server = self.assert_identity(cp)
-        if server.status != "off":
+        # A staged rollback can be retried after the provider half already
+        # succeeded. If the server is running on OLD_IP, do not bounce it a
+        # second time merely to reach the DNS-only stage.
+        if server.ipv4 != cp["old_ip"]["ip"] and server.status != "off":
             server = self.with_retries("stop", self.provider.stop_server, cp["server"]["id"])
             self.record(cp, "rollback:stop", f"server {server.id} is {server.status}")
 
@@ -3725,10 +3728,11 @@ class Rotation:
             server = self.assert_identity(cp, expect_ip="old")
             self.record(cp, "rollback:assign", f"{cp['old_ip']['ip']} is back on {server.id}")
 
-        server = self.with_retries(
-            "start", self.provider.start_server, cp["server"]["id"], cp["old_ip"]["name"]
-        )
-        self.record(cp, "rollback:start", f"server {server.id} is {server.status}")
+        if server.status != "running":
+            server = self.with_retries(
+                "start", self.provider.start_server, cp["server"]["id"], cp["old_ip"]["name"]
+            )
+            self.record(cp, "rollback:start", f"server {server.id} is {server.status}")
 
         if skip_dns_rollback:
             # Provider rollback only. The CF half is performed by the
@@ -3886,7 +3890,7 @@ class Rotation:
                 "result": {"ok": True, "skipped": "no_apply_marker"},
             }
             cp["outcome"] = "rolled_back"
-            self.save(cp)
+            self._transition(cp, "rolled_back")
             return
 
         outcome = self._do_dns_rollback(cp)
@@ -3909,12 +3913,13 @@ class Rotation:
             "inventory_recovery_required": True,
             "dns_undone": outcome == "rolled_back",
         }
-        self.save(cp)
         if outcome == "rolled_back":
+            self._transition(cp, "rolled_back")
             self.log(
                 f"DNS ROLLBACK OK: every allowlisted A is on {cp['old_ip']['ip']}."
             )
         else:
+            self.save(cp)
             self.log(
                 "DNS ROLLBACK INCOMPLETE: review state/<txid>.json "
                 "and finish the remaining records by hand."

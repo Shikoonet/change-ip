@@ -891,6 +891,39 @@ class WorkflowStructureTests(unittest.TestCase):
                             "the dns_finalize_verified marker")
 
     # -- 10. rollback stage ordering -------------------------------------------
+    def test_hcloud_staged_rollback_accepts_clean_terminal_exit_codes(self):
+        """CLI rc=5 means a clean rollback, not a failed shell step."""
+        job = self.jobs["rollback"]
+        steps = job.get("steps") or []
+        provider = next(
+            step for step in steps
+            if (step.get("name") or "") == "Roll back the provider IP"
+        )
+        dns = next(
+            step for step in steps
+            if (step.get("name") or "") == "Roll back the DNS records"
+        )
+        self.assertIn("--expect-rc 5", provider.get("run") or "")
+        self.assertIn("--expect-state needs_rollback", provider.get("run") or "")
+        self.assertIn("--expect-rc 5", dns.get("run") or "")
+        self.assertIn("--expect-state rolled_back", dns.get("run") or "")
+
+    def test_hcloud_rollback_retries_the_newest_checkpoint(self):
+        job = self.jobs["rollback"]
+        steps = job.get("steps") or []
+        picker = next(
+            step for step in steps
+            if (step.get("name") or "") == "Find the last transaction"
+        )
+        proof = next(
+            step for step in steps
+            if (step.get("name") or "") == "Prove it is the box you meant"
+        )
+        pick_script = picker.get("run") or ""
+        self.assertIn("art = max(live", pick_script)
+        self.assertNotIn("finals =", pick_script)
+        self.assertIn("provider_is_back", proof.get("run") or "")
+
     def test_rollback_dataforest_stages_in_required_order(self):
         """The required order:
             rollback-dns

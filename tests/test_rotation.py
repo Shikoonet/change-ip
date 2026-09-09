@@ -1148,6 +1148,33 @@ class TestRollback(Base):
         self.assertEqual(out["state"], "rolled_back")
         self.assertEqual(fake.server["ipv4_address"], cp["old_ip"]["ip"])
 
+    def test_staged_rollback_retry_does_not_restart_server_already_on_old_ip(self):
+        """Retrying after provider recovery must not bounce the server again."""
+        fake = FakeHcloud()
+        rot = self.build(fake)
+        cp = self.full_run(rot)
+        rot.restore_old_ip(cp, "staged rollback", skip_dns_rollback=True)
+        self.assertEqual(cp["state"], "needs_rollback")
+        self.assertEqual(fake.server["ipv4_address"], cp["old_ip"]["ip"])
+        before = fake.write_count
+
+        rot.restore_old_ip(cp, "retry staged rollback", skip_dns_rollback=True)
+
+        self.assertEqual(fake.write_count, before)
+        self.assertEqual(fake.server["status"], "running")
+
+    def test_dns_only_rollback_finishes_the_checkpoint(self):
+        fake = FakeHcloud()
+        rot = self.build(fake)
+        cp = self.full_run(rot)
+        rot.restore_old_ip(cp, "staged rollback", skip_dns_rollback=True)
+
+        rot.dns_rollback_only(cp)
+
+        self.assertEqual(cp["state"], "rolled_back")
+        self.assertEqual(cp["outcome"], "rolled_back")
+        self.assertTrue(cp["rollback"]["dns_undone"])
+
     def test_a_failed_restart_still_leaves_a_record(self):
         """The remedy for a stuck shutdown can fail too. That must not escape."""
         fake = FakeHcloud()

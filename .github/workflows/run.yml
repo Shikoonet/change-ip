@@ -1266,10 +1266,10 @@ jobs:
           if not live:
               sys.exit("No checkpoint artifact left. They expire after 30 days; "
                        "past that a rollback is done by hand from the console.")
-          # Prefer rotation-state-final (the post-dns artifact) over the bare
-          # one, so the rollback has the post-swap truth on disk.
-          finals = [a for a in live if a["name"].endswith("-final")]
-          art = max(finals or live, key=lambda a: a["created_at"])
+          # Always take the newest checkpoint. A failed staged rollback emits
+          # rotation-state-rolledback after rotation-state-final; preferring
+          # every older "-final" artifact would discard provider recovery.
+          art = max(live, key=lambda a: a["created_at"])
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"ARTIFACT_NAME={art['name']}\n")
               f.write(f"ARTIFACT_RUN_ID={art['workflow_run']['id']}\n")
@@ -1308,7 +1308,12 @@ jobs:
           if str(cp["server"]["id"]) != os.environ["SERVER_ID"].strip():
               sys.exit(f"{txid} is server {cp['server']['id']}, you typed "
                        f"{os.environ['SERVER_ID']}. Wrong transaction.")
-          now = (cp.get("new_ip") or {}).get("ip") or cp["old_ip"]["ip"]
+          rollback = cp.get("rollback") or {}
+          provider_is_back = rollback.get("state") in {
+              "rolled_back", "rollback_incomplete"
+          }
+          now = (cp["old_ip"]["ip"] if provider_is_back else
+                 ((cp.get("new_ip") or {}).get("ip") or cp["old_ip"]["ip"]))
           if now != os.environ["SERVER_IP"].strip():
               sys.exit(f"{txid} left the box on {now}, you typed "
                        f"{os.environ['SERVER_IP']}. Read it before rolling back.")
@@ -1319,10 +1324,15 @@ jobs:
       # gated on the checkpoint showing DNS recovery is required.
       - name: Roll back the provider IP
         run: |
-          python3 rotate.py rollback --config rotation.yml \
+          python3 .github/scripts/stage.py \
+            --expect-rc 5 \
+            --expect-state needs_rollback \
             --txid "${{ steps.cp.outputs.txid }}" \
-            --confirm-server-id "${{ inputs.server_id }}" \
-            --no-dns-rollback
+            --label "rollback.hcloud_provider" \
+            -- python3 rotate.py rollback --config rotation.yml \
+              --txid "${{ steps.cp.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --no-dns-rollback
       # Decide from the checkpoint whether DNS recovery is required. This
       # is a positive check (==) on a real field; no falsy-ternary trick.
       - name: Decide whether DNS rollback is required
@@ -1355,10 +1365,15 @@ jobs:
           CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
           CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
         run: |
-          python3 rotate.py rollback --config rotation.yml \
+          python3 .github/scripts/stage.py \
+            --expect-rc 5 \
+            --expect-state rolled_back \
             --txid "${{ steps.cp.outputs.txid }}" \
-            --confirm-server-id "${{ inputs.server_id }}" \
-            --dns-rollback-only
+            --label "rollback.hcloud_dns" \
+            -- python3 rotate.py rollback --config rotation.yml \
+              --txid "${{ steps.cp.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --dns-rollback-only
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state-rolledback, path: state/, retention-days: 3}
