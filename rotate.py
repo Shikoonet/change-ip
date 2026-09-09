@@ -3821,45 +3821,175 @@ class Rotation:
     def _do_dns_rollback(self, cp: Dict[str, Any]) -> str:
         """Run the Cloudflare rollback half using the persisted manifest.
 
+        Multi-account checkpoints are bucketed by the persisted
+        ``credential_ref`` exactly like apply.  Each bucket is sent with only
+        its owning account's ``token_env``; the adapter then exposes that one
+        value to the playbook as ``CLOUDFLARE_API_TOKEN``.  When apply stopped
+        between accounts, only buckets with a per-account apply-started marker
+        are eligible for rollback.
+
         Returns one of: "rolled_back", "rollback_incomplete". Mutates `cp`
         with `cloudflare_rollback`. The caller drives the surrounding
         state transitions and the inventory-rollback prompt.
         """
         outcome = "rolled_back"
+        per_account_results: List[Dict[str, Any]] = []
         try:
-            result = self.with_retries(
-                "cloudflare_rollback", self.cloudflare_replace,
-                "rollback",
-                old_ip=cp["new_ip"]["ip"],
-                new_ip=cp["old_ip"]["ip"],
-                allowed_records=self._allowed_records(),
-                expected_count=self._expected_record_count(),
-                manifest=cp.get("cloudflare_manifest") or [],
-                invocation_id=_new_invocation_id(),
-                cf_api_base=_test_mode_cf_api_base(),
-            )
+            manifest = cp.get("cloudflare_manifest") or []
+            accounts = self._cf_accounts()
+            accounts_by_name = {a["name"]: a for a in accounts}
+            buckets: Dict[str, List[Dict[str, Any]]] = {}
+            for entry in manifest:
+                ref = entry.get("credential_ref")
+                if not ref or ref not in accounts_by_name:
+                    if len(accounts) == 1:
+                        ref = accounts[0]["name"]
+                    else:
+                        raise EscalationRequired(
+                            f"manifest entry {entry.get('name')!r} has no "
+                            f"credential_ref or refers to an unknown account; "
+                            "refusing to choose a Cloudflare token for rollback."
+                        )
+                buckets.setdefault(ref, []).append(entry)
+
+            # A per-account marker means this is a multi-account apply from
+            # the current checkpoint format.  Do not touch later accounts
+            # whose apply subprocess was never dispatched.  Old single-
+            # account checkpoints have only flat marker fields and safely
+            # fall back to their sole manifest bucket.
+            started = cp.get("cloudflare_apply_started") or {}
+            started_accounts = {
+                name for name in accounts_by_name
+                if isinstance(started.get(name), dict)
+            }
+            if started_accounts:
+                buckets = {
+                    name: subset for name, subset in buckets.items()
+                    if name in started_accounts
+                }
+            if manifest and not buckets:
+                raise EscalationRequired(
+                    "Cloudflare rollback found no manifest bucket matching "
+                    "the persisted per-account apply-started markers; refusing "
+                    "to declare DNS recovered from an inconsistent checkpoint."
+                )
+
+            missing = [
+                accounts_by_name[name]["token_env"] for name in buckets
+                if not os.environ.get(accounts_by_name[name]["token_env"], "").strip()
+            ]
+            if missing:
+                raise EscalationRequired(
+                    "Cloudflare rollback is missing its selected account "
+                    f"token env var(s): {sorted(missing)!r}."
+                )
+
+            for account_name, subset in buckets.items():
+                account = accounts_by_name[account_name]
+                invocation_id = _new_invocation_id()
+                try:
+                    result = self.with_retries(
+                        f"cloudflare_rollback.{account_name}",
+                        self.cloudflare_replace,
+                        "rollback",
+                        old_ip=cp["new_ip"]["ip"],
+                        new_ip=cp["old_ip"]["ip"],
+                        allowed_records=account["records"],
+                        expected_count=account["expected_count"],
+                        manifest=subset,
+                        invocation_id=invocation_id,
+                        credential_ref=account_name,
+                        token_env=account["token_env"],
+                        cf_api_base=_test_mode_cf_api_base(),
+                    )
+                    rb = result.get("result") or {}
+                    ok = (
+                        result.get("rc") == 0
+                        and bool(rb.get("ok"))
+                        and not rb.get("rollback_incomplete")
+                    )
+                    per_account_results.append({
+                        "account": account_name,
+                        "credential_ref": account_name,
+                        "token_env": account["token_env"],
+                        "rc": result.get("rc"),
+                        "ok": ok,
+                        "result": rb,
+                        "invocation_id": invocation_id,
+                    })
+                    if not ok:
+                        outcome = "rollback_incomplete"
+                except ProviderError as exc:
+                    per_account_results.append({
+                        "account": account_name,
+                        "credential_ref": account_name,
+                        "token_env": account["token_env"],
+                        "rc": EXIT_PROVIDER,
+                        "ok": False,
+                        "error": redact(str(exc)),
+                        "invocation_id": invocation_id,
+                    })
+                    self.log(
+                        f"  DNS rollback for {account_name!r} raised {exc}; "
+                        "continuing with the remaining account(s)"
+                    )
+                    outcome = "rollback_incomplete"
+
+            incomplete_records = [
+                record
+                for item in per_account_results
+                for record in ((item.get("result") or {}).get("incomplete_records") or [])
+            ]
+            aggregate_result: Dict[str, Any] = {
+                "ok": outcome == "rolled_back",
+                "operation": "rollback",
+                "rollback_incomplete": outcome != "rolled_back",
+                "incomplete_records": incomplete_records,
+                "per_account": per_account_results,
+            }
+            # Preserve the legacy single-account result shape for callers
+            # that inspect provider-specific rollback fields directly.
+            if len(per_account_results) == 1:
+                aggregate_result = per_account_results[0].get("result") or aggregate_result
             cp["cloudflare_rollback"] = {
                 "ts": utcnow(),
-                "rc": result.get("rc"),
-                "result": result.get("result") or {},
+                "rc": 0 if outcome == "rolled_back" else EXIT_PROVIDER,
+                "ok": outcome == "rolled_back",
+                "per_account": per_account_results,
+                "result": aggregate_result,
             }
-            rb = result.get("result") or {}
-            if result.get("rc") != 0 or rb.get("rollback_incomplete"):
-                outcome = "rollback_incomplete"
+            self.save(cp)
+            if outcome == "rollback_incomplete":
                 self.log(
                     "  DNS rollback incomplete: review state/cloudflare_rollback "
                     "and finish the remaining records by hand."
                 )
             else:
-                self.log("  DNS rollback: every allowlisted A is back on the old IP.")
-        except (RetryableError, EscalationRequired) as exc:
+                self.log(
+                    "  DNS rollback: every allowlisted A is back on the old IP "
+                    f"across {len(per_account_results)} account(s)."
+                )
+        except ProviderError as exc:
             self.log(f"  DNS rollback raised {exc}; continuing with provider recovery")
+            cp["cloudflare_rollback"] = {
+                "ts": utcnow(),
+                "rc": EXIT_PROVIDER,
+                "ok": False,
+                "per_account": per_account_results,
+                "result": {
+                    "ok": False,
+                    "operation": "rollback",
+                    "rollback_incomplete": True,
+                    "error": redact(str(exc)),
+                },
+            }
+            self.save(cp)
             outcome = "rollback_incomplete"
         return outcome
 
     def dns_rollback_only(self, cp: Dict[str, Any]) -> None:
         """The DNS-only rollback half, run in a separate process that
-        carries the CLOUDFLARE_API_TOKEN env.
+        carries the configured Cloudflare account token env vars.
 
         The provider half must have already been restored on disk by a
         prior invocation (`cp["cloudflare_apply_started"]` or
@@ -3867,9 +3997,10 @@ class Rotation:
         undo and we exit cleanly.
 
         Pre-condition: the caller has already loaded cp from disk and has
-        decided this step should run. The CF token is in this process's
-        environment because the workflow put it here on the explicit
-        `if:` of the dns-rollback step.
+        decided this step should run. The CF account tokens are in this
+        process's environment because the workflow put them on the explicit
+        `if:` of the dns-rollback step. Each playbook subprocess receives only
+        the one token selected by its manifest bucket.
         """
         if self.provider_only:
             raise EscalationRequired(

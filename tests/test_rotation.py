@@ -1175,6 +1175,147 @@ class TestRollback(Base):
         self.assertEqual(cp["outcome"], "rolled_back")
         self.assertTrue(cp["rollback"]["dns_undone"])
 
+    def test_multi_account_dns_rollback_uses_each_owner_token(self):
+        """Rollback must route persisted buckets just like forward apply.
+
+        This is the live regression from run 34333473368: both account token
+        env vars were present, but rollback omitted token_env and fell into
+        the empty legacy CLOUDFLARE_API_TOKEN path before contacting DNS.
+        """
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        cfg["cloudflare"] = {"accounts": {
+            "account_a": {
+                "token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                "records": [],
+            },
+            "account_b": {
+                "token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+                "records": [],
+            },
+        }}
+        names = (
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+            "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+        )
+        saved = {name: os.environ.get(name) for name in names}
+
+        def restore_env():
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.addCleanup(restore_env)
+        os.environ.pop("CLOUDFLARE_API_TOKEN", None)
+        os.environ["CLOUDFLARE_API_TOKEN_ACCOUNT_A"] = "fake-account-a-token"
+        os.environ["CLOUDFLARE_API_TOKEN_ACCOUNT_B"] = "fake-account-b-token"
+        calls = []
+
+        def rollback_spy(op, **params):
+            calls.append({"op": op, "params": dict(params)})
+            return {
+                "rc": 0,
+                "result": {
+                    "ok": True,
+                    "operation": op,
+                    "rollback_incomplete": False,
+                    "incomplete_records": [],
+                },
+            }
+
+        rot = self.build(fake=fake, cfg=cfg, cf=rollback_spy)
+        manifest = [
+            {"zone_id": "zone-a", "record_id": "record-a",
+             "name": "a.example", "credential_ref": "account_a"},
+            {"zone_id": "zone-b", "record_id": "record-b",
+             "name": "b.example", "credential_ref": "account_b"},
+        ]
+        cp = {
+            "txid": "tx-multi-account-rollback",
+            "old_ip": {"ip": "203.0.113.10"},
+            "new_ip": {"ip": "198.51.100.99"},
+            "cloudflare_manifest": manifest,
+            "cloudflare_apply_started": {
+                "account_a": {"operation": "apply"},
+                "account_b": {"operation": "apply"},
+            },
+        }
+
+        self.assertEqual(rot._do_dns_rollback(cp), "rolled_back")
+
+        rollback_calls = [call for call in calls if call["op"] == "rollback"]
+        self.assertEqual(len(rollback_calls), 2)
+        routed = {
+            call["params"]["credential_ref"]: call["params"]
+            for call in rollback_calls
+        }
+        self.assertEqual(
+            routed["account_a"]["token_env"],
+            "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+        )
+        self.assertEqual(
+            routed["account_b"]["token_env"],
+            "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+        )
+        self.assertEqual(routed["account_a"]["manifest"], manifest[:1])
+        self.assertEqual(routed["account_b"]["manifest"], manifest[1:])
+        self.assertTrue(cp["cloudflare_rollback"]["ok"])
+
+    def test_multi_account_dns_rollback_only_touches_started_accounts(self):
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        cfg["cloudflare"] = {"accounts": {
+            "account_a": {
+                "token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                "records": [],
+            },
+            "account_b": {
+                "token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+                "records": [],
+            },
+        }}
+        prior = os.environ.get("CLOUDFLARE_API_TOKEN_ACCOUNT_A")
+        os.environ["CLOUDFLARE_API_TOKEN_ACCOUNT_A"] = "fake-account-a-token"
+        self.addCleanup(
+            lambda: os.environ.__setitem__("CLOUDFLARE_API_TOKEN_ACCOUNT_A", prior)
+            if prior is not None
+            else os.environ.pop("CLOUDFLARE_API_TOKEN_ACCOUNT_A", None)
+        )
+        calls = []
+
+        def rollback_spy(op, **params):
+            calls.append({"op": op, "params": dict(params)})
+            return {"rc": 0, "result": {
+                "ok": True, "operation": op, "rollback_incomplete": False,
+            }}
+
+        rot = self.build(fake=fake, cfg=cfg, cf=rollback_spy)
+        cp = {
+            "txid": "tx-partial-account-rollback",
+            "old_ip": {"ip": "203.0.113.10"},
+            "new_ip": {"ip": "198.51.100.99"},
+            "cloudflare_manifest": [
+                {"zone_id": "zone-a", "record_id": "record-a",
+                 "name": "a.example", "credential_ref": "account_a"},
+                {"zone_id": "zone-b", "record_id": "record-b",
+                 "name": "b.example", "credential_ref": "account_b"},
+            ],
+            # Account B was discovered but its apply subprocess never began.
+            "cloudflare_apply_started": {
+                "account_a": {"operation": "apply"},
+            },
+        }
+
+        self.assertEqual(rot._do_dns_rollback(cp), "rolled_back")
+        rollback_calls = [call for call in calls if call["op"] == "rollback"]
+        self.assertEqual(len(rollback_calls), 1)
+        self.assertEqual(
+            rollback_calls[0]["params"]["credential_ref"], "account_a"
+        )
+
     def test_a_failed_restart_still_leaves_a_record(self):
         """The remedy for a stuck shutdown can fail too. That must not escape."""
         fake = FakeHcloud()
