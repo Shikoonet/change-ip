@@ -416,6 +416,12 @@
             status_code: [200]
             validate_certs: true
           register: _recs_p1
+          # Do not die inside the loop. A 403 here means the credential can
+          # LIST a zone but not read its DNS records, and dying on the spot
+          # produced a censored `no_log` blob that named neither the zone nor
+          # the status (run 34319147155). The very next task fails closed on
+          # exactly the same condition and can say which zone it was.
+          failed_when: false
           no_log: true
           loop: "{{ _pairs }}"
           loop_control:
@@ -427,6 +433,46 @@
         # page==1, total_pages>=1, and total_pages within the safety bound.
         # Without this, a malformed first response would let later pages
         # silently fill a manifest the playbook cannot trust.
+        # Name the zone the credential could not read. `no_log` above hides
+        # the response; these two fields are the zone's own name and an HTTP
+        # status, neither of which is a secret, and without them a 403 is
+        # indistinguishable from any other failure.
+        # Two tasks, because an assert that loops over the RESPONSES prints a
+        # whole response — headers included — when it fails. This one reduces
+        # each result to a zone name and an HTTP status first, so the refusal
+        # below can only ever print those.
+        - name: "cloudflare | discover | reduce page-1 to (zone, status)"
+          ansible.builtin.set_fact:
+            _p1_status: >-
+              {%- set out = [] -%}
+              {%- for r in (_recs_p1.results | default([])) -%}
+                {%- set _ = out.append({
+                    'zone': r.item.zone_name | default(r.item.name) | default('?'),
+                    'zone_id': r.item.zone_id | default('?'),
+                    'status': r.status | default(0) | int
+                  }) -%}
+              {%- endfor -%}
+              {{ out }}
+          when: operation == 'discover'
+
+        - name: "cloudflare | discover | every pair must have answered 200"
+          ansible.builtin.assert:
+            that:
+              - (item.status | int) == 200
+            fail_msg: >-
+              Cloudflare answered {{ item.status }} for {{ item.zone }}
+              (zone {{ item.zone_id }}). A 403 here means the credential can
+              LIST this zone but cannot read its DNS records — it needs
+              Zone → DNS → Read on it. Refusing to build a manifest from a
+              partial view: a zone that answers nothing is not a zone with no
+              records, and the difference is an address released under a live
+              record.
+            quiet: true
+          loop: "{{ _p1_status | default([]) }}"
+          loop_control:
+            label: "{{ item.zone }}"
+          when: operation == 'discover'
+
         - name: "cloudflare | discover | validate page-1 metadata for every pair"
           ansible.builtin.assert:
             that:

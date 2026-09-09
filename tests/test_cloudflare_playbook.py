@@ -940,6 +940,32 @@ class TestCloudflarePlaybook(unittest.TestCase):
         )
         self.assertNotEqual(rc, 0)
 
+    def test_a_zone_that_answers_403_is_named_and_nothing_else_is_printed(self):
+        """A credential that can LIST a zone but not read its records.
+
+        Run 34319147155 failed exactly here after the operator widened
+        ACCOUNT_A, and said only "Status code was 403" plus a censored no_log
+        blob — no zone, no clue which permission was missing. The refusal is
+        still absolute; it now names the zone, and prints nothing but the zone
+        and the status.
+        """
+        names = ["testip.shimobile.net", "ok.tinooer.top"]
+        zr = _zone_records_for(names, old_ip="203.0.113.5")
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(names)],
+                          records_pages=_records_pages_one(zr, names),
+                          fail_status=403, fail_after=2)  # zone list ok, record read forbidden
+        rc, stdout, stderr, result = _run_playbook_full(
+            self.base, op="discover", old_ip="203.0.113.5", new_ip="198.51.100.5",
+            allowed=[], scan_only=False)
+        self.assertNotEqual(rc, 0)
+        blob = stdout + stderr
+        self.assertIn("answered 403", blob)
+        self.assertIn("Zone → DNS → Read", blob)
+        self.assertRegex(blob, r"answered 403 for [a-z0-9.-]+")
+        # the refusal must not carry the response itself
+        self.assertNotIn("Authorization", blob)
+        self.assertNotIn("Bearer", blob)
+
     def test_pagination_metadata_must_be_consistent(self):
         """Table-driven subtests: each row installs a scenario that the
         discover op must fail closed against. Every case asserts:
