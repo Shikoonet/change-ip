@@ -40,9 +40,42 @@ runs:
       env:
         ROTATION_CONFIG: ${{ inputs.rotation_config }}
       run: |
-        printf '%s' "$ROTATION_CONFIG" > rotation.yml
-        test -s rotation.yml || { echo "ROTATION_CONFIG secret is empty."; exit 1; }
+        printf '%s' "$ROTATION_CONFIG" > rotation.secret.yml
+        test -s rotation.secret.yml || { echo "ROTATION_CONFIG secret is empty."; exit 1; }
         mkdir -p state
+        # The project config lives in GIT (`rotation.project.yml`): it pins no
+        # server and holds no secret, so a change to it ships by pushing, not
+        # by someone editing a value in three environments. What the secret
+        # still supplies is `project_fingerprint` — sha256(HCLOUD_TOKEN)[:12],
+        # which must not be in a public repo — carried onto the committed file
+        # here.
+        #
+        # This runs at JOB time on purpose. Publishing the config through
+        # bootstrap alone would mean every config change had an ordering
+        # requirement ("dispatch bootstrap first"), and run 34315277665 is what
+        # that costs: a change-ip refused with `identity mismatch` against the
+        # server the OLD secret still pinned.
+        if [ -f rotation.project.yml ]; then
+          python3 - <<'PY'
+        import yaml
+        project = yaml.safe_load(open("rotation.project.yml")) or {}
+        try:
+            secret = yaml.safe_load(open("rotation.secret.yml")) or {}
+        except Exception:
+            secret = {}
+        fp = secret.get("project_fingerprint")
+        if fp:
+            project["project_fingerprint"] = fp
+        with open("rotation.yml", "w") as fh:
+            yaml.safe_dump(project, fh, sort_keys=False, default_flow_style=False)
+        print("config: rotation.project.yml from git"
+              + (" + project_fingerprint from the secret" if fp else ""))
+        PY
+        else
+          cp rotation.secret.yml rotation.yml
+          echo "config: ROTATION_CONFIG (no rotation.project.yml in this checkout)"
+        fi
+        rm -f rotation.secret.yml
 
     - shell: bash
       # The dispatch form asks for the address so the operator states out loud
@@ -59,7 +92,7 @@ runs:
       run: |
         python3 - <<'EOF'
         import os, socket, sys, yaml
-        cfg = yaml.safe_load(open("rotation.yml"))["server"]
+        cfg = (yaml.safe_load(open("rotation.yml")) or {}).get("server") or {}
         if not cfg.get("expected_ipv4"):
             print("config pins no expected_ipv4 (good: it cannot go stale). "
                   "The typed address is asserted live by rotate.py instead.")

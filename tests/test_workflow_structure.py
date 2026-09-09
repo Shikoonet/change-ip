@@ -455,6 +455,34 @@ class WorkflowStructureTests(unittest.TestCase):
         rel = steps["Release the old address (retention=release, change-ip)"]
         self.assertIn("fleet == 'false'", rel["if"])
 
+    def test_setup_action_takes_the_config_from_git_not_the_secret(self):
+        """A config change must ship by pushing, with no dispatch ordering.
+
+        Run 34315277665: change-ip refused with `identity mismatch` because
+        ROTATION_CONFIG still pinned the previous server — the committed
+        config was in the checkout but the job read the secret. The secret's
+        remaining job is `project_fingerprint`, which cannot live in a public
+        repo.
+        """
+        import yaml as _yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        act = _yaml.safe_load((root / ".github/actions/setup/action.yml").read_text())
+        step = next(s for s in act["runs"]["steps"]
+                    if "rotation.project.yml" in (s.get("run") or ""))
+        run = step["run"]
+        self.assertIn("project_fingerprint", run, "the fingerprint must carry over")
+        self.assertIn('rm -f rotation.secret.yml', run,
+                      "the secret's copy must not linger in the workspace")
+        # the secret is still required to be non-empty: an empty one is a
+        # misconfigured environment, not a config to fall back from
+        self.assertIn("ROTATION_CONFIG secret is empty", run)
+        # and every job that runs rotate.py goes through this action
+        for name, job in self.jobs.items():
+            uses = [st.get("uses") for st in (job.get("steps") or [])]
+            if any("rotate.py" in (st.get("run") or "") for st in (job.get("steps") or [])):
+                self.assertIn("./.github/actions/setup", uses,
+                              f"job {name!r} runs rotate.py without the setup action")
+
     def test_the_committed_project_config_pins_no_server_and_no_secret(self):
         """rotation.project.yml is what bootstrap publishes; git must stay clean of secrets."""
         import yaml as _yaml
