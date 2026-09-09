@@ -58,7 +58,7 @@ content scan، token per account) اثبات شده. مسیر **PATCH** — `app
   assignee نداشته باشد؛ قبلاً آزاد نشده باشد. هر کدام از یک خواندن تازه، هر شکست یک رد است
   نه یک skip.
 - در `run.yml` سه جاب آن را صدا می‌زنند، هر سه زیر reviewer `hetzner-production`: `swap`
-  برای `provider-only`؛ `dns` بعد از `done` یا «DNS خارج از scope»؛ و `release_old_ip`
+  برای `provider-only`؛ `dns` فقط بعد از `done` با manifest غیرخالی؛ و `release_old_ip`
   (`operation: release-old-ip`، `server_ip` = آدرس بی‌صاحب، یا `all-unassigned` برای
   همه‌ی IPv4های وصل‌نشده در یک dispatch). `retention` در زمان اجرا از خود `rotation.yml`
   خوانده می‌شود؛ کانفیگ `keep` با exit 0 و بدون حذف رد می‌شود.
@@ -172,7 +172,7 @@ confirmed → cloudflare_preflighted → new_ip_allocated → server_off
 چک‌پوینت persist می‌کند. `cloudflare_replaced` بعد از `ansible_done` می‌آید: PATCH فقط روی
 record IDهای manifest، نه scan، نه discover ثانویه، نه expansion.
 
-## سه راه برای نیمه‌ی DNS در `change-ip` (از ۲۰۲۶-۰۹-۰۹)
+## نیمه‌ی DNS در `change-ip` (از ۲۰۲۶-۰۹-۰۹)
 
 preflight حالا **استپ خودش** در جاب `swap` است و پیش از allocate اجرا می‌شود، با توکن‌های
 Cloudflare فقط روی همان استپ. قبلاً جاب swap دستور `apply --until connectivity_ok` را بدون
@@ -180,11 +180,21 @@ Cloudflare فقط روی همان استپ. قبلاً جاب swap دستور `a
 تأیید reviewer escalate می‌شد، و با `mode: provider_only` نیمه‌ی DNS در هر `change-ip`
 بی‌صدا skip می‌شد.
 
-بعد از swap، جاب `dns` از روی **شواهد** تصمیم می‌گیرد:
+پیش‌پرواز، تمام zoneهایی را که هر credential می‌بیند با pagination می‌خواند و برای هر
+zone تمام رکوردهای A با `content=old_ip` را، باز هم با pagination، داخل manifest می‌گذارد.
+این مسیر به نام یا تعداد رکورد وابسته نیست: یک رکورد و هزاران رکورد قرارداد یکسانی دارند.
 
-| اسکن‌ها | inventory شیکونِت | نتیجه |
+`change-ip` کامل اکنون فقط با manifest غیرخالی ادامه می‌دهد. «صفر رکورد» دیگر DNS را خارج
+از scope اعلام نمی‌کند؛ پیش از allocate/stop روی provider با `escalated` متوقف می‌شود. اگر
+یک credential حتی یک zone هم نبیند همان‌جا متوقف می‌شود. تنها راه اعلام اینکه DNS عمداً
+خارج از scope است، dispatch صریح `provider-only` است.
+
+بعد از swap، جاب `dns` همان manifest ذخیره‌شدهٔ پیش از swap را مصرف می‌کند؛ scan دوم و
+تفسیر دوبارهٔ نتیجه وجود ندارد:
+
+| manifest پیش‌پرواز | inventory شیکونِت | نتیجه |
 |---|---|---|
-| ۰ رکورد، ≥۱ zone در هر حساب | — | `declare-dns-out-of-scope` → `done` |
+| ۰ رکورد | — | **توقف پیش از mutation provider**؛ برای no-DNS از `provider-only` استفاده کن |
 | رکورد هست | باکس در inventory هست، آدرس نو کامیت شده | `make ip-change` (مسیر ناوگان) |
 | رکورد هست | باکس اصلاً در inventory نیست | `declare-ansible-out-of-scope` سپس resume: **خود ابزار PATCH می‌زند** روی manifest |
 | رکورد هست | باکس در inventory هست ولی آدرس نو کامیت نشده | **قرمز** — کامیت گم‌شده است |
@@ -194,19 +204,23 @@ skip‌کردنش یعنی یک دامنه روی آدرسی می‌ماند ک�
 `declare_ansible_out_of_scope` رد می‌کند اگر inventory هر کدام از دو آدرس را نام ببرد —
 آن وقت نود ناوگان است، نه استثنا.
 
-### ⚠ «۰ رکورد» فقط درباره‌ی zoneهایی است که توکن می‌بیند
+### ⚠ «۰ رکورد» هرگز مجوز ادامهٔ `change-ip` نیست
 
 run `34317550319` سبز شد، «۰ رکورد در ۸ zone» گفت، DNS را خارج از scope اعلام کرد و آدرس
 قدیم را **حذف کرد** — در حالی که `testip.shimobile.net` هنوز به همان آدرس اشاره می‌کرد،
 داخل zone نهمی که هیچ‌کدام از دو توکن نمی‌خواندش. «چیزی در zoneهایی که می‌بینم نیست»
 اثبات «چیزی نیست» نیست، و آدرس آزادشده را هتزنر می‌تواند به مشتری دیگری بدهد.
 
-تنها گاردی که این را می‌گیرد ورودی **`dns_names`** روی فرم dispatch است: هر FQDN که آنجا
-بنویسی باید در manifest پیش‌پرواز پیدا شود، وگرنه run **پیش از هر تغییری** escalate می‌کند و
-می‌گوید کدام حساب‌ها گشتند و چه پیدا کردند. per-run است، پس بیات نمی‌شود.
+گارد عمومی این است که manifest کامل `change-ip` نباید خالی باشد و هر credential پیکربندی‌شده
+باید دست‌کم یک zone ببیند. ورودی **`dns_names`** فقط یک assertion اضافه برای نام‌هایی است که
+اپراتور از قبل می‌داند؛ لازم نیست رکوردها را آنجا فهرست کنی. هر نام اختیاری که وارد شود باید
+در manifest پیدا شود، وگرنه run **پیش از هر تغییری** متوقف می‌شود.
 
 اگر zone در حساب سومی است: آن حساب را به `cloudflare.accounts` در `rotation.project.yml`
 اضافه کن (`token_env` باید یکی از سه نام مجاز باشد) و توکنش را روی environmentها بگذار.
+`scripts/setup-secrets.sh` برای `ACCOUNT_A` فقط کلید صریح
+`cloudflare_all_zones_api_token` (یا `cloudflare_api_token_account_a`) را از vault می‌پذیرد؛
+دیگر توکن محدود `cloudflare_miragerunner_api_token` را به‌جای توکن all-zones نصب نمی‌کند.
 
 ## allowlist یک **کف** است، نه فهرست کامل (از ۲۰۲۶-۰۹-۰۸)
 

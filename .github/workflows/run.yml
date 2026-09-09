@@ -110,7 +110,7 @@ on:
         description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip. dns-scan: the address to SEARCH DNS for — it does not have to be a current address, and that is the point.'
         required: true
       dns_names:
-        description: 'Optional. FQDNs you know point at this box, comma- or space-separated (e.g. testip.shimobile.net). Each one must turn up in the DNS preflight or the run stops BEFORE anything moves. It is the only guard against a zone no configured Cloudflare credential can read: run 34317550319 proved "0 records across 8 zones", called DNS out of scope and deleted the old address while testip.shimobile.net still pointed at it, in a ninth zone neither token could see.'
+        description: 'Optional extra assertion, comma- or space-separated. You do NOT need to list every record: preflight automatically finds every A record on the old IP across every visible zone and every result page. If supplied, each name must be in that manifest. A full change-ip also refuses an empty manifest before anything moves; use provider-only only when DNS is intentionally out of scope.'
         required: false
         default: ''
 
@@ -283,8 +283,10 @@ jobs:
           cp = json.load(open(sorted(glob.glob('state/*.json'), key=os.path.getmtime)[-1]))
           m = cp.get('cloudflare_manifest') or []
           print(f'manifest: {len(m)} A record(s) will move with this address')
-          for r in m:
-              print('  ' + r['name'])"
+          for r in m[:50]:
+              print('  ' + r['name'])
+          if len(m) > 50:
+              print(f'  ... {len(m) - 50} more record(s); manifest is complete')"
       - id: run
         run: |
           set +e
@@ -653,90 +655,35 @@ jobs:
       # inventory. An empty SHIKOONET_REPO or an absent inventory line is the
       # "right answer is skip, not fail" case: a throwaway test server is not
       # in shikoonet, and refusing to skip made every test run look red.
-      # ---- scan first, then decide ---------------------------------------
-      # change-ip used to assume every box has DNS to move, and gated the DNS
-      # half on the shikoonet inventory alone: a box not in the inventory was
-      # "out of scope" and skipped, then verify went red because the
-      # checkpoint never reached done. Now the DNS half decides from
-      # EVIDENCE:
-      #   * both accounts scanned, both empty, both saw >=1 zone
-      #       -> DNS out of scope: declared into the checkpoint, run finishes
-      #          at done, old address released. Nothing skipped silently — the
-      #          checkpoint carries which scans said so.
-      #   * any records on the old address
-      #       -> the inventory gate applies. Not in inventory = the commit is
-      #          missing = RED, never a skip. In inventory = full DNS path.
-      #   * any scan failed
-      #       -> red. No conclusion from no evidence.
-      # Scan account A for A records on the OLD address. Read-only;
-      # carries only this account's Cloudflare credential; writes no output
-      # file the gate reads and no $GITHUB_OUTPUT.
-      - name: Scan account A for the old address
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
-          OLD_IP: ${{ needs.swap.outputs.old_ip }}
-        run: |
-          set -e
-          python3 - <<'PYX' > /tmp/ev-a.json
-          import json, os
-          print(json.dumps({
-              "operation": "discover", "scan_only": True,
-              "invocation_id": "dns-gate-a-" + os.environ["GITHUB_RUN_ID"],
-              "result_file": "/tmp/scan-a.json",
-              "old_ip": os.environ["OLD_IP"], "new_ip": os.environ["OLD_IP"],
-              "allowed_records": "[]", "expected_count": 0, "manifest": "[]",
-          }))
-          PYX
-          ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-a.json
-      # Scan account B for A records on the OLD address. Read-only;
-      # carries only this account's Cloudflare credential; writes no output
-      # file the gate reads and no $GITHUB_OUTPUT.
-      - name: Scan account B for the old address
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
-          OLD_IP: ${{ needs.swap.outputs.old_ip }}
-        run: |
-          set -e
-          python3 - <<'PYX' > /tmp/ev-b.json
-          import json, os
-          print(json.dumps({
-              "operation": "discover", "scan_only": True,
-              "invocation_id": "dns-gate-b-" + os.environ["GITHUB_RUN_ID"],
-              "result_file": "/tmp/scan-b.json",
-              "old_ip": os.environ["OLD_IP"], "new_ip": os.environ["OLD_IP"],
-              "allowed_records": "[]", "expected_count": 0, "manifest": "[]",
-          }))
-          PYX
-          ansible-playbook cloudflare_replace_ip_step.yml -e @/tmp/ev-b.json
-      # No credentials in this step: it only reads the two result files and
-      # writes the decision. The contract forbids output-writing steps from
-      # holding credential-shaped text.
-      - name: Decide the DNS scope from the scans
+      # ---- consume the preflight manifest --------------------------------
+      # The swap job built this manifest BEFORE touching Hetzner. It scanned
+      # every visible zone and every result page, and full `change-ip` now
+      # refuses an empty manifest. Do not scan a second time and reinterpret
+      # "zero" as out-of-scope: run 34321050608 proved that a stale but valid
+      # token can make that branch green while an unseen record still points
+      # at the address about to be released.
+      #
+      # This step carries no credential. It only proves that the persisted
+      # manifest is non-empty and bound to this transaction's OLD_IP. One
+      # record or thousands use the same path below.
+      - name: Require the persisted DNS manifest
         id: decide
+        env:
+          OLD_IP: ${{ needs.swap.outputs.old_ip }}
+          TXID: ${{ needs.swap.outputs.txid }}
         run: |
           python3 - <<'PYX'
           import json, os, sys
-          scope, notes = "none", []
-          for acct in ("a", "b"):
-              try:
-                  res = json.load(open(f"/tmp/scan-{acct}.json"))
-              except (OSError, ValueError):
-                  print(f"::error::account {acct.upper()}: no scan result — cannot decide")
-                  sys.exit(1)
-              if not res.get("ok"):
-                  print(f"::error::account {acct.upper()}: scan not ok — cannot decide")
-                  sys.exit(1)
-              n, z = len(res.get("manifest") or []), int(res.get("zones_seen") or 0)
-              notes.append(f"{acct.upper()}: {n} record(s), {z} zone(s) seen")
-              if n:
-                  scope = "records"
-              elif z < 1:
-                  print(f"::error::account {acct.upper()} saw 0 zones; that proves nothing")
-                  sys.exit(1)
-          print("; ".join(notes))
-          print(f"dns_scope={scope}")
+          cp = json.load(open(f"state/{os.environ['TXID']}.json"))
+          old_ip = (cp.get("old_ip") or {}).get("ip")
+          if old_ip != os.environ["OLD_IP"]:
+              sys.exit(f"checkpoint OLD_IP {old_ip!r} != workflow OLD_IP {os.environ['OLD_IP']!r}")
+          manifest = cp.get("cloudflare_manifest") or []
+          if not manifest:
+              sys.exit("full change-ip has an empty Cloudflare manifest; refusing DNS-out-of-scope")
+          print(f"dns_scope=records ({len(manifest)} A record(s))")
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"dns_scope={scope}\n")
+              fh.write("dns_scope=records\n")
           PYX
 
       # ---- records exist: the inventory gate --------------------------------
@@ -891,24 +838,15 @@ jobs:
             --label "dns.hcloud_direct" \
             -- python3 rotate.py resume --config rotation.yml \
               --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
-      # ---- no records anywhere: finish without the DNS half ----------------
-      - name: Declare DNS out of scope and finish
-        if: steps.decide.outputs.dns_scope == 'none'
-        run: |
-          python3 rotate.py declare-dns-out-of-scope --config rotation.yml \
-            --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}" \
-            --scan /tmp/scan-a.json --scan /tmp/scan-b.json
-          python3 rotate.py status --config rotation.yml --txid "$TXID" | grep -E '"(state|outcome)"'
-
       # ---- the change-ip release ---------------------------------------------
       # Same guards as the provider-only one, but the finish line here is
-      # `done` — reached by the DNS path or by the declaration above.
+      # `done` and can only be reached after a non-empty preflight manifest
+      # was applied and verified.
       # rotate.py refuses unless the checkpoint is done, the server is re-read
       # on the new address, and the old Primary IP is re-read as the same
       # address attached to nothing. success() means nothing before it failed.
       - name: Release the old address (retention=release, change-ip)
-        if: success() && (steps.decide.outputs.dns_scope == 'none'
-            || steps.in_scope.outputs.in_scope == 'true'
+        if: success() && (steps.in_scope.outputs.in_scope == 'true'
             || steps.in_scope.outputs.fleet == 'false')
         run: |
           set -e

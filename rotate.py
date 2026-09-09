@@ -1822,6 +1822,7 @@ class Rotation:
                 [f"# edit {self.config_path} and fill cloudflare.accounts"],
             )
         combined: List[Dict[str, Any]] = []
+        discovered_by_id: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
         per_account: List[Dict[str, Any]] = []
         for account in accounts:
             invocation_id = _new_invocation_id()
@@ -1839,18 +1840,45 @@ class Rotation:
                 cf_api_base=_test_mode_cf_api_base(),
             )
             sub_manifest = (result.get("result") or {}).get("manifest") or []
+            overlap_count = 0
             for entry in sub_manifest:
                 # Mark every entry with the credential reference that
-                # discovered it. A record's ownership is structural: the
-                # account that discovered it is the only account allowed
-                # to PATCH it later.
-                combined.append({**entry, "credential_ref": account["name"]})
+                # discovered it. When an all-zones token overlaps an older
+                # narrow token, the same Cloudflare record can legitimately
+                # be discovered twice. Config order is the ownership order:
+                # the first credential owns the later PATCH. A duplicate is
+                # accepted only when both views describe exactly the same
+                # record and baseline; conflicting views fail closed.
+                candidate = {**entry, "credential_ref": account["name"]}
+                record_key = (entry.get("zone_id"), entry.get("record_id"))
+                prior = discovered_by_id.get(record_key)
+                if prior is not None:
+                    comparable = ("zone_id", "record_id", "name", "type",
+                                  "previous_content", "ttl", "proxied")
+                    conflicts = [field for field in comparable
+                                 if prior.get(field) != candidate.get(field)]
+                    if conflicts:
+                        raise EscalationRequired(
+                            f"Cloudflare credentials {prior['credential_ref']!r} "
+                            f"and {account['name']!r} returned conflicting views "
+                            f"of record {record_key!r} (fields: {conflicts!r}). "
+                            "Nothing has moved; refusing to choose a baseline.",
+                            ["# inspect the overlapping Cloudflare credentials"],
+                        )
+                    overlap_count += 1
+                    continue
+                discovered_by_id[record_key] = candidate
+                combined.append(candidate)
             per_account.append({
                 "name": account["name"],
                 "token_env": account["token_env"],
                 "invocation_id": invocation_id,
                 "rc": result.get("rc"),
+                "zones_seen": int(
+                    (result.get("result") or {}).get("zones_seen") or 0
+                ),
                 "record_count": len(sub_manifest),
+                "overlap_count": overlap_count,
                 "manifest_digest": dataforest_adapter.deterministic_digest(sub_manifest),
             })
             if result.get("rc") != 0 or not (result.get("result") or {}).get("ok"):
@@ -1865,7 +1893,45 @@ class Rotation:
                         f"--confirm-server-id {cp['server']['id']}",
                     ],
                 )
-        # Combined invariants: no record is owned by more than one account,
+            if per_account[-1]["zones_seen"] < 1:
+                raise EscalationRequired(
+                    f"Cloudflare preflight account {account['name']!r} "
+                    f"(token_env={account['token_env']!r}) saw zero zones. "
+                    "A successful API response with no visible zones is not "
+                    "proof that this account has no matching records. Nothing "
+                    "has moved; fix this environment secret or its zone "
+                    "resources and re-dispatch.",
+                    ["# fix the Cloudflare credential coverage, then re-dispatch"],
+                )
+
+        # A full `change-ip` promises to move DNS. Therefore an empty
+        # manifest is not evidence that DNS is out of scope; it is evidence
+        # that the configured credentials did not find any DNS work. Run
+        # 34321050608 showed why the distinction matters: a valid but stale
+        # environment token saw eight unrelated zones, found zero records,
+        # and the workflow called that success before releasing OLD_IP.
+        #
+        # This guard is independent of record names and counts. Discovery
+        # still scans every visible zone and paginates all A records whose
+        # content is OLD_IP, so one record and thousands take the same path.
+        # A server which genuinely has no DNS must use the explicit
+        # `provider-only` operation.
+        if not combined:
+            scanned = ", ".join(
+                f"{a['name']}={a.get('zones_seen', 0)} zone(s)"
+                for a in per_account
+            ) or "no accounts"
+            raise EscalationRequired(
+                f"Cloudflare preflight found zero A records pointing at "
+                f"{cp['old_ip']['ip']} ({scanned}). A full change-ip may not "
+                "turn an empty or partial credential view into DNS-out-of-scope, "
+                "because that can release OLD_IP while an unseen record still "
+                "points at it. Nothing has moved. Fix the Cloudflare secret or "
+                "its zone scope and re-dispatch. If this server intentionally "
+                "has no DNS, dispatch `provider-only` instead.",
+                ["# fix the Cloudflare credential coverage, then re-dispatch"],
+            )
+        # Combined invariants: each record has one deterministic PATCH owner,
         # the union covers every configured FQDN exactly once, and the
         # combined digest is stable across runs.
         # Every name the operator stated must actually be in the manifest.
@@ -4511,10 +4577,11 @@ def main(
     p_apply.add_argument("--config", required=True)
     p_apply.add_argument("--confirm-server-id", default=None)
     p_apply.add_argument("--dns-name", action="append", default=[],
-                         help="an FQDN that points at this box. Repeatable. Every one "
-                              "must show up in the preflight manifest or the run stops "
-                              "before anything moves — the only guard against a zone no "
-                              "configured Cloudflare credential can see")
+                         help="optional extra assertion for an FQDN that points at this "
+                              "box. Repeatable; every supplied name must show up in the "
+                              "preflight manifest. Discovery itself is IP-based and "
+                              "automatically includes every matching A record in every "
+                              "visible zone/page")
     p_apply.add_argument("--provider-only", action="store_true",
                          help="declare THIS run provider-only: no Cloudflare call at all, "
                               "pause at connectivity_ok. Same meaning as the config's "

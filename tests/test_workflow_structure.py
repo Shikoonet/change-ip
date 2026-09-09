@@ -393,8 +393,9 @@ class WorkflowStructureTests(unittest.TestCase):
                    if "Release the old address" in s.get("name", "")]
         self.assertEqual(len(dns_rel), 1)
         self.assertIn("success()", dns_rel[0]["if"])
-        self.assertIn("steps.decide.outputs.dns_scope == 'none'", dns_rel[0]["if"])
         self.assertIn("steps.in_scope.outputs.in_scope == 'true'", dns_rel[0]["if"])
+        self.assertIn("steps.in_scope.outputs.fleet == 'false'", dns_rel[0]["if"])
+        self.assertNotIn("dns_scope == 'none'", dns_rel[0]["if"])
         self.assertIn("--txid", dns_rel[0]["run"])
         for jn in callers:
             self.assertEqual(self.jobs[jn].get("environment"), "hetzner-production",
@@ -433,13 +434,15 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("--provider-only", run["run"])
 
     def test_the_form_can_name_records_and_preflight_enforces_them(self):
-        """`dns_names` is the only guard against a zone no credential can read."""
+        """`dns_names` stays an optional extra assertion, never a record list."""
         # PyYAML reads the bare key `on:` as the boolean True.
         on = self.doc.get(True, self.doc.get("on"))
         inputs = on["workflow_dispatch"]["inputs"]
         self.assertIn("dns_names", inputs)
         self.assertFalse(inputs["dns_names"].get("required"),
                          "naming records must stay optional")
+        self.assertIn("do NOT need to list every record",
+                      inputs["dns_names"]["description"])
         pre = next(s for s in self.jobs["swap"]["steps"]
                    if (s.get("name") or "").startswith("Preflight DNS"))
         self.assertIn("DNS_NAMES", pre["env"])
@@ -526,38 +529,28 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("--confirm-server-id", plan[0]["run"])
         self.assertIn("--expect-ipv4", plan[0]["run"])
 
-    def test_change_ip_dns_half_decides_from_scans_and_never_skips_records(self):
-        """One button for every box, with no silent skip.
-
-        The dns job scans both accounts for the OLD address first. Two empty
-        scans that each saw a zone -> declare DNS out of scope and finish.
-        Any records -> the inventory gate; not in inventory -> a red step,
-        not a skip. The steps that hold Cloudflare credentials write nothing
-        to $GITHUB_OUTPUT; the step that writes the decision holds none.
-        """
+    def test_change_ip_dns_half_requires_the_persisted_preflight_manifest(self):
+        """DNS consumes one pre-swap manifest and has no empty-success branch."""
         steps = {s.get("name"): s for s in self.jobs["dns"]["steps"] if s.get("name")}
-        for acct in ("A", "B"):
-            st = steps[f"Scan account {acct} for the old address"]
-            self.assertIn("CLOUDFLARE_API_TOKEN", st["env"])
-            self.assertNotIn("GITHUB_OUTPUT", st["run"])
-            self.assertIn("scan_only", st["run"])
-        dec = steps["Decide the DNS scope from the scans"]
+        self.assertNotIn("Scan account A for the old address", steps)
+        self.assertNotIn("Scan account B for the old address", steps)
+        dec = steps["Require the persisted DNS manifest"]
         self.assertEqual(dec.get("id"), "decide")
         self.assertNotIn("CLOUDFLARE", " ".join(dec.get("env") or {}))
         self.assertIn("GITHUB_OUTPUT", dec["run"])
-        for bad in ("token", "secret", "CLOUDFLARE"):
-            self.assertNotIn(bad, dec["run"], f"decide step must not mention {bad!r}")
-        # zero zones seen is a failure, not "none"
-        self.assertIn("saw 0 zones", dec["run"])
+        self.assertIn("cloudflare_manifest", dec["run"])
+        self.assertIn("if not manifest", dec["run"])
+        self.assertIn("dns_scope=records", dec["run"])
+        self.assertNotIn("/tmp/scan-", dec["run"])
         refuse = steps["Refuse — records exist but the inventory commit is missing"]
         self.assertIn("dns_scope == 'records'", refuse["if"])
         self.assertIn("in_scope != 'true'", refuse["if"])
         self.assertIn("exit 1", refuse["run"])
-        declare = steps["Declare DNS out of scope and finish"]
-        self.assertIn("dns_scope == 'none'", declare["if"])
-        self.assertIn("declare-dns-out-of-scope", declare["run"])
-        self.assertIn("--scan /tmp/scan-a.json --scan /tmp/scan-b.json", declare["run"])
-        # the swap job exports old_ip for the scans
+        self.assertNotIn("Declare DNS out of scope and finish", steps)
+        job_body = "\n".join(s.get("run", "") for s in self.jobs["dns"]["steps"])
+        self.assertNotIn("declare-dns-out-of-scope", job_body)
+        self.assertNotIn("dns_scope=none", job_body)
+        # the swap job exports old_ip so the checkpoint binding is rechecked
         self.assertIn("old_ip", self.jobs["swap"]["outputs"])
 
     def test_every_test_module_is_in_exactly_one_ci_shard(self):

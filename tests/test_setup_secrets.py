@@ -97,7 +97,18 @@ class TestScriptHygiene(unittest.TestCase):
                 continue
             self.assertNotIn("| gh secret set", line,
                              msg=f"{SCRIPT.name}:{i} pipes into `gh secret set`; "
-                                 "materialise and check the value first")
+                             "materialise and check the value first")
+
+    def test_account_a_is_never_refreshed_from_a_narrow_zone_token(self):
+        """Bootstrap must not replace an all-zones secret with an old subset."""
+        src = SCRIPT.read_text()
+        section = src[src.index('head_ "cloudflare tokens"'):
+                      src.index('head_ "shikoonet access')]
+        start = section.index("set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_A")
+        end = section.index("set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_B", start)
+        account_a_call = section[start:end]
+        self.assertNotIn("cloudflare_miragerunner_api_token", account_a_call)
+        self.assertIn("cloudflare_all_zones_api_token", account_a_call)
 
 
 if __name__ == "__main__":

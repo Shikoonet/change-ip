@@ -144,6 +144,8 @@ def _cf_find(records: List[Dict[str, Any]], wanted: Dict[str, Any]) -> Optional[
 
 
 def _cf_op_discover(state: Dict[str, Any], old_ip: str) -> Dict[str, Any]:
+    zones_seen = len({rec["zone_id"]
+                      for rec in state["cloudflare"]["records"]})
     manifest = []
     for rec in state["cloudflare"]["records"]:
         if rec["content"] != old_ip:
@@ -154,6 +156,7 @@ def _cf_op_discover(state: Dict[str, Any], old_ip: str) -> Dict[str, Any]:
             "ttl": rec.get("ttl", 1), "proxied": rec.get("proxied", False),
         })
     return {"ok": True, "rc": 0, "result": {"ok": True, "operation": "discover",
+                                              "zones_seen": zones_seen,
                                               "manifest": manifest}}
 
 

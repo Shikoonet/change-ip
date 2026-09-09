@@ -183,10 +183,17 @@ class _CloudflareHandler(BaseHTTPRequestHandler):
                         if rec.get("content") == content and rec.get("id") not in seen:
                             seen.add(rec.get("id"))
                             matched.append(rec)
+            pages = [matched[i:i + 50] for i in range(0, len(matched), 50)] or [[]]
+            idx = page - 1
+            if idx < 0 or idx >= len(pages):
+                self._send_json({"success": False,
+                                 "errors": [{"message": "page out of range"}]}, 400)
+                return
             self._send_json({
                 "success": True,
-                "result": matched,
-                "result_info": {"total_pages": 1, "page": 1, "per_page": 50},
+                "result": pages[idx],
+                "result_info": {"total_pages": len(pages), "page": page,
+                                "per_page": 50},
             }, 200)
             return
         key = (zone_id, name or "")
@@ -632,6 +639,27 @@ class TestCloudflarePlaybook(unittest.TestCase):
             print("STDOUT:", stdout[-2500:])
         self.assertEqual(rc, 0)
         self.assertEqual([r["name"] for r in result["manifest"]], names)
+
+    def test_content_scan_paginates_every_matching_record_without_names(self):
+        """The IP scan, not a hand-maintained FQDN list, defines the manifest."""
+        names = [f"host-{i:03d}.example.com" for i in range(137)]
+        zr = _zone_records_for(names, old_ip="203.0.113.5")
+        _install_handlers(
+            zone_records=zr,
+            zone_pages=[[{"id": "zone-example.com", "name": "example.com"}]],
+            records_pages=_records_pages_one(zr, names),
+        )
+        rc, stdout, stderr, result = _run_playbook_full(
+            self.base, op="discover",
+            old_ip="203.0.113.5", new_ip="198.51.100.5",
+            allowed=[], scan_only=False, verbose=True,
+        )
+        if rc != 0:
+            print("STDOUT:", stdout[-2500:])
+            print("STDERR:", stderr[-1500:])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(result["manifest"]), 137)
+        self.assertEqual({r["name"] for r in result["manifest"]}, set(names))
 
     def test_a_floor_that_disagrees_with_the_allowlist_is_a_typo(self):
         """Zero is allowed on both sides; disagreeing counts are still refused."""

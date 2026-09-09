@@ -175,6 +175,11 @@ class FakeCloudflare:
                     "ttl": rec.get("ttl", 1),
                     "proxied": rec.get("proxied", False),
                 })
+            if self.account_zones and params.get("credential_ref"):
+                visible_zones = set(self.account_zones.get(
+                    params["credential_ref"], []))
+            else:
+                visible_zones = {r["zone_id"] for r in self.records}
             return {
                 "ok": True,
                 "rc": 0,
@@ -182,6 +187,11 @@ class FakeCloudflare:
                     "ok": True,
                     "operation": "discover",
                     "invocation_id": params.get("invocation_id", ""),
+                    # Production discovery reports every zone visible to the
+                    # selected credential, independently of how many matching
+                    # records it found. Keep the fake's contract identical so
+                    # the fail-closed zone-coverage checks are exercised.
+                    "zones_seen": len(visible_zones),
                     "manifest": manifest,
                 },
             }

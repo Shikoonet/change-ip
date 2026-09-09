@@ -1735,6 +1735,75 @@ class TestCloudflareFlow(Base):
         protect_ts = next(h["ts"] for h in cp["history"] if h["action"] == "protect_ip")
         self.assertLessEqual(preflight_ts, protect_ts)
 
+    def test_one_blind_account_stops_even_when_another_found_records(self):
+        """A non-empty partial union must not hide a credential that saw 0 zones."""
+        from tests.fake_cloudflare import FakeCloudflare
+
+        backing = FakeCloudflare(old_ip=self.fake.server["ipv4_address"])
+
+        class OneBlindAccount:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, op, **params):
+                self.calls.append({"op": op, "params": dict(params)})
+                if op == "discover" and params.get("credential_ref") == "account_b":
+                    return {"ok": True, "rc": 0, "result": {
+                        "ok": True, "operation": "discover",
+                        "zones_seen": 0, "manifest": [],
+                    }}
+                return backing(op, **params)
+
+        cfg = example_config(self.fake)
+        cfg["cloudflare"] = {"accounts": {
+            "account_a": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                          "records": []},
+            "account_b": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+                          "records": []},
+        }}
+        for name in ("CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                     "CLOUDFLARE_API_TOKEN_ACCOUNT_B"):
+            os.environ[name] = FAKE_CF_TOKEN
+            self.addCleanup(os.environ.pop, name, None)
+        rot = self.build(fake=self.fake, cfg=cfg, cf=OneBlindAccount())
+        cp = self.full_run(rot)
+        self.assertEqual((cp["state"], cp["outcome"]),
+                         ("escalated", "escalated"))
+        self.assertEqual(self.fake.write_count, 0)
+        self.assertIn("saw zero zones", "\n".join(self.lines))
+
+    def test_overlapping_all_zones_and_narrow_tokens_patch_each_record_once(self):
+        """The first configured credential owns records both tokens can see."""
+        from tests.fake_cloudflare import FakeCloudflare
+
+        zones = ["zone-aaaa", "zone-bbbb", "zone-cccc", "zone-dddd"]
+        cf = FakeCloudflare(
+            old_ip=self.fake.server["ipv4_address"],
+            account_zones={"account_a": zones, "account_b": zones},
+        )
+        cfg = example_config(self.fake)
+        cfg["cloudflare"] = {"accounts": {
+            "account_a": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                          "records": []},
+            "account_b": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_B",
+                          "records": []},
+        }}
+        for name in ("CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                     "CLOUDFLARE_API_TOKEN_ACCOUNT_B"):
+            os.environ[name] = FAKE_CF_TOKEN
+            self.addCleanup(os.environ.pop, name, None)
+        rot = self.build(fake=self.fake, cfg=cfg, cf=cf)
+        cp = self.full_run(rot)
+        self.assertEqual((cp["state"], cp["outcome"]), ("done", "done"))
+        self.assertEqual(len(cp["cloudflare_manifest"]), 8)
+        self.assertEqual({r["credential_ref"]
+                          for r in cp["cloudflare_manifest"]}, {"account_a"})
+        self.assertEqual(cf.write_count, 8,
+                         "overlap must not PATCH the same record twice")
+        accounts = cp["cloudflare_preflight"]["accounts"]
+        self.assertEqual(accounts[0]["overlap_count"], 0)
+        self.assertEqual(accounts[1]["overlap_count"], 8)
+
     def test_cloudflare_replaced_runs_after_ansible_done(self):
         rot = self.build()
         states = []
@@ -2047,18 +2116,24 @@ class TestCloudflareFlow(Base):
         for item in captured["argv"]:
             self.assertIsInstance(item, str)
 
-    def test_zero_records_in_discover_is_still_a_run(self):
-        # discover that returns zero records: allowed — the apply path then
-        # sees an empty manifest and short-circuits.
-        empty_cf = type(self.cf)(records=[])
+    def test_zero_records_in_full_change_ip_stops_before_provider_mutation(self):
+        # The credential sees a real zone, but none of its A records points at
+        # OLD_IP. That is not permission to call DNS out of scope: a different
+        # credential may own an unseen zone. Full change-ip must stop before
+        # Hetzner is touched; provider-only is the explicit no-DNS operation.
+        empty_cf = type(self.cf)(records=[{
+            "zone_id": "zone-visible", "record_id": "rec-other",
+            "name": "elsewhere.example.com", "content": "203.0.113.254",
+            "ttl": 1, "proxied": False,
+        }])
         rot = self.build(cf=empty_cf)
         cp = self.full_run(rot)
-        # Empty discover != failure if expected_count was zero too. But our
-        # config says expected_record_count=4; the fake seeds 8 → mismatch is
-        # silently accepted by the current preflight (it does not enforce
-        # expected_count itself, the playbook does). Assert the run reached
-        # done if it completed.
-        self.assertIn(cp["state"], ("done",))
+        self.assertEqual((cp["state"], cp["outcome"]),
+                         ("escalated", "escalated"))
+        self.assertEqual(self.fake.write_count, 0,
+                         "empty DNS visibility must stop before Hetzner mutates")
+        self.assertEqual(empty_cf.write_count, 0)
+        self.assertIn("zero A records", "\n".join(self.lines))
 
     def test_malformed_result_handled_by_adapter(self):
         # The real adapter raises on a malformed result file. We exercise

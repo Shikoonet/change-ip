@@ -425,8 +425,18 @@ head_ "cloudflare tokens"
 # `dns` job sits on hetzner-production and cannot read cloudflare-production,
 # so the same values are needed in both places; a job has exactly one
 # environment and this half needs a Hetzner token in the same process.
+#
+# ACCOUNT_A is deliberately sourced only from a vault key whose NAME says it
+# is the all-zones credential. It used to be populated from
+# `cloudflare_miragerunner_api_token`, a six-zone token; bootstrap could then
+# silently replace a manually-installed all-zones token with that narrower
+# value on one environment. GitHub never reveals secret values, so a missing
+# broad source is a [keep]/[FAIL], never permission to substitute a narrower
+# token. Add the broad token to the private vault under one of these explicit
+# names before asking bootstrap to refresh it.
 for env in $DNS_ENVS; do
-  set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_A "$env" vault_get cloudflare_miragerunner_api_token
+  set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_A "$env" vault_get \
+    cloudflare_all_zones_api_token cloudflare_api_token_account_a
   set_secret CLOUDFLARE_API_TOKEN_ACCOUNT_B "$env" vault_get cloudflare_samsos_api_token
 done
 
