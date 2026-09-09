@@ -165,11 +165,26 @@
           floor left for them to relax.
         quiet: true
 
-    - name: "cloudflare | only A records are in scope"
+    # The floor is DECLARED, so it must match what was declared. Zero is a
+    # legitimate declaration — "no named record is required" — because the
+    # per-zone content scan is what actually finds records, and a rotation
+    # with an empty floor still moves every A record that holds old_ip.
+    #
+    # This used to refuse zero outright, from the era when the allowlist WAS
+    # the whole set and an empty one meant a rotation that silently moved
+    # nothing. Under the floor model that reading is gone, and the old guard
+    # cost run 34316063764: the first change-ip with a real DNS config
+    # escalated here before touching anything.
+    - name: "cloudflare | the floor is declared, not guessed"
       ansible.builtin.assert:
         that:
-          - expected_count | int >= 1
-        fail_msg: "expected_count must be a positive integer (allow-list zero is a stop, not a pass)."
+          - expected_count | int >= 0
+          - (expected_count | int) == ((allowed_records | from_json) | length)
+        fail_msg: >-
+          expected_count is {{ expected_count }} but allowed_records names
+          {{ (allowed_records | from_json) | length }}. The floor is a
+          declaration: the two must agree, or one of them is a typo. Zero on
+          both sides is fine and means the content scan alone decides.
         quiet: true
       when: not ((scan_only | default(false)) | bool)
 

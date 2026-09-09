@@ -442,9 +442,21 @@ def run_cloudflare_op(
             stdout_tail = redact(getattr(completed, "stdout", "") or "")[-4000:]
             stderr_tail = redact(getattr(completed, "stderr", "") or "")[-4000:]
             if rc != 0:
+                # SAY the tails. "see stdout/stderr tails" pointed at evidence
+                # this branch then threw away, so the only way to learn why a
+                # preflight failed was to reproduce the playbook by hand — a
+                # round trip that cost a live run (34316063764). Both are
+                # already redacted; the playbook keeps `no_log: true` on every
+                # task that touches a token, so what reaches here is the task
+                # name and the assertion that failed.
+                detail = "\n".join(
+                    part for part in (
+                        f"  stderr: {stderr_tail.strip()}" if stderr_tail.strip() else "",
+                        f"  stdout: {stdout_tail.strip()}" if stdout_tail.strip() else "",
+                    ) if part
+                ) or "  (the playbook printed nothing)"
                 raise EscalationRequired(
-                    f"cloudflare {operation} exited {rc} with no result JSON; "
-                    f"see stdout/stderr tails.",
+                    f"cloudflare {operation} exited {rc} with no result JSON:\n{detail}",
                     [
                         "ansible-playbook cloudflare_replace_ip_step.yml "
                         f"-e operation={operation} -e result_file=/tmp/cf.json "

@@ -308,6 +308,7 @@ def _run_playbook_full(base: str, *, op: str, old_ip: str, new_ip: str,
                         allowed: List[str], manifest: Optional[List[Dict[str, Any]]] = None,
                         env_extra: Optional[Dict[str, str]] = None,
                         scan_only: bool = False,
+                        expected_count_override: Optional[int] = None,
                         verbose: bool = False) -> Tuple[int, str, str, Dict[str, Any]]:
     with tempfile.NamedTemporaryFile(prefix="cf_result_", suffix=".json", delete=False) as out:
         result_path = out.name
@@ -335,7 +336,9 @@ def _run_playbook_full(base: str, *, op: str, old_ip: str, new_ip: str,
             "-e", f"old_ip={old_ip}",
             "-e", f"new_ip={new_ip}",
             "-e", f"allowed_records='{json.dumps(allowed)}'",
-            "-e", f"expected_count={len(allowed)}",
+            "-e", ("expected_count="
+                   + str(len(allowed) if expected_count_override is None
+                         else expected_count_override)),
             "-e", f"result_file={result_path}",
             "-e", f"manifest='{json.dumps(manifest or [])}'",
             "-e", "invocation_id=11111111-1111-1111-1111-111111111111",
@@ -601,6 +604,46 @@ class TestCloudflarePlaybook(unittest.TestCase):
         names = sorted(r["name"] for r in result["manifest"])
         self.assertEqual(names, sorted(ALLOWLIST_8))
         self.assertNotIn("elsewhere.tinooer.top", names)
+
+    def test_discover_with_a_zero_floor_is_a_rotation_shape_not_a_stop(self):
+        """The shape `change-ip` actually sends: no named record, scan decides.
+
+        Run 34316063764 escalated here — `expected_count must be a positive
+        integer` — with a real DNS config and a record (testip.shimobile.net)
+        sitting on the address about to be released. That guard belonged to
+        the era when the allowlist WAS the whole set; with the per-zone
+        content scan, an empty floor is a declaration, not a silent no-op.
+        There is no `scan_only` here: this is the rotation path, and the
+        manifest it builds is what apply will PATCH.
+        """
+        names = ["testip.shimobile.net"]
+        zr = _zone_records_for(names, old_ip="203.0.113.5")
+        pages = _records_pages_one(zr, names)
+        other = {"id": "rec-other", "name": "elsewhere.shimobile.net",
+                 "type": "A", "content": "9.9.9.9", "ttl": 300, "proxied": False}
+        zr = zr + [("zone-shimobile.net", other)]
+        pages[("zone-shimobile.net", other["name"])] = [[other]]
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(names)],
+                          records_pages=pages)
+        rc, stdout, stderr, result = _run_playbook_full(
+            self.base, op="discover", old_ip="203.0.113.5", new_ip="198.51.100.5",
+            allowed=[], scan_only=False)
+        if rc != 0:
+            print("STDOUT:", stdout[-2500:])
+        self.assertEqual(rc, 0)
+        self.assertEqual([r["name"] for r in result["manifest"]], names)
+
+    def test_a_floor_that_disagrees_with_the_allowlist_is_a_typo(self):
+        """Zero is allowed on both sides; disagreeing counts are still refused."""
+        names = ["testip.shimobile.net"]
+        zr = _zone_records_for(names, old_ip="203.0.113.5")
+        _install_handlers(zone_records=zr, zone_pages=[_zones_for(names)],
+                          records_pages=_records_pages_one(zr, names))
+        rc, stdout, stderr, result = _run_playbook_full(
+            self.base, op="discover", old_ip="203.0.113.5", new_ip="198.51.100.5",
+            allowed=names, expected_count_override=0)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("floor is a", stdout + stderr)
 
     def test_scan_only_cannot_be_smuggled_into_apply(self):
         """scan_only relaxes a discover-time floor. Nothing else.
