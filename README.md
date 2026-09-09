@@ -16,15 +16,10 @@ Provider is selected in `rotation.yml` (`provider: hcloud` or
 `provider: dataforest`). The state machine, the checkpoint format, the
 Cloudflare half, and the `make ip-change HOST=<alias>` half are shared.
 
-> ⚠ **This has never been run against a real server.** It was written
-> 2026-08-26 with a full offline test suite and **zero live API calls**. In this
-> repo that counts as *untested*, in those words — every one of the four traps
-> found on 2026-08-13 (`tmp.mount`, `aide --check`, conntrack buckets,
-> node_exporter's listener) surfaced after a completely green `--check`. Worse
-> here than usual: **the hcloud modules create no real actions in check mode**,
-> so `--check` cannot validate the stop → detach → attach → start ordering at
-> all. The first live run needs its own approval and
-> `make monitoring-doctor` on both sides of it.
+> Live runs are checkpointed and identity-pinned because **the hcloud modules
+> create no real actions in check mode**. A green `--check` cannot validate the
+> stop → detach → attach → start ordering; use `plan`, inspect its receipt, and
+> then explicitly dispatch `change-ip`.
 
 ---
 
@@ -42,7 +37,7 @@ in `rotation.yml` at that checkout; in CI the `dns` job clones it.
 
 `CLAUDE.md`, `.claude/agents/` and `.claude/skills/` travel with the directory.
 
-## CI/CD — the interactive pause became an approval gate
+## CI/CD — explicit dispatches without per-job approval
 
 GitHub Actions — **one workflow**, `.github/workflows/run.yml`:
 
@@ -55,23 +50,14 @@ Run workflow       three fields: operation, server_id, server_ip.
   rollback         find last checkpoint → prove it is that box → roll back
 ```
 
-### ⚠ The approval button is a paid feature
+The production environments intentionally have **no required reviewers** and
+no wait timer, so a dispatched job starts without an additional Approve
+deployment click. The `environment:` references remain because they scope the
+provider secrets and retain deployment history.
 
-This pipeline was designed around `environment:` + **required reviewers** —
-GitHub's answer to GitLab's per-job manual button. On a **private repository
-with a free plan that section does not exist**: the "Deployment protection
-rules" heading never renders, the run never enters *Waiting*, and the
-environment does nothing but scope the secret (which is still worth having —
-an environment secret is not readable by any workflow on any branch).
-
-So the pause is two dispatches: `plan` reads and prints, `change-ip` acts. It
-is a habit, not a check — and that is deliberate, because every check
-implemented inside the runner so far has hit a free-plan limitation. Read the
-plan, then dispatch the swap.
-
-Making the repository public, or moving to a paid plan, brings the real
-approval button back — the `environment:` lines are already there and would
-start pausing immediately.
+Operator intent is still explicit and two-phase: `plan` reads and prints a
+receipt; `change-ip` refuses unless that fresh receipt names the same server.
+The inventory check remains fail-closed before DNS is moved.
 
 The form asks **what to do, which server, and the address it is on right
 now** — nothing else. Every other value is in the config secret or is re-read
@@ -128,22 +114,18 @@ tool asks a human to edit the inventory. It expects **exit 6** — a deliberate
 pause, deliberately not exit 4, because a normal stage boundary showing red is
 how a real escalation stops being noticed.
 
-The human gate is not removed and `yes` is not piped blindly at the prompt. It
-moves to two things the workflow can fail on:
+The redundant environment approval is removed and `yes` is not piped blindly
+at the prompt. Safety comes from two checks the workflow can fail on:
 
-* **the pause** — `environment: hetzner-production` with *required reviewers*.
-  GitHub has no per-job manual button; a protected environment is the button.
-  The run sits in *Waiting* until someone approves that specific job, and the
-  wait between `swap` and `dns` is the window to commit the inventory edit. The
-  node is already up on the new address during it; only DNS still lags.
+* **the dispatch receipt** — `plan` and `change-ip` are separate explicit
+  dispatches, and the latter requires the former's fresh server-bound receipt.
 * **the grep** — before `dns` answers the inventory prompt it clones shikoonet
   and greps `inventory/hosts.yml` for the new address. No commit, no answer, no
   DNS change.
 
 Put `HCLOUD_TOKEN` on the **environment**, not the repository. An environment
-secret is only readable by a job that has passed that environment's reviewers;
-a repo secret is readable by any workflow on any branch. Masking is not a
-boundary.
+secret is exposed only to jobs that reference that environment. Required
+reviewers are disabled; the environment remains the credential boundary.
 
 `rollback` is a dispatch choice rather than a button on the old run, because
 GitHub — unlike GitLab — leaves no clickable button on a run that has
@@ -171,11 +153,10 @@ This is that half, and it hands off to the half that already works.
 
 ## What it will never do
 
-* **Delete anything.** No server, no Primary IP, no DNS record. After a
+* **Delete anything implicitly.** No server or DNS record is deleted. After a
   rollback the *new* address is retained; after success the *old* address is
-  retained. Both cost money and removing either is a separate decision with a
-  separate approval. `state: absent` appears nowhere in `hcloud_step.yml` and
-  `tests/contract.yml` asserts that by reading the file.
+  retained unless the configured retention policy authorizes release. Removing
+  a retained address is a separate explicit dispatch.
 * **Write to `inventory/hosts.yml`.** That file is the single source of truth.
   The tool prints the edit and waits. `auto_edit_inventory: true` is *refused*,
   not silently ignored.

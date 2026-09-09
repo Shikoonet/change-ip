@@ -314,12 +314,97 @@ STATE_LABELS = {
 }
 
 
+def _markdown_cell(value: Any) -> str:
+    """Return a single safe Markdown-table cell from checkpoint metadata."""
+    return redact(str(value or "-")).replace("\r", " ").replace("\n", " ").replace(
+        "|", "\\|"
+    )
+
+
+def _dns_report_rows(state: str, cp: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Build the token-free per-record DNS report for an Actions summary.
+
+    The preflight manifest is the canonical record set. It contains Cloudflare
+    ids, DNS names and the non-secret logical credential reference, but never a
+    token value. Production discovery also records ``zone_name``; older/test
+    checkpoints fall back to the stable zone id instead of omitting the row.
+    """
+    report_states = (
+        "cloudflare_preflighted",
+        "ansible_done",
+        "cloudflare_replaced",
+        "rolled_back",
+        "rollback_incomplete",
+        "escalated",
+    )
+    if state not in report_states:
+        return []
+    manifest = cp.get("cloudflare_manifest") or []
+    if not manifest:
+        return []
+    if state == "escalated" and not (
+        cp.get("cloudflare_apply_started") or cp.get("cloudflare_apply")
+    ):
+        # An identity/provider failure before the DNS half is unrelated to
+        # Cloudflare. The earlier preflight summary already lists its scope.
+        return []
+
+    if state == "rolled_back":
+        per_account = (cp.get("cloudflare_rollback") or {}).get("per_account") or []
+        successful_refs = {
+            str(item.get("credential_ref") or item.get("account") or "")
+            for item in per_account
+            if item.get("ok") is True
+        }
+        # A partial multi-account apply only rolls back the accounts whose
+        # subprocess actually started. Do not claim untouched buckets were
+        # restored. Legacy checkpoints have no per-account result and keep the
+        # full single-account manifest.
+        if per_account:
+            manifest = [
+                record for record in manifest
+                if str(record.get("credential_ref") or "_default") in successful_refs
+            ]
+
+    old_ip = str((cp.get("old_ip") or {}).get("ip") or "-")
+    new_ip = str((cp.get("new_ip") or {}).get("ip") or "-")
+    if state == "cloudflare_preflighted":
+        source, target, result = old_ip, new_ip, "planned"
+    elif state == "ansible_done":
+        source, target, result = old_ip, new_ip, "queued for update and verification"
+    elif state == "cloudflare_replaced":
+        source, target, result = old_ip, new_ip, "updated and verified"
+    elif state == "escalated":
+        source, target, result = old_ip, new_ip, "update attempted; run stopped"
+    elif state == "rollback_incomplete":
+        source, target, result = new_ip, old_ip, "rollback attempted; incomplete"
+    else:
+        source, target, result = new_ip, old_ip, "restored and verified"
+
+    rows = []
+    for record in manifest:
+        rows.append({
+            "account": str(record.get("credential_ref") or "_default"),
+            "zone": str(record.get("zone_name") or record.get("zone_id") or "-"),
+            "record": str(record.get("name") or "-"),
+            "source": source,
+            "target": target,
+            "result": result,
+        })
+    return sorted(
+        rows,
+        key=lambda item: (item["account"], item["zone"], item["record"]),
+    )
+
+
 def github_summary(state: str, cp: Dict[str, Any]) -> None:
-    """Append one row to GitHub's job summary. A no-op outside Actions.
+    """Append state and per-record DNS details to GitHub's job summary.
 
     Wired to Rotation.on_transition, so it fires on exactly the states the
     checkpoint reached — including `escalated` and `rolled_back`, which reach
-    it through the same _transition() the happy path uses.
+    it through the same _transition() the happy path uses. DNS rows come only
+    from the already-redacted checkpoint manifest; credentials are never read
+    or formatted here.
     """
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -339,6 +424,30 @@ def github_summary(state: str, cp: Dict[str, Any]) -> None:
                 "| utc | state | what happened | address |\n|:-|:-|:-|:-|\n"
             )
         handle.write(redact(row))
+        dns_rows = _dns_report_rows(state, cp)
+        if dns_rows:
+            title = {
+                "cloudflare_preflighted": "Cloudflare DNS scope (before server changes)",
+                "ansible_done": "Cloudflare DNS records queued for final update",
+                "cloudflare_replaced": "Cloudflare DNS records updated",
+                "rolled_back": "Cloudflare DNS records rolled back",
+                "rollback_incomplete": "Cloudflare DNS rollback incomplete",
+                "escalated": "Cloudflare DNS update stopped",
+            }[state]
+            handle.write(f"\n### {title}\n\n")
+            handle.write(
+                "| account | zone | A record | from | to | result |\n"
+                "|:-|:-|:-|:-|:-|:-|\n"
+            )
+            for dns_row in dns_rows:
+                handle.write(
+                    "| `{account}` | `{zone}` | `{record}` | `{source}` | "
+                    "`{target}` | {result} |\n".format(
+                        **{key: _markdown_cell(value)
+                           for key, value in dns_row.items()}
+                    )
+                )
+            handle.write(f"\n**{len(dns_rows)} A record(s) reported.**\n")
 
 
 TERMINAL = ("done", "planned", "rolled_back", "rollback_incomplete", "escalated",

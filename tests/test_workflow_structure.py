@@ -359,7 +359,7 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_release_step_is_gated_and_reads_retention(self):
         """The one delete in the workflow must be conditional three ways.
 
-        It runs only in the swap job (same reviewer that approved the swap),
+        It runs only in the explicitly dispatched swap job,
         only for provider-only (change-ip finishes at `done`, not here),
         and only when the config's old_ip.retention says release — read at
         run time from rotation.yml, never assumed. A `keep` config must exit 0
@@ -378,8 +378,8 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("--confirm-server-id", run)
         # The delete is reachable from exactly two places: the swap job's
         # post-pause step (checkpoint mode) and the release_old_ip job
-        # (by-address mode). Both sit on hetzner-production behind its
-        # reviewer. Anywhere else is a new, unreviewed path to a delete.
+        # (by-address mode). Both sit on hetzner-production so credentials
+        # remain environment-scoped. Anywhere else is a new path to a delete.
         # Three callers: swap (provider-only, after the pause), dns (change-ip,
         # after `done`), and release_old_ip (by address). All on
         # hetzner-production. The dns one must be gated on the inventory gate
@@ -399,7 +399,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("--txid", dns_rel[0]["run"])
         for jn in callers:
             self.assertEqual(self.jobs[jn].get("environment"), "hetzner-production",
-                             f"{jn} must sit behind hetzner-production's reviewer")
+                             f"{jn} must use hetzner-production's secret scope")
         rel = self.jobs["release_old_ip"]
         self.assertIn("inputs.operation == 'release-old-ip'", rel["if"])
         body = " ".join(s.get("run", "") for s in rel["steps"])
@@ -412,7 +412,7 @@ class WorkflowStructureTests(unittest.TestCase):
         Until 2026-09-09 the swap job ran `apply --until connectivity_ok`
         with no Cloudflare credential in scope: with a real DNS config the
         first step of the state machine (`cloudflare_preflight`) would have
-        escalated AFTER the reviewer approved, and with `mode: provider_only`
+        escalated only after dispatch, and with `mode: provider_only`
         it silently skipped DNS on every change-ip. Now preflight is its own
         step, gated on change-ip, and the swap resumes from it.
         """
@@ -604,8 +604,8 @@ class WorkflowStructureTests(unittest.TestCase):
         The playbook's only mutating verb is PATCH, reached from `apply` and
         `rollback`. This job may therefore invoke `discover` and nothing
         else. The check is on the job's own steps, not on the playbook: a
-        future edit that adds `operation=apply` here would hand a reviewer-
-        gated production token to a write path that nobody reviewed.
+        future edit that adds `operation=apply` here would hand a production
+        token to a write path that is meant to be read-only.
         """
         job = self.jobs.get("dns_scan")
         self.assertIsNotNone(job, "dns_scan job is missing")

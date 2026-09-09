@@ -1824,6 +1824,95 @@ class TestConfig(Base):
                       "server_on", "connectivity_ok", "done"):
             self.assertIn(f"`{state}`", text)
             self.assertIn(rotate.STATE_LABELS[state], text)
+        self.assertIn("Cloudflare DNS scope (before server changes)", text)
+        self.assertIn("Cloudflare DNS records updated", text)
+        self.assertIn("| account | zone | A record | from | to | result |", text)
+        self.assertIn("`ne.tinooer.top`", text)
+        self.assertIn("`46.224.67.245`", text)
+        self.assertIn("updated and verified", text)
+        self.assertNotIn(FAKE_CF_TOKEN, text)
+
+    def test_job_summary_names_every_multi_account_record(self):
+        path = os.path.join(self.tmp.name, "multi-account-summary.md")
+        open(path, "w").close()
+        saved = os.environ.get("GITHUB_STEP_SUMMARY")
+        os.environ["GITHUB_STEP_SUMMARY"] = path
+        cp = {
+            "txid": "tx-report",
+            "server": {
+                "id": 123,
+                "expected_name": "server",
+                "expected_location": "nbg1",
+            },
+            "old_ip": {"ip": "203.0.113.10"},
+            "new_ip": {"ip": "198.51.100.99"},
+            "cloudflare_manifest": [
+                {"name": "api.example.com", "zone_name": "example.com",
+                 "zone_id": "zone-a", "record_id": "record-a",
+                 "credential_ref": "account_a"},
+                {"name": "edge.example.net", "zone_name": "example.net",
+                 "zone_id": "zone-b", "record_id": "record-b",
+                 "credential_ref": "account_b"},
+            ],
+        }
+        try:
+            rotate.github_summary("cloudflare_replaced", cp)
+        finally:
+            if saved is None:
+                os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = saved
+
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        for expected in (
+            "`account_a`", "`example.com`", "`api.example.com`",
+            "`account_b`", "`example.net`", "`edge.example.net`",
+            "`203.0.113.10`", "`198.51.100.99`",
+        ):
+            self.assertIn(expected, text)
+        self.assertIn("**2 A record(s) reported.**", text)
+
+    def test_rollback_summary_does_not_claim_an_unstarted_account(self):
+        cp = {
+            "old_ip": {"ip": "203.0.113.10"},
+            "new_ip": {"ip": "198.51.100.99"},
+            "cloudflare_manifest": [
+                {"name": "a.example", "zone_name": "example",
+                 "credential_ref": "account_a"},
+                {"name": "b.example", "zone_name": "example",
+                 "credential_ref": "account_b"},
+            ],
+            "cloudflare_rollback": {"per_account": [
+                {"account": "account_a", "credential_ref": "account_a",
+                 "ok": True},
+                {"account": "account_b", "credential_ref": "account_b",
+                 "ok": False},
+            ]},
+        }
+        rows = rotate._dns_report_rows("rolled_back", cp)
+        self.assertEqual([row["record"] for row in rows], ["a.example"])
+        self.assertEqual(rows[0]["result"], "restored and verified")
+
+    def test_failed_cloudflare_update_summary_still_names_every_record(self):
+        cp = {
+            "old_ip": {"ip": "203.0.113.10"},
+            "new_ip": {"ip": "198.51.100.99"},
+            "cloudflare_manifest": [
+                {"name": "failed.example", "zone_name": "example",
+                 "credential_ref": "account_a"},
+            ],
+            "cloudflare_apply_started": {
+                "account_a": {"operation": "apply"},
+            },
+        }
+        rows = rotate._dns_report_rows("escalated", cp)
+        self.assertEqual([row["record"] for row in rows], ["failed.example"])
+        self.assertEqual(rows[0]["result"], "update attempted; run stopped")
+
+        # An unrelated provider failure must not claim DNS was attempted.
+        cp.pop("cloudflare_apply_started")
+        self.assertEqual(rotate._dns_report_rows("escalated", cp), [])
 
     def test_job_summary_is_a_no_op_off_ci(self):
         os.environ.pop("GITHUB_STEP_SUMMARY", None)
