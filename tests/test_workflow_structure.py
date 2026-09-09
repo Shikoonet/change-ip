@@ -27,7 +27,7 @@ that has either token and asserting:
   DATAFOREST     | plan_dataforest; swap_dataforest; swap_dataforest_guest;
                  | finalize (provider-finalize step);
                  | rollback_dataforest (rollback-provider step)
-  HCLOUD         | plan; swap; dns (SSH portion only); verify;
+  HCLOUD         | plan; swap; dns/resume (SSH portion only); verify;
                  | rollback (provider half only)
 """
 
@@ -36,6 +36,8 @@ from __future__ import annotations
 import os
 import subprocess
 import pathlib
+import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -45,6 +47,14 @@ import yaml
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "run.yml"
+
+
+def _load_script(name):
+    path = ROOT / ".github" / "scripts" / name
+    spec = importlib.util.spec_from_file_location(name.replace(".", "_"), path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 CF_TOKEN = "CLOUDFLARE_API_TOKEN"
 CF_ACCOUNT_A = "CLOUDFLARE_API_TOKEN_ACCOUNT_A"
@@ -66,7 +76,8 @@ JOB_LEVEL_TOKEN_BUDGETS = {
                "dataforest_provider_finalize", "rollback_dataforest"},
     # release_old_ip added 2026-09-08: it lists and deletes Primary IPs, so it
     # needs the Hetzner token and sits on hetzner-production like swap.
-    HC_TOKEN: {"plan", "swap", "dns", "verify", "rollback", "release_old_ip"},
+    HC_TOKEN: {"plan", "swap", "dns", "resume_hcloud", "verify", "rollback",
+               "release_old_ip"},
 }
 
 # Within `finalize`, the CF token lives ONLY on the finalize-precheck
@@ -376,19 +387,14 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn('"$retention" != "release"', run)
         self.assertIn("release-old-ip", run)
         self.assertIn("--confirm-server-id", run)
-        # The delete is reachable from exactly two places: the swap job's
-        # post-pause step (checkpoint mode) and the release_old_ip job
-        # (by-address mode). Both sit on hetzner-production so credentials
-        # remain environment-scoped. Anywhere else is a new path to a delete.
-        # Three callers: swap (provider-only, after the pause), dns (change-ip,
-        # after `done`), and release_old_ip (by address). All on
-        # hetzner-production. The dns one must be gated on the inventory gate
-        # AND on the resume step having succeeded — a rotation that stopped
-        # short keeps its way back.
+        # Four callers: swap (provider-only), dns (normal change-ip),
+        # resume_hcloud (recovery), and release_old_ip (by-address mode). All
+        # use hetzner-production. A rotation that stopped short keeps its way
+        # back because each in-transaction release follows state=done.
         callers = sorted({jn for jn, j in self.jobs.items()
                           for s in (j.get("steps") or [])
                           if "release-old-ip" in (s.get("run") or "")})
-        self.assertEqual(callers, ["dns", "release_old_ip", "swap"], callers)
+        self.assertEqual(callers, ["dns", "release_old_ip", "resume_hcloud", "swap"], callers)
         dns_rel = [s for s in self.jobs["dns"]["steps"]
                    if "Release the old address" in s.get("name", "")]
         self.assertEqual(len(dns_rel), 1)
@@ -464,10 +470,13 @@ class WorkflowStructureTests(unittest.TestCase):
             self.assertIn(tok, direct["env"])
         # it never carries the fleet path's credentials
         self.assertNotIn("SSH_PRIVATE_KEY", direct["env"])
-        # the refusal is now for a FLEET node whose commit is missing, only
-        refuse = steps["Refuse — records exist but the inventory commit is missing"]
-        self.assertIn("fleet == 'true'", refuse["if"])
-        gate = steps["Is this node in shikoonet's inventory?"]
+        # Fleet inventory is updated + pushed by the workflow; there is no
+        # human-commit refusal between the provider and DNS stages.
+        sync = steps["Update and commit shikoonet inventory automatically"]
+        self.assertIn("sync_inventory_repo.sh apply", sync["run"])
+        self.assertIn("SHIKOONET_PAT", sync["env"])
+        self.assertNotIn("Refuse — records exist but the inventory commit is missing", steps)
+        gate = steps["Classify the synchronized inventory"]
         self.assertIn("fleet=$fleet", gate["run"])
         self.assertIn("in_scope=$in_scope", gate["run"])
         # and a box that reached `done` by that path still releases the old address
@@ -542,16 +551,35 @@ class WorkflowStructureTests(unittest.TestCase):
         self.assertIn("if not manifest", dec["run"])
         self.assertIn("dns_scope=records", dec["run"])
         self.assertNotIn("/tmp/scan-", dec["run"])
-        refuse = steps["Refuse — records exist but the inventory commit is missing"]
-        self.assertIn("dns_scope == 'records'", refuse["if"])
-        self.assertIn("in_scope != 'true'", refuse["if"])
-        self.assertIn("exit 1", refuse["run"])
+        sync = steps["Update and commit shikoonet inventory automatically"]
+        self.assertIn("dns_scope == 'records'", sync["if"])
+        self.assertIn("sync_inventory_repo.sh apply", sync["run"])
         self.assertNotIn("Declare DNS out of scope and finish", steps)
         job_body = "\n".join(s.get("run", "") for s in self.jobs["dns"]["steps"])
         self.assertNotIn("declare-dns-out-of-scope", job_body)
         self.assertNotIn("dns_scope=none", job_body)
         # the swap job exports old_ip so the checkpoint binding is rechecked
         self.assertIn("old_ip", self.jobs["swap"]["outputs"])
+
+    def test_change_ip_preflights_inventory_write_and_resume_is_available(self):
+        swap_steps = {s.get("name"): s for s in self.jobs["swap"]["steps"]
+                      if s.get("name")}
+        preflight = swap_steps["Preflight automatic inventory commit (change-ip)"]
+        self.assertEqual(preflight["if"], "inputs.operation == 'change-ip'")
+        self.assertIn("sync_inventory_repo.sh check", preflight["run"])
+        self.assertIn("SHIKOONET_PAT", preflight["env"])
+
+        on = self.doc.get(True, self.doc.get("on"))
+        options = on["workflow_dispatch"]["inputs"]["operation"]["options"]
+        self.assertIn("resume", options)
+        resume = self.jobs["resume_hcloud"]
+        self.assertIn("inputs.operation == 'resume'", resume["if"])
+        body = "\n".join(step.get("run", "") for step in resume["steps"])
+        self.assertIn("find_resumable_checkpoint.py", body)
+        self.assertIn("sync_inventory_repo.sh apply", body)
+        self.assertIn("rotate.py resume", body)
+        self.assertNotIn("rotate.py apply", body)
+
 
     def test_every_test_module_is_in_exactly_one_ci_shard(self):
         """The CI matrix is the only list of what runs. It must be complete.
@@ -1495,3 +1523,109 @@ class TestCICommandGraphExecutable(unittest.TestCase):
                 msg=f"{cmd!r} appears {n} times in ci-full dry-run, "
                     f"but must run at most once: {[c for c in out if cmd in c]}",
             )
+
+
+class InventoryAutomationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.updater = _load_script("update_inventory.py")
+        cls.finder = _load_script("find_resumable_checkpoint.py")
+
+    def inventory(self, body):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "hosts.yml"
+        path.write_text(body)
+        return path
+
+    def test_inventory_update_is_targeted_format_preserving_and_idempotent(self):
+        path = self.inventory(
+            "all:\n"
+            "  children:\n"
+            "    nodes:\n"
+            "      hosts:\n"
+            "        HTZ-FI:\n"
+            "          ansible_host: '89.167.41.234'  # production\n"
+            "          ansible_user: root\n"
+        )
+        status = self.updater.update_inventory(
+            path, "HTZ-FI", "89.167.41.234", "46.62.161.237"
+        )
+        self.assertEqual(status, "updated")
+        text = path.read_text()
+        self.assertIn("ansible_host: '46.62.161.237'  # production", text)
+        self.assertIn("ansible_user: root", text)
+        self.assertEqual(
+            self.updater.update_inventory(
+                path, "HTZ-FI", "89.167.41.234", "46.62.161.237"
+            ),
+            "already-current",
+        )
+
+    def test_inventory_update_refuses_wrong_alias_and_ambiguous_address(self):
+        path = self.inventory(
+            "all:\n"
+            "  children:\n"
+            "    nodes:\n"
+            "      hosts:\n"
+            "        OTHER:\n"
+            "          ansible_host: 89.167.41.234\n"
+        )
+        with self.assertRaises(self.updater.InventoryError):
+            self.updater.update_inventory(
+                path, "HTZ-FI", "89.167.41.234", "46.62.161.237"
+            )
+
+        path = self.inventory(
+            "all:\n"
+            "  children:\n"
+            "    nodes:\n"
+            "      hosts:\n"
+            "        HTZ-FI:\n"
+            "          ansible_user: root\n"
+        )
+        with self.assertRaises(self.updater.InventoryError):
+            self.updater.update_inventory(
+                path, "HTZ-FI", "89.167.41.234", "46.62.161.237"
+            )
+
+        path = self.inventory(
+            "all:\n"
+            "  children:\n"
+            "    a:\n"
+            "      hosts:\n"
+            "        HTZ-FI: {ansible_host: 89.167.41.234}\n"
+            "    b:\n"
+            "      hosts:\n"
+            "        COPY:\n"
+            "          ansible_host: 89.167.41.234\n"
+        )
+        with self.assertRaises(self.updater.InventoryError):
+            self.updater.update_inventory(
+                path, "HTZ-FI", "89.167.41.234", "46.62.161.237"
+            )
+
+    def test_checkpoint_selection_uses_latest_state_per_transaction(self):
+        base = {
+            "provider": "hcloud",
+            "server": {"id": 136408362},
+            "new_ip": {"ip": "46.62.161.237"},
+            "cloudflare_manifest": [{"name": "fi.example"}],
+        }
+        terminal = dict(base, txid="same", state="rolled_back")
+        stale = dict(base, txid="same", state="connectivity_ok")
+        wanted = dict(base, txid="wanted", state="connectivity_ok")
+        artifacts = [
+            {"id": 3, "name": "rotation-state-rolledback", "expired": False},
+            {"id": 2, "name": "rotation-state-final", "expired": False},
+            {"id": 1, "name": "rotation-state", "expired": False},
+        ]
+        contents = {3: [terminal], 2: [stale], 1: [wanted]}
+        found = self.finder.find_checkpoint(
+            artifacts,
+            lambda artifact: contents[artifact["id"]],
+            "hcloud",
+            "136408362",
+            "46.62.161.237",
+        )
+        self.assertEqual(found["txid"], "wanted")

@@ -118,7 +118,9 @@
           --until only names PAUSABLE states; the assertion above lists
           exactly which string entries belong there. Widening this list lets
           a CI job stop between detach and attach.
-      # The human gate the interactive prompt used to be, on GitHub Actions.
+      # CI replaces the interactive prompt with an identity-checked inventory
+      # commit.  The check mode proves the fleet repo is writable before the
+      # provider mutation, and apply updates the same alias afterwards.
       # Three independent halves, because any one of them alone still lets a
       # real rotation happen off a git push:
       - file: ".github/workflows/run.yml"
@@ -141,11 +143,15 @@
           dispatches — `operation: plan` then `operation: change-ip` — and it
           is a habit, not a check.
       - file: ".github/workflows/run.yml"
-        pattern: 'grep -q -- "\$NEW_IP" /tmp/shikoonet/inventory/hosts.yml'
+        pattern: 'sync_inventory_repo.sh check'
         why: >-
-          `yes` is only ever answered to the inventory prompt after the new
-          address has been re-derived from the shikoonet checkout. Delete this
-          and the pipeline is piping yes at a question it did not verify
+          before Hetzner moves, a dry-run commit proves the exact alias can be
+          edited and the configured PAT has write access
+      - file: ".github/workflows/run.yml"
+        pattern: 'sync_inventory_repo.sh apply'
+        why: >-
+          after allocation, the workflow commits the exact old-to-new
+          ansible_host replacement before it answers the inventory prompt
 
   tasks:
 

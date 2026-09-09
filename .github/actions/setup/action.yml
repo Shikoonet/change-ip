@@ -61,8 +61,13 @@ runs:
         project = yaml.safe_load(open("rotation.project.yml")) or {}
         try:
             secret = yaml.safe_load(open("rotation.secret.yml")) or {}
-        except Exception:
-            secret = {}
+        except Exception as exc:
+            raise SystemExit(f"ROTATION_CONFIG is not valid YAML: {exc}")
+        if not isinstance(secret, dict):
+            raise SystemExit(
+                "ROTATION_CONFIG must be a YAML mapping, for example: "
+                "project_fingerprint: 1a718ab98481"
+            )
         fp = secret.get("project_fingerprint")
         if fp:
             project["project_fingerprint"] = fp

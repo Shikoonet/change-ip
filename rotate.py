@@ -4784,6 +4784,14 @@ def _resolve_state_dir(cfg: Dict[str, Any], config_path: str) -> str:
 
 
 def _resolve_repo_dir(cfg: Dict[str, Any], config_path: str) -> str:
+    # CI clones the fleet repository into an isolated runner directory.  The
+    # committed config deliberately cannot name that ephemeral path, so the
+    # workflow supplies it at process scope after the authenticated clone.
+    # This changes only where `make ip-change HOST=<alias>` runs; server and
+    # provider identity still come from the checkpoint + fresh provider read.
+    override = os.environ.get("ROTATION_ANSIBLE_REPO_DIR", "").strip()
+    if override:
+        return os.path.abspath(override)
     repo = (cfg.get("ansible") or {}).get("repo_dir") or ".."
     if os.path.isabs(repo):
         return repo

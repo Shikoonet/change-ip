@@ -46,7 +46,8 @@ push / PR          offline suite + lint only. No secrets, no cost.
                    This is the merge-request gate and it runs nowhere else.
 Run workflow       three fields: operation, server_id, server_ip.
   plan             read everything, change nothing, leave a receipt
-  change-ip        2·swap → 3·dns → 4·verify   (refuses without that receipt)
+  change-ip        swap → inventory commit → every DNS record → verify
+  resume           finish that chain from its exact saved checkpoint
   rollback         find last checkpoint → prove it is that box → roll back
 ```
 
@@ -57,7 +58,7 @@ provider secrets and retain deployment history.
 
 Operator intent is still explicit and two-phase: `plan` reads and prints a
 receipt; `change-ip` refuses unless that fresh receipt names the same server.
-The inventory check remains fail-closed before DNS is moved.
+Inventory synchronization is automatic and fail-closed before DNS is moved.
 
 The form asks **what to do, which server, and the address it is on right
 now** — nothing else. Every other value is in the config secret or is re-read
@@ -109,19 +110,19 @@ Primary IPv4** — there is no window where both are attached and no API call
 that swaps them atomically, so the detach must precede the attach. That pair
 is the entire outage, and it is as short as the platform permits.
 
-`swap` runs `--until connectivity_ok` and stops exactly where the interactive
-tool asks a human to edit the inventory. It expects **exit 6** — a deliberate
-pause, deliberately not exit 4, because a normal stage boundary showing red is
-how a real escalation stops being noticed.
+`swap` runs `--until connectivity_ok`; the next job automatically updates the
+selected alias in `inventory/hosts.yml`, commits it, and continues. Exit 6 is a
+checkpoint boundary between jobs, not a request for a manual edit.
 
-The redundant environment approval is removed and `yes` is not piped blindly
-at the prompt. Safety comes from two checks the workflow can fail on:
+The redundant environment approval is removed. Safety comes from two checks
+the workflow can fail on:
 
 * **the dispatch receipt** — `plan` and `change-ip` are separate explicit
   dispatches, and the latter requires the former's fresh server-bound receipt.
-* **the grep** — before `dns` answers the inventory prompt it clones shikoonet
-  and greps `inventory/hosts.yml` for the new address. No commit, no answer, no
-  DNS change.
+* **the inventory transaction** — before touching Hetzner, a dry-run commit
+  proves the fleet token can write. Afterwards the workflow parses the YAML,
+  requires exactly one matching alias and old address, preserves formatting,
+  commits only `inventory/hosts.yml`, and verifies the new value before DNS.
 
 Put `HCLOUD_TOKEN` on the **environment**, not the repository. An environment
 secret is exposed only to jobs that reference that environment. Required
@@ -157,9 +158,9 @@ This is that half, and it hands off to the half that already works.
   rollback the *new* address is retained; after success the *old* address is
   retained unless the configured retention policy authorizes release. Removing
   a retained address is a separate explicit dispatch.
-* **Write to `inventory/hosts.yml`.** That file is the single source of truth.
-  The tool prints the edit and waits. `auto_edit_inventory: true` is *refused*,
-  not silently ignored.
+* **Blindly rewrite `inventory/hosts.yml`.** The local CLI still prints the
+  edit and waits. GitHub Actions uses a separate guarded updater that changes
+  one explicit `alias.ansible_host`, commits that one file, and is idempotent.
 * **Touch a server it cannot re-prove.** Before every mutating step it re-reads
   the server and asserts id, name, location, project fingerprint, and the
   address that phase expects. A mismatch is `escalated` — never "try the other
@@ -243,9 +244,10 @@ mismatch · `3` provider error after retries · `4` escalated · `5` rolled back
  5. attach it
  6. power on                                    <- node reachable again
  7. TCP probe :22 on the new address
- 8. WAIT for you to edit inventory/hosts.yml
- 9. make ip-change HOST=<alias>                 <- Cloudflare PATCH + monitoring-doctor
+ 8. update + commit inventory/hosts.yml automatically
+ 9. make ip-change HOST=<alias>                 <- node-specific automation
 10. fresh read-back and a second probe
+11. PATCH + verify every Cloudflare manifest record in every configured account
 ```
 
 Steps 3 to 6 are the outage. Everything before step 2 is reversible for free.

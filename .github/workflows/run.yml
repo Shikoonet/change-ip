@@ -19,11 +19,10 @@
 #
 # WHAT REPLACED THE INTERACTIVE PROMPT.
 #
-# The tool was built around a human at a terminal: it powers the node down,
-# swaps the address, then STOPS and waits for someone to type the new IP into
-# shikoonet's inventory/hosts.yml before it moves DNS. A workflow has no stdin,
-# and the honest way to keep that gate is not to pipe `yes` at it — it is to
-# move the gate somewhere the workflow can actually fail on:
+# The tool was built around a human at a terminal.  CI replaces the inventory
+# prompt with a narrowly-scoped, identity-checked git update: it edits only the
+# selected alias's explicit ansible_host, commits that one file, then lets the
+# existing Ansible + Cloudflare state machine continue.
 #
 #   * production environments deliberately have no required-reviewer rule.
 #     They scope secrets and keep deployment history without stopping every
@@ -31,16 +30,15 @@
 #     `operation: plan` reads and prints, then `operation: change-ip` acts.
 #     That is not left as a habit — plan uploads a receipt and swap refuses
 #     without a fresh one naming the same server. See swap's first step.
-#   * the inventory edit becomes a COMMIT in the shikoonet repo, and the `dns`
-#     job GREPS that checkout for the new address before it answers the prompt.
-#     No commit, no answer, no DNS change.
+#   * before the provider mutation, a dry-run commit proves that the fleet PAT
+#     can write the inventory repo; after allocation, `dns` makes and pushes
+#     the real commit.  Any identity mismatch or push failure stops before DNS.
 #
 # So `yes` is never a guess here. It is a fact the job re-derived from git.
 #
-# The human window is between `swap` and `dns`: the node is already up on the
-# new address, DNS still points at the old one. That state is stable and
-# resumable — take as long as the edit needs. `dns` fails until the inventory
-# commit lands, so the window closes on a fact, not on a timer.
+# The swap-to-DNS boundary remains checkpointed and resumable, but a normal run
+# crosses it automatically. `resume` recovers a run that stopped there without
+# allocating yet another address.
 #
 # `--check` cannot validate the stop → detach → attach → start ordering,
 # because the hcloud modules create no real actions in check mode. Live runs
@@ -63,8 +61,9 @@
 #   SSH_PRIVATE_KEY         only `dns` needs it (ip-change.yml SSHes the node
 #                           on its new address).
 #   ANSIBLE_VAULT_PASSWORD  shikoonet's vault, for the Cloudflare token.
-#   SHIKOONET_REPO          https URL of the shikoonet checkout, with a
-#                           read-only token.
+#   SHIKOONET_REPO          https URL of the shikoonet checkout.
+#   SHIKOONET_PAT           fine-grained token for that repo with Contents:
+#                           Read and write (ADMIN_PAT is the fallback).
 #
 # Put HCLOUD_TOKEN on the ENVIRONMENT, not the repo: an environment secret is
 # exposed only to jobs that reference that environment. Required reviewers are
@@ -86,6 +85,7 @@ on:
         options:
           - plan
           - change-ip
+          - resume
           - provider-only
           - dns-scan
           - release-old-ip
@@ -103,7 +103,7 @@ on:
         description: 'Hetzner server id OR DataForest Seed UUID. Must equal server.id in the config.'
         required: true
       server_ip:
-        description: 'The address the server is on RIGHT NOW. change-ip/provider-only: the old IP. rollback: the new IP on the first attempt, or the old IP when resuming after provider rollback. dns-scan: the address to SEARCH DNS for; it need not be current.'
+        description: 'The address the server is on RIGHT NOW. change-ip/provider-only: the old IP. resume: the new IP left by the interrupted run. rollback: the new IP on the first attempt, or the old IP when resuming after provider rollback. dns-scan: the address to SEARCH DNS for; it need not be current.'
         required: true
       dns_names:
         description: 'Optional extra assertion, comma- or space-separated. You do NOT need to list every record: preflight automatically finds every A record on the old IP across every visible zone and every result page. If supplied, each name must be in that manifest. A full change-ip also refuses an empty manifest before anything moves; use provider-only only when DNS is intentionally out of scope.'
@@ -201,8 +201,8 @@ jobs:
   #    address, allocates a new one in the same datacenter, attaches it, powers
   #    back on, and waits for TCP on the SSH port.
   #
-  #    `--until connectivity_ok` stops it exactly where the interactive tool
-  #    asks a human to edit the inventory.
+  #    `--until connectivity_ok` creates the safe hand-off to the automatic
+  #    inventory + DNS job.
   #
   #    ⚠ Between the detach and the start the node has NO public address.
   #
@@ -283,6 +283,24 @@ jobs:
               print('  ' + r['name'])
           if len(m) > 50:
               print(f'  ... {len(m) - 50} more record(s); manifest is complete')"
+      - name: Preflight automatic inventory commit (change-ip)
+        if: inputs.operation == 'change-ip'
+        env:
+          SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
+          SHIKOONET_PAT: ${{ secrets.SHIKOONET_PAT }}
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
+          OLD_IP: ${{ inputs.server_ip }}
+        run: |
+          set -euo pipefail
+          TXID=$(ls -t state/*.json | head -1 | xargs -n1 basename | sed 's/\.json$//')
+          export ALIAS
+          ALIAS=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['alias'])")
+          # The real new address does not exist yet.  A documentation-only
+          # address lets the updater build a local commit and `git push
+          # --dry-run` prove write access before Hetzner is touched.
+          export NEW_IP=192.0.2.1
+          test "$OLD_IP" != "$NEW_IP" || export NEW_IP=198.51.100.1
+          bash .github/scripts/sync_inventory_repo.sh check
       - id: run
         run: |
           set +e
@@ -613,16 +631,11 @@ jobs:
         if: always()
         with: {name: rotation-state-dns, path: state/, retention-days: 3}
 
-  # 3. dns — the half that already worked. Runs `make ip-change HOST=<alias>`
-  #    in a shikoonet checkout, which PATCHes the Cloudflare record in place
-  #    and reads it back from the API as a gate.
-  #
-  #    THE GATE THAT REPLACED THE PROMt is the grep below. rotate.py is about
-  #    to ask "did you type the new address into the inventory?" — this job
-  #    answers that from the shikoonet default branch, never from an
-  #    assumption.
+  # 3. dns — atomically update the fleet inventory, run the existing
+  #    node-specific Ansible path, then PATCH every record captured by the
+  #    preflight manifest through the credential of the account that found it.
   dns:
-    name: 3 · move DNS (gated by the inventory commit)
+    name: 3 · update inventory and move every DNS record
     needs: [swap]
     if: inputs.operation == 'change-ip'
         && inputs.provider == 'hcloud'
@@ -647,10 +660,6 @@ jobs:
           expect_ipv4: "${{ inputs.server_ip }}"
       - uses: actions/download-artifact@v4
         with: {name: rotation-state, path: state/}
-      # Gate the WHOLE rest of the job on whether the node is in shikoonet's
-      # inventory. An empty SHIKOONET_REPO or an absent inventory line is the
-      # "right answer is skip, not fail" case: a throwaway test server is not
-      # in shikoonet, and refusing to skip made every test run look red.
       # ---- consume the preflight manifest --------------------------------
       # The swap job built this manifest BEFORE touching Hetzner. It scanned
       # every visible zone and every result page, and full `change-ip` now
@@ -682,53 +691,20 @@ jobs:
               fh.write("dns_scope=records\n")
           PYX
 
-      # ---- records exist: the inventory gate --------------------------------
-      # TWO steps on purpose. The contract forbids a step that writes
-      # $GITHUB_OUTPUT from also holding token-shaped data, so a step that
-      # can leak a credential into an output cannot exist. The clone carries
-      # the credentials and writes no output; the decision reads the checkout
-      # and carries no credentials.
-      - name: Fetch shikoonet (credentials live here, no outputs)
+      # This credential-bearing step writes no GitHub output. It updates only
+      # inventory/hosts.yml, and only after parsed YAML proves ALIAS currently
+      # owns OLD_IP. The following token-free step classifies the result.
+      - name: Update and commit shikoonet inventory automatically
         if: steps.decide.outputs.dns_scope == 'records'
         env:
           SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
-          # shikoonet is a PRIVATE repo, so an anonymous clone gets
-          # "could not read Username for 'https://github.com'" and exit 128 —
-          # which is what killed this job on 2026-09-08 after the address had
-          # already moved. SHIKOONET_PAT if provided, else ADMIN_PAT.
           SHIKOONET_PAT: ${{ secrets.SHIKOONET_PAT }}
           ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
+          OLD_IP: ${{ needs.swap.outputs.old_ip }}
+          NEW_IP: ${{ needs.swap.outputs.new_ip }}
         run: |
-          set -e
-          rm -rf /tmp/shikoonet /tmp/shikoonet.absent
-          if [ -z "$SHIKOONET_REPO" ]; then
-            echo "SHIKOONET_REPO is empty -> nothing to fetch; the gate will say out of scope"
-            touch /tmp/shikoonet.absent
-            exit 0
-          fi
-          tok="${SHIKOONET_PAT:-$ADMIN_PAT}"
-          if [ -z "$tok" ]; then
-            echo "::error::Cannot read $SHIKOONET_REPO: neither SHIKOONET_PAT nor"
-            echo "::error::ADMIN_PAT is set, and the repo is private. The inventory"
-            echo "::error::gate cannot be evaluated; skipping it would move DNS"
-            echo "::error::without confirming the commit exists."
-            exit 1
-          fi
-          # A credential helper that lives for this one command. A token
-          # inside the URL would land in .git/config, remotes and error
-          # messages — CLAUDE.md forbids exactly that.
-          tokf=$(mktemp); chmod 600 "$tokf"; printf '%s' "$tok" > "$tokf"
-          if ! git -c "credential.helper=!f() { echo username=x-access-token; echo password=$(cat $tokf); }; f" \
-                 clone --depth 1 --quiet "$SHIKOONET_REPO" /tmp/shikoonet; then
-            rm -f "$tokf"
-            echo "::error::clone of shikoonet failed. The token in use cannot read"
-            echo "::error::that repository — a fine-grained PAT scoped to change-ip"
-            echo "::error::alone will not (and cannot: one resource owner per PAT)."
-            echo "::error::Set SHIKOONET_PAT to a token owned by that repo's owner."
-            exit 1
-          fi
-          rm -f "$tokf"
-      - name: Is this node in shikoonet's inventory?
+          bash .github/scripts/sync_inventory_repo.sh apply
+      - name: Classify the synchronized inventory
         id: in_scope
         if: steps.decide.outputs.dns_scope == 'records'
         env:
@@ -736,16 +712,9 @@ jobs:
           OLD_IP: ${{ needs.swap.outputs.old_ip }}
         run: |
           set -e
-          # Two facts, ASSIGNED in the shell scope — an earlier version only
-          # echoed one and the DNS half was skipped on every rotation:
-          #   fleet    = the inventory names this box (either address), so
-          #              `make ip-change` is how its DNS moves;
-          #   in_scope = it names the NEW address, so the human commit exists.
-          # Not a fleet node at all means hand-made records with no inventory
-          # line — the tool PATCHes those itself from the manifest.
           in_scope=false; fleet=false
-          inv=/tmp/shikoonet/inventory/hosts.yml
-          if [ -e /tmp/shikoonet.absent ]; then
+          inv="$RUNNER_TEMP/shikoonet/inventory/hosts.yml"
+          if [ -e "$RUNNER_TEMP/shikoonet.absent" ]; then
             echo "no shikoonet checkout -> not a fleet node"
           else
             grep -q -- "$NEW_IP" "$inv" && in_scope=true
@@ -754,20 +723,6 @@ jobs:
           fi
           echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"
           echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
-      # Records point at the old address and the node is NOT in the inventory:
-      # the human commit is missing. This is the gate the whole CD design
-      # keeps on purpose. It fails; it does not skip.
-      - name: Refuse — records exist but the inventory commit is missing
-        if: steps.decide.outputs.dns_scope == 'records'
-            && steps.in_scope.outputs.fleet == 'true'
-            && steps.in_scope.outputs.in_scope != 'true'
-        env:
-          NEW_IP: ${{ needs.swap.outputs.new_ip }}
-        run: |
-          echo "::error::DNS records point at the old address, but $NEW_IP is not in"
-          echo "::error::shikoonet's inventory/hosts.yml. Commit the inventory change,"
-          echo "::error::then dispatch 'resume' — or roll back. Nothing was moved."
-          exit 1
       - name: Resume the rotation in shikoonet
         if: steps.decide.outputs.dns_scope == 'records' && steps.in_scope.outputs.in_scope == 'true'
         env:
@@ -793,6 +748,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
           CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+          ROTATION_ANSIBLE_REPO_DIR: ${{ runner.temp }}/shikoonet
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_ed25519
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
@@ -823,8 +779,8 @@ jobs:
         run: |
           set -e
           inv=""
-          test -f /tmp/shikoonet/inventory/hosts.yml \
-            && inv="--inventory /tmp/shikoonet/inventory/hosts.yml"
+          test -f "$RUNNER_TEMP/shikoonet/inventory/hosts.yml" \
+            && inv="--inventory $RUNNER_TEMP/shikoonet/inventory/hosts.yml"
           python3 rotate.py declare-ansible-out-of-scope --config rotation.yml \
             --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}" $inv
           python3 .github/scripts/stage.py \
@@ -857,6 +813,126 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: rotation-state-final, path: state/, retention-days: 3}
+
+  # Recover a change-ip that reached the new address but stopped before all
+  # inventory/DNS work completed.  It selects the newest artifact matching all
+  # three identity facts (provider, immutable server id, current NEW_IP), so a
+  # busy multi-server project never resumes "the latest run" by accident.
+  resume_hcloud:
+    name: resume · finish inventory and DNS without another IP rotation
+    if: inputs.operation == 'resume' && inputs.provider == 'hcloud'
+    runs-on: ubuntu-latest
+    environment: hetzner-production
+    timeout-minutes: 30
+    env:
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      ANSIBLE_HOST_KEY_CHECKING: 'False'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          rotation_config: "${{ secrets.ROTATION_CONFIG }}"
+          expect_ipv4: "${{ inputs.server_ip }}"
+      - name: Recover the exact incomplete checkpoint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/find_resumable_checkpoint.py \
+            --provider hcloud \
+            --server-id "${{ inputs.server_id }}" \
+            --current-ip "${{ inputs.server_ip }}" \
+            --state-dir state
+      - name: Re-prove checkpoint identity
+        id: cp
+        env:
+          SERVER_ID: ${{ inputs.server_id }}
+          SERVER_IP: ${{ inputs.server_ip }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob, json, os, sys
+          files = glob.glob("state/*.json")
+          if len(files) != 1:
+              sys.exit(f"expected one recovered checkpoint, found {len(files)}")
+          cp = json.load(open(files[0]))
+          if str(cp["server"]["id"]) != os.environ["SERVER_ID"].strip():
+              sys.exit("recovered checkpoint server_id changed")
+          if cp["new_ip"]["ip"] != os.environ["SERVER_IP"].strip():
+              sys.exit("recovered checkpoint NEW_IP changed")
+          state = cp.get("resume_state") if cp.get("state") == "escalated" else cp.get("state")
+          print(f"txid={cp['txid']}")
+          print(f"old_ip={cp['old_ip']['ip']}")
+          print(f"new_ip={cp['new_ip']['ip']}")
+          print(f"alias={cp['alias']}")
+          print(f"needs_declare={'true' if state == 'connectivity_ok' else 'false'}")
+          PY
+      - name: Update and commit shikoonet inventory automatically
+        env:
+          SHIKOONET_REPO: ${{ secrets.SHIKOONET_REPO }}
+          SHIKOONET_PAT: ${{ secrets.SHIKOONET_PAT }}
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
+          OLD_IP: ${{ steps.cp.outputs.old_ip }}
+          NEW_IP: ${{ steps.cp.outputs.new_ip }}
+          ALIAS: ${{ steps.cp.outputs.alias }}
+        run: bash .github/scripts/sync_inventory_repo.sh apply
+      - name: Classify the synchronized inventory
+        id: in_scope
+        env:
+          OLD_IP: ${{ steps.cp.outputs.old_ip }}
+          NEW_IP: ${{ steps.cp.outputs.new_ip }}
+        run: |
+          in_scope=false; fleet=false
+          inv="$RUNNER_TEMP/shikoonet/inventory/hosts.yml"
+          if [ ! -e "$RUNNER_TEMP/shikoonet.absent" ]; then
+            grep -q -- "$NEW_IP" "$inv" && in_scope=true
+            { grep -q -- "$NEW_IP" "$inv" || grep -q -- "$OLD_IP" "$inv"; } && fleet=true
+          fi
+          echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"
+          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
+      - name: Declare Ansible out of scope for a non-fleet node
+        if: steps.in_scope.outputs.fleet == 'false' && steps.cp.outputs.needs_declare == 'true'
+        run: |
+          inv=""
+          test -f "$RUNNER_TEMP/shikoonet/inventory/hosts.yml" \
+            && inv="--inventory $RUNNER_TEMP/shikoonet/inventory/hosts.yml"
+          python3 rotate.py declare-ansible-out-of-scope --config rotation.yml \
+            --txid "${{ steps.cp.outputs.txid }}" \
+            --confirm-server-id "${{ inputs.server_id }}" $inv
+      - name: Resume inventory, Cloudflare PATCH and verification
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+          ROTATION_ANSIBLE_REPO_DIR: ${{ runner.temp }}/shikoonet
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          install -m 600 -D /dev/null ~/.vault_pass_pasarguard
+          printf '%s\n' "$VAULT_PASSWORD" > ~/.vault_pass_pasarguard
+          printf 'yes\n' | python3 .github/scripts/stage.py \
+            --expect-rc 0 --expect-state done \
+            --txid "${{ steps.cp.outputs.txid }}" \
+            --label "resume.hcloud_dns" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "${{ steps.cp.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+      - name: Release the old address when configured
+        if: success()
+        run: |
+          retention=$(python3 -c "import yaml;print((yaml.safe_load(open('rotation.yml')).get('old_ip') or {}).get('retention','keep'))")
+          if [ "$retention" = "release" ]; then
+            python3 rotate.py release-old-ip --config rotation.yml \
+              --txid "${{ steps.cp.outputs.txid }}" \
+              --confirm-server-id "${{ inputs.server_id }}"
+          else
+            echo "old_ip.retention=$retention; old address retained"
+          fi
+      - run: python3 rotate.py status --config rotation.yml --txid "${{ steps.cp.outputs.txid }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: rotation-state-resumed, path: state/, retention-days: 3}
 
   # 3'. dns-scan — READ-ONLY. "What in DNS still points at this address?"
   #
