@@ -109,6 +109,10 @@ on:
       server_ip:
         description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip. dns-scan: the address to SEARCH DNS for — it does not have to be a current address, and that is the point.'
         required: true
+      dns_names:
+        description: 'Optional. FQDNs you know point at this box, comma- or space-separated (e.g. testip.shimobile.net). Each one must turn up in the DNS preflight or the run stops BEFORE anything moves. It is the only guard against a zone no configured Cloudflare credential can read: run 34317550319 proved "0 records across 8 zones", called DNS out of scope and deleted the old address while testip.shimobile.net still pointed at it, in a ninth zone neither token could see.'
+        required: false
+        default: ''
 
 concurrency:
   # Live operations only. `cancel-in-progress: false` is mandatory:
@@ -260,11 +264,17 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
           CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+          DNS_NAMES: ${{ inputs.dns_names }}
         run: |
           set +e
+          names=""
+          for n in $(printf '%s' "$DNS_NAMES" | tr ',' ' '); do
+            names="$names --dns-name $n"
+          done
           python3 rotate.py apply --config rotation.yml \
             --confirm-server-id "${{ inputs.server_id }}" \
-            --expect-ipv4 "${{ inputs.server_ip }}" --until cloudflare_preflighted
+            --expect-ipv4 "${{ inputs.server_ip }}" $names \
+            --until cloudflare_preflighted
           rc=$?
           set -e
           test "$rc" -eq 6 || exit "$rc"

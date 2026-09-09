@@ -432,6 +432,22 @@ class WorkflowStructureTests(unittest.TestCase):
         # provider-only declares itself per run instead of relying on the config
         self.assertIn("--provider-only", run["run"])
 
+    def test_the_form_can_name_records_and_preflight_enforces_them(self):
+        """`dns_names` is the only guard against a zone no credential can read."""
+        # PyYAML reads the bare key `on:` as the boolean True.
+        on = self.doc.get(True, self.doc.get("on"))
+        inputs = on["workflow_dispatch"]["inputs"]
+        self.assertIn("dns_names", inputs)
+        self.assertFalse(inputs["dns_names"].get("required"),
+                         "naming records must stay optional")
+        pre = next(s for s in self.jobs["swap"]["steps"]
+                   if (s.get("name") or "").startswith("Preflight DNS"))
+        self.assertIn("DNS_NAMES", pre["env"])
+        self.assertIn("--dns-name", pre["run"])
+        # and it must not have cost the step its credentials
+        for tok in ("CLOUDFLARE_API_TOKEN_ACCOUNT_A", "CLOUDFLARE_API_TOKEN_ACCOUNT_B"):
+            self.assertIn(tok, pre["env"])
+
     def test_records_without_an_inventory_line_are_patched_not_skipped(self):
         """A box with hand-made records is not a fleet node and not out of scope."""
         steps = {s.get("name"): s for s in self.jobs["dns"]["steps"] if s.get("name")}

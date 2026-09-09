@@ -895,6 +895,7 @@ class Rotation:
         ssh_keyscan: Optional[Callable[..., Dict[str, Any]]] = None,
         expect_ipv4: Optional[str] = None,
         provider_only: bool = False,
+        require_dns_names: Optional[List[str]] = None,
     ):
         # ROTATION_TEST_MODE=1 + ROTATION_PROBE=accept / refuse lets the
         # test harness short-circuit the real SSH probe. Production
@@ -949,6 +950,17 @@ class Rotation:
         # second exists because `operation: provider-only` is a per-run choice
         # on a form, and pinning it in the config meant a config edit to move
         # between the two — the manual step this repo exists to remove.
+        # Names the OPERATOR says point at this box, stated per run. Every
+        # one of them must turn up in the preflight manifest or the run stops
+        # before anything moves. This is the floor that catches the failure a
+        # config-side allowlist cannot: a zone NO configured credential can
+        # see. Run 34317550319 proved "0 records across 8 zones", declared DNS
+        # out of scope and deleted the old address — while
+        # testip.shimobile.net still pointed at it, in a ninth zone neither
+        # token could read. Per run, so nothing goes stale between rotations.
+        self.require_dns_names = [
+            str(n).strip().lower() for n in (require_dns_names or []) if str(n).strip()
+        ]
         self.provider_only = bool(provider_only) or (
             (self.cfg.get("cloudflare") or {}).get("mode") == "provider_only"
         )
@@ -1236,6 +1248,12 @@ class Rotation:
             )
         if not scan_paths:
             raise NonRetryableError("at least one --scan result file is required")
+        if self.require_dns_names:
+            raise NonRetryableError(
+                f"this run names DNS records to move "
+                f"({', '.join(self.require_dns_names)}); it cannot also declare DNS "
+                "out of scope."
+            )
         old_ip = (cp.get("old_ip") or {}).get("ip")
         evidence = []
         for path in scan_paths:
@@ -1772,6 +1790,12 @@ class Rotation:
         manifest and skip the API call: the structural pause later guards
         us from doing work we said we wouldn't.
         """
+        if self.provider_only and self.require_dns_names:
+            raise NonRetryableError(
+                f"provider-only was declared for this run, but it also names DNS "
+                f"records to move ({', '.join(self.require_dns_names)}). One of the "
+                "two is wrong; refusing to guess which."
+            )
         if self.provider_only:
             cp["cloudflare_manifest"] = []
             cp["cloudflare_preflight"] = {"ts": utcnow(), "skipped": True}
@@ -1844,6 +1868,25 @@ class Rotation:
         # Combined invariants: no record is owned by more than one account,
         # the union covers every configured FQDN exactly once, and the
         # combined digest is stable across runs.
+        # Every name the operator stated must actually be in the manifest.
+        # "Not found" here means one of: it does not point at the old address,
+        # it is not an A record, or — the case that cost a live run — its zone
+        # is invisible to every credential this config carries.
+        if self.require_dns_names:
+            found = {str(r.get("name") or "").strip().lower() for r in combined}
+            missing = [n for n in self.require_dns_names if n not in found]
+            if missing:
+                seen = ", ".join(sorted(found)) or "nothing"
+                raise EscalationRequired(
+                    f"named record(s) {', '.join(missing)} were not found on "
+                    f"{cp['old_ip']['ip']} by any configured Cloudflare account "
+                    f"({', '.join(a['name'] + '/' + a['token_env'] for a in accounts)}). "
+                    f"What the accounts DID find: {seen}. Nothing has moved. Either the "
+                    "name does not point at this address, or its zone belongs to an "
+                    "account this config has no credential for — add that account to "
+                    "cloudflare.accounts and its token to the environments.",
+                    [f"# check the zone's account, then re-dispatch"],
+                )
         owned_ids = [(r.get("zone_id"), r.get("record_id")) for r in combined]
         if len(owned_ids) != len(set(owned_ids)):
             raise EscalationRequired(
@@ -4467,6 +4510,11 @@ def main(
     p_apply = sub.add_parser("apply", help="execute a rotation")
     p_apply.add_argument("--config", required=True)
     p_apply.add_argument("--confirm-server-id", default=None)
+    p_apply.add_argument("--dns-name", action="append", default=[],
+                         help="an FQDN that points at this box. Repeatable. Every one "
+                              "must show up in the preflight manifest or the run stops "
+                              "before anything moves — the only guard against a zone no "
+                              "configured Cloudflare credential can see")
     p_apply.add_argument("--provider-only", action="store_true",
                          help="declare THIS run provider-only: no Cloudflare call at all, "
                               "pause at connectivity_ok. Same meaning as the config's "
@@ -4480,6 +4528,8 @@ def main(
     p_resume.add_argument("--txid", required=True)
     p_resume.add_argument("--config", default=None)
     p_resume.add_argument("--confirm-server-id", default=None)
+    p_resume.add_argument("--dns-name", action="append", default=[],
+                          help="see `apply --dns-name`")
     p_resume.add_argument("--provider-only", action="store_true",
                           help="see `apply --provider-only`")
     p_resume.add_argument("--until", choices=PAUSABLE, default=None,
@@ -4761,6 +4811,7 @@ def _dispatch(
         # already frozen in the checkpoint that plan wrote.
         expect_ipv4=getattr(args, "expect_ipv4", None),
         provider_only=bool(getattr(args, "provider_only", False)),
+        require_dns_names=list(getattr(args, "dns_name", None) or []),
         # Every transition also lands in GitHub's job summary. Outside Actions
         # the hook writes nothing, so this costs a dict lookup on a terminal.
         **{"on_transition": github_summary, **(rotation_kwargs or {})},

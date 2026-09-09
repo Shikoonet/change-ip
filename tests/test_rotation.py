@@ -722,6 +722,65 @@ class TestPerProjectConfig(Base):
         self.assertIn(cp_old := DEFAULT_OLD_IP_ID, fake.ips)
 
 
+class TestNamedDnsRecordsFloor(Base):
+    """`--dns-name`: what the operator knows must be found before anything moves.
+
+    Run 34317550319 is the case. Both credentials reported "0 records, 8
+    zones seen", the run declared DNS out of scope, finished green and
+    deleted the old Primary IP — while testip.shimobile.net still resolved to
+    it, in a ninth zone neither token could read. Proving "nothing in the
+    zones I can see" is not proving "nothing".
+    """
+
+    def _world(self, names, **kw):
+        from tests.fake_cloudflare import FakeCloudflare
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        del cfg["server"]; del cfg["dns"]; cfg["ansible"].pop("host_alias")
+        cfg["cloudflare"] = {"accounts": {
+            "acct": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A", "records": []}}}
+        os.environ["CLOUDFLARE_API_TOKEN_ACCOUNT_A"] = FAKE_CF_TOKEN
+        self.addCleanup(os.environ.pop, "CLOUDFLARE_API_TOKEN_ACCOUNT_A", None)
+        cf = FakeCloudflare(old_ip=fake.server["ipv4_address"])
+        rot = self.build(fake=fake, cfg=cfg, cf=cf,
+                         expect_ipv4=fake.server["ipv4_address"],
+                         require_dns_names=names, **kw)
+        rot.cfg.setdefault("server", {})["id"] = fake.server["id"]
+        return fake, cf, rot
+
+    def test_a_name_no_credential_can_see_stops_before_the_swap(self):
+        fake, cf, rot = self._world(["testip.shimobile.net"])
+        cp = self.full_run(rot)
+        # escalated, not rolled_back: preflight runs before any mutation, so
+        # there is nothing to roll back — a human is simply needed.
+        self.assertEqual(cp["outcome"], "escalated")
+        self.assertNotIn("stop", [c["op"] for c in fake.calls],
+                         "the box must not be touched")
+        self.assertEqual(fake.server["ipv4_address"], "46.224.67.245")
+        text = "\n".join(self.lines)
+        self.assertIn("testip.shimobile.net", text)
+        self.assertIn("no credential for", text)
+
+    def test_a_name_the_scan_finds_passes(self):
+        found = "ne.tinooer.top"          # seeded by FakeCloudflare on the old address
+        fake, cf, rot = self._world([found], until="connectivity_ok")
+        cp = self.full_run(rot)
+        self.assertEqual(cp["state"], "connectivity_ok")
+        self.assertIn(found, [r["name"] for r in cp["cloudflare_manifest"]])
+
+    def test_named_records_cannot_also_be_declared_out_of_scope(self):
+        fake, cf, rot = self._world(["ne.tinooer.top"], until="connectivity_ok")
+        cp = self.full_run(rot)
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.declare_dns_out_of_scope(cp, ["/dev/null"])
+
+    def test_provider_only_and_named_records_is_a_contradiction(self):
+        fake, cf, rot = self._world(["ne.tinooer.top"], provider_only=True)
+        cp = self.full_run(rot)
+        self.assertEqual(cp["outcome"], "escalated")
+        self.assertNotIn("stop", [c["op"] for c in fake.calls])
+
+
 class TestDeclareAnsibleOutOfScope(Base):
     """A box with DNS records but no shikoonet inventory line: the tool PATCHes."""
 
