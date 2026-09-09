@@ -632,6 +632,149 @@ class TestIdentity(Base):
 
 
 # ---------------------------------------------------------------------------
+class TestPerProjectConfig(Base):
+    """No server block: the form's number + the typed address ARE the identity.
+
+    Run 34312249225 refused a new server with "identity mismatch" because the
+    secret pinned the previous one; editing three environments per server is
+    the manual step this repo exists to remove.
+    """
+
+    def _project_cfg(self, fake):
+        cfg = example_config(fake)
+        del cfg["server"]
+        del cfg["dns"]
+        cfg["ansible"].pop("host_alias")
+        cfg["cloudflare"] = {"accounts": {
+            "acct": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A", "records": []}}}
+        return cfg
+
+    def setUp(self):
+        super().setUp()
+        os.environ["CLOUDFLARE_API_TOKEN_ACCOUNT_A"] = FAKE_CF_TOKEN
+        self.addCleanup(os.environ.pop, "CLOUDFLARE_API_TOKEN_ACCOUNT_A", None)
+
+    def test_validate_accepts_no_server_block_and_empty_floors(self):
+        cfg = self._project_cfg(FakeHcloud())
+        rotate.validate_config(cfg)
+        self.assertEqual(cfg["server"], {})
+
+    def test_partial_server_block_is_still_a_typo(self):
+        cfg = self._project_cfg(FakeHcloud())
+        cfg["server"] = {"id": 1}
+        with self.assertRaises(rotate.ConfigError):
+            rotate.validate_config(cfg)
+
+    def test_dataforest_still_pins_its_seed(self):
+        cfg = self._project_cfg(FakeHcloud())
+        cfg["provider"] = "dataforest"
+        with self.assertRaises(rotate.ConfigError):
+            rotate.validate_config(cfg)
+
+    def test_plan_pins_name_location_and_alias_from_the_live_read(self):
+        fake = FakeHcloud()
+        path = self.write_config(self._project_cfg(fake))
+        rc = rotate.main(["plan", "--config", path, "--confirm-server-id",
+                          str(fake.server["id"]), "--expect-ipv4", fake.server["ipv4_address"]],
+                         runner=fake)
+        self.assertEqual(rc, 0)
+        cp = json.load(open(os.path.join(self.state_dir, sorted(os.listdir(self.state_dir))[-1])))
+        self.assertEqual(cp["server"]["expected_name"], fake.server["name"])
+        self.assertEqual(cp["server"]["expected_location"], fake.server["location"])
+        self.assertEqual(cp["alias"], fake.server["name"])
+        self.assertTrue(cp["new_ip"]["name"].startswith(fake.server["name"] + "-ipv4-"))
+        self.assertEqual(fake.write_count, 0)
+
+    def test_plan_without_the_number_is_a_usage_error(self):
+        fake = FakeHcloud()
+        path = self.write_config(self._project_cfg(fake))
+        rc = rotate.main(["plan", "--config", path, "--expect-ipv4", fake.server["ipv4_address"]],
+                         runner=fake)
+        self.assertEqual(rc, rotate.EXIT_USAGE)
+
+    def test_the_typed_address_is_the_second_factor(self):
+        """One mistyped digit must not select another server in the project."""
+        fake = FakeHcloud()
+        path = self.write_config(self._project_cfg(fake))
+        rc = rotate.main(["plan", "--config", path, "--confirm-server-id", str(fake.server["id"])],
+                         runner=fake)
+        self.assertEqual(rc, rotate.EXIT_IDENTITY)
+        rc = rotate.main(["plan", "--config", path, "--confirm-server-id", str(fake.server["id"]),
+                          "--expect-ipv4", "203.0.113.9"], runner=fake)
+        self.assertEqual(rc, rotate.EXIT_IDENTITY)
+
+    def test_confirmation_must_agree_with_the_checkpoint_not_just_itself(self):
+        fake = FakeHcloud()
+        cfg = self._project_cfg(fake)
+        cfg["old_ip"] = {"retention": "release"}
+        cfg["cloudflare"]["mode"] = "provider_only"
+        cfg["cloudflare"].pop("accounts")
+        path = self.write_config(cfg)
+        rc = rotate.main(["apply", "--config", path, "--confirm-server-id", str(fake.server["id"]),
+                          "--expect-ipv4", fake.server["ipv4_address"], "--until", "connectivity_ok"],
+                         runner=fake)
+        self.assertEqual(rc, rotate.EXIT_PAUSED)
+        txid = sorted(os.listdir(self.state_dir))[-1][:-5]
+        # the config-level gate is `given == given` here; the checkpoint is the pin
+        rc = rotate.main(["release-old-ip", "--config", path, "--txid", txid,
+                          "--confirm-server-id", "999"], runner=fake)
+        self.assertEqual(rc, rotate.EXIT_IDENTITY)
+        self.assertIn(cp_old := DEFAULT_OLD_IP_ID, fake.ips)
+
+
+class TestDeclareAnsibleOutOfScope(Base):
+    """A box with DNS records but no shikoonet inventory line: the tool PATCHes."""
+
+    def _paused_with_records(self):
+        from tests.fake_cloudflare import FakeCloudflare
+        fake = FakeHcloud()
+        cfg = example_config(fake)
+        del cfg["server"]; del cfg["dns"]; cfg["ansible"].pop("host_alias")
+        cfg["cloudflare"] = {"accounts": {
+            "acct": {"token_env": "CLOUDFLARE_API_TOKEN_ACCOUNT_A", "records": []}}}
+        os.environ["CLOUDFLARE_API_TOKEN_ACCOUNT_A"] = FAKE_CF_TOKEN
+        self.addCleanup(os.environ.pop, "CLOUDFLARE_API_TOKEN_ACCOUNT_A", None)
+        cf = FakeCloudflare(old_ip=fake.server["ipv4_address"])  # eight records on old_ip
+        rot = self.build(fake=fake, cfg=cfg, cf=cf, until="connectivity_ok",
+                         expect_ipv4=fake.server["ipv4_address"])
+        rot.cfg.setdefault("server", {})["id"] = fake.server["id"]  # what main() does
+        cp = self.full_run(rot)
+        self.assertEqual(cp["state"], "connectivity_ok")
+        self.assertEqual(len(cp["cloudflare_manifest"]), 8, "empty floor, scan found them")
+        return fake, cf, rot, cp
+
+    def test_declares_then_resume_patches_without_make_ip_change(self):
+        fake, cf, rot, cp = self._paused_with_records()
+        cp = rot.declare_ansible_out_of_scope(cp, inventory_path=None)
+        self.assertEqual(cp["state"], "ansible_done")
+        self.assertTrue(cp["ansible"]["skipped"])
+        rot.until = None
+        cp = rot.execute(cp)
+        self.assertEqual((cp["state"], cp["outcome"]), ("done", "done"))
+        self.assertEqual({r["content"] for r in cf.records}, {cp["new_ip"]["ip"]})
+        self.assertEqual(self.ip_change_calls, [], "make ip-change must not run")
+
+    def test_refuses_when_the_inventory_names_either_address(self):
+        fake, cf, rot, cp = self._paused_with_records()
+        inv = os.path.join(self.tmp.name, "hosts.yml")
+        for ip in (cp["old_ip"]["ip"], cp["new_ip"]["ip"]):
+            open(inv, "w").write(f"box:\n  ansible_host: {ip}\n")
+            with self.assertRaises(rotate.IdentityMismatch):
+                rot.declare_ansible_out_of_scope(cp, inventory_path=inv)
+            self.assertEqual(cp["state"], "connectivity_ok")
+        open(inv, "w").write("other:\n  ansible_host: 198.51.100.1\n")
+        cp = rot.declare_ansible_out_of_scope(cp, inventory_path=inv)
+        self.assertEqual(cp["state"], "ansible_done")
+        self.assertEqual(cp["ansible"]["evidence"]["inventory"], "hosts.yml")
+
+    def test_refuses_off_the_pause(self):
+        fake, cf, rot, cp = self._paused_with_records()
+        rot._transition(cp, "server_off")
+        with self.assertRaises(rotate.NonRetryableError):
+            rot.declare_ansible_out_of_scope(cp)
+
+
+# ---------------------------------------------------------------------------
 class TestDryRunAndConfirm(Base):
     def test_plan_mutates_nothing(self):
         rot = self.build()

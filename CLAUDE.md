@@ -77,6 +77,22 @@ content scan، token per account) اثبات شده. مسیر **PATCH** — `app
 `SERVER_ID` باید دقیقاً با `server.id` در کانفیگ برابر باشد. «هرچه کانفیگ شده را بچرخان»
 هیچ املایی ندارد. `make ip-rotate-plan` شماره را چاپ می‌کند.
 
+## سرور هم روی فرم است، نه در کانفیگ (از ۲۰۲۶-۰۹-۰۹)
+
+`rotation.project.yml` **کامیت شده** و هیچ سروری را پین نمی‌کند: شماره از `server_id` و آدرس
+از `server_ip` روی فرم dispatch می‌آید، و `plan` نام و location را از همان خواندن زنده پین
+می‌کند تا هر assert بعدی به آن تکیه کند. آدرس تایپ‌شده فاکتور دوم است — بدون آن یک رقم
+اشتباه می‌توانست هر سرور دیگری در پروژه را انتخاب کند، پس با کانفیگ per-project اجباری است.
+
+چرا: کانفیگ قبلی یک سرور را پین می‌کرد و run `34312249225` روی یک باکس نو با
+`identity mismatch: 165255228 != 165200692` رد شد — یعنی برای هر سرور جدید باید سه
+environment را دستی ویرایش می‌کردی. `project_fingerprint` داخل گیت نیست:
+`scripts/setup-secrets.sh` آن را از `ROTATION_CONFIG` فعلی برمی‌دارد و روی فایل کامیت‌شده
+سوار می‌کند. انتشار: **Actions → bootstrap → mode: apply**.
+
+⚠ `cloudflare.mode: provider_only` هم از کانفیگ پروژه حذف شد. provider-only یک انتخاب
+**هر اجرا** است (`operation: provider-only` روی فرم → `--provider-only`)، نه یک خاصیت پروژه.
+
 ## آدرس روی فرم است، نه در کانفیگ (از ۲۰۲۶-۰۹-۰۸)
 
 `server.expected_ipv4` برای hcloud **اختیاری** است و در `ROTATION_CONFIG` نیست. آدرس هر بار
@@ -155,6 +171,28 @@ confirmed → cloudflare_preflighted → new_ip_allocated → server_off
 از رکوردهای A داخل allowlist می‌سازد و قبل از اینکه یک بیت روی هتزنر عوض شود آن را روی
 چک‌پوینت persist می‌کند. `cloudflare_replaced` بعد از `ansible_done` می‌آید: PATCH فقط روی
 record IDهای manifest، نه scan، نه discover ثانویه، نه expansion.
+
+## سه راه برای نیمه‌ی DNS در `change-ip` (از ۲۰۲۶-۰۹-۰۹)
+
+preflight حالا **استپ خودش** در جاب `swap` است و پیش از allocate اجرا می‌شود، با توکن‌های
+Cloudflare فقط روی همان استپ. قبلاً جاب swap دستور `apply --until connectivity_ok` را بدون
+هیچ توکن Cloudflare اجرا می‌کرد: با یک کانفیگ DNS واقعی، اولین استپ ماشین حالت بعد از
+تأیید reviewer escalate می‌شد، و با `mode: provider_only` نیمه‌ی DNS در هر `change-ip`
+بی‌صدا skip می‌شد.
+
+بعد از swap، جاب `dns` از روی **شواهد** تصمیم می‌گیرد:
+
+| اسکن‌ها | inventory شیکونِت | نتیجه |
+|---|---|---|
+| ۰ رکورد، ≥۱ zone در هر حساب | — | `declare-dns-out-of-scope` → `done` |
+| رکورد هست | باکس در inventory هست، آدرس نو کامیت شده | `make ip-change` (مسیر ناوگان) |
+| رکورد هست | باکس اصلاً در inventory نیست | `declare-ansible-out-of-scope` سپس resume: **خود ابزار PATCH می‌زند** روی manifest |
+| رکورد هست | باکس در inventory هست ولی آدرس نو کامیت نشده | **قرمز** — کامیت گم‌شده است |
+
+ردیف سوم برای باکسی است که رکورد دستی دارد و نود ناوگان نیست (`testip.shimobile.net`).
+skip‌کردنش یعنی یک دامنه روی آدرسی می‌ماند که همان run آزادش می‌کند.
+`declare_ansible_out_of_scope` رد می‌کند اگر inventory هر کدام از دو آدرس را نام ببرد —
+آن وقت نود ناوگان است، نه استثنا.
 
 ## allowlist یک **کف** است، نه فهرست کامل (از ۲۰۲۶-۰۹-۰۸)
 

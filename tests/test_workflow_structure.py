@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import pathlib
 import unittest
 from pathlib import Path
 
@@ -403,6 +404,83 @@ class WorkflowStructureTests(unittest.TestCase):
         body = " ".join(s.get("run", "") for s in rel["steps"])
         self.assertIn('"$retention" != "release"', body)
         self.assertIn("--ip", body)
+
+    def test_change_ip_preflights_dns_before_the_box_is_touched(self):
+        """The manifest is built while the box still has its address.
+
+        Until 2026-09-09 the swap job ran `apply --until connectivity_ok`
+        with no Cloudflare credential in scope: with a real DNS config the
+        first step of the state machine (`cloudflare_preflight`) would have
+        escalated AFTER the reviewer approved, and with `mode: provider_only`
+        it silently skipped DNS on every change-ip. Now preflight is its own
+        step, gated on change-ip, and the swap resumes from it.
+        """
+        steps = [s for s in self.jobs["swap"]["steps"] if s.get("name") or s.get("id")]
+        names = [s.get("name") or s.get("id") for s in steps]
+        pre = next(s for s in steps if (s.get("name") or "").startswith("Preflight DNS"))
+        run = next(s for s in steps if s.get("id") == "run")
+        self.assertLess(names.index(pre["name"]), names.index("run"),
+                        "preflight must come before the swap")
+        self.assertIn("--until cloudflare_preflighted", pre["run"])
+        self.assertEqual(pre["if"], "inputs.operation == 'change-ip'")
+        for tok in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN_ACCOUNT_A",
+                    "CLOUDFLARE_API_TOKEN_ACCOUNT_B"):
+            self.assertIn(tok, pre["env"])
+        # the swap itself holds no Cloudflare credential, and neither does the job
+        self.assertNotIn("CLOUDFLARE", " ".join(run.get("env") or {}))
+        self.assertNotIn("CLOUDFLARE", " ".join(self.jobs["swap"].get("env") or {}))
+        # provider-only declares itself per run instead of relying on the config
+        self.assertIn("--provider-only", run["run"])
+
+    def test_records_without_an_inventory_line_are_patched_not_skipped(self):
+        """A box with hand-made records is not a fleet node and not out of scope."""
+        steps = {s.get("name"): s for s in self.jobs["dns"]["steps"] if s.get("name")}
+        direct = steps["Move DNS directly (records exist, node is not in shikoonet)"]
+        self.assertIn("dns_scope == 'records'", direct["if"])
+        self.assertIn("fleet == 'false'", direct["if"])
+        self.assertIn("declare-ansible-out-of-scope", direct["run"])
+        self.assertIn("--expect-state done", direct["run"])
+        self.assertNotIn("make ip-change", direct["run"])
+        for tok in ("CLOUDFLARE_API_TOKEN_ACCOUNT_A", "CLOUDFLARE_API_TOKEN_ACCOUNT_B"):
+            self.assertIn(tok, direct["env"])
+        # it never carries the fleet path's credentials
+        self.assertNotIn("SSH_PRIVATE_KEY", direct["env"])
+        # the refusal is now for a FLEET node whose commit is missing, only
+        refuse = steps["Refuse — records exist but the inventory commit is missing"]
+        self.assertIn("fleet == 'true'", refuse["if"])
+        gate = steps["Is this node in shikoonet's inventory?"]
+        self.assertIn("fleet=$fleet", gate["run"])
+        self.assertIn("in_scope=$in_scope", gate["run"])
+        # and a box that reached `done` by that path still releases the old address
+        rel = steps["Release the old address (retention=release, change-ip)"]
+        self.assertIn("fleet == 'false'", rel["if"])
+
+    def test_the_committed_project_config_pins_no_server_and_no_secret(self):
+        """rotation.project.yml is what bootstrap publishes; git must stay clean of secrets."""
+        import yaml as _yaml
+        root = pathlib.Path(__file__).resolve().parents[1]
+        cfg = _yaml.safe_load((root / "rotation.project.yml").read_text())
+        self.assertNotIn("server", cfg, "a pinned server is a secret edit per box")
+        self.assertNotIn("project_fingerprint", cfg,
+                         "sha256(HCLOUD_TOKEN)[:12] does not belong in a public repo")
+        self.assertNotIn("mode", cfg["cloudflare"],
+                         "provider-only is a per-run choice, not a project property")
+        self.assertEqual(cfg["old_ip"]["retention"], "release")
+        self.assertEqual({a["token_env"] for a in cfg["cloudflare"]["accounts"].values()},
+                         {"CLOUDFLARE_API_TOKEN_ACCOUNT_A", "CLOUDFLARE_API_TOKEN_ACCOUNT_B"})
+        text = (root / "rotation.project.yml").read_text()
+        self.assertNotRegex(text, r"\b\d{9}\b", "no server id")
+        # setup-secrets.sh publishes it, carrying the fingerprint forward
+        script = (root / "scripts" / "setup-secrets.sh").read_text()
+        self.assertIn("rotation.project.yml", script)
+        self.assertIn("project_fingerprint", script)
+
+    def test_plan_passes_the_number_from_the_form(self):
+        """A per-project config pins no server: the form's number is the identity."""
+        plan = [s for s in self.jobs["plan"]["steps"] if "rotate.py plan" in (s.get("run") or "")]
+        self.assertTrue(plan)
+        self.assertIn("--confirm-server-id", plan[0]["run"])
+        self.assertIn("--expect-ipv4", plan[0]["run"])
 
     def test_change_ip_dns_half_decides_from_scans_and_never_skips_records(self):
         """One button for every box, with no silent skip.

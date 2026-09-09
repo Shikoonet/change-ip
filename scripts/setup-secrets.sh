@@ -101,6 +101,35 @@ SSH_KEY_FILE="${SSH_KEY_FILE:-$(_default_ssh_key)}"
 SHIKOONET_URL="${SHIKOONET_URL:-$(git -C "$SHIKOONET_DIR" remote get-url origin 2>/dev/null || echo '')}"
 ROTATION_CONFIG_FILE="${ROTATION_CONFIG_FILE:-$(cd "$(dirname "$0")/.." && pwd)/rotation.yml}"
 
+# The project config is COMMITTED (`rotation.project.yml`): it pins no server
+# and holds no secret, so it belongs in git rather than in a value only a
+# human can edit. When it exists it is what gets published — with
+# `project_fingerprint` carried over from the config already installed, so the
+# one genuinely secret-ish field never enters the repository and the pin that
+# stops a production rotation resuming with a staging token keeps working.
+_repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -r "$_repo_root/rotation.project.yml" ]]; then
+  _merged="${_ci_tmp:-$(mktemp -d)}/rotation.effective.yml"
+  if PROJECT="$_repo_root/rotation.project.yml" CURRENT="$ROTATION_CONFIG_FILE" \
+     OUT="$_merged" python3 - <<'PY'
+import os, yaml
+project = yaml.safe_load(open(os.environ["PROJECT"])) or {}
+try:
+    current = yaml.safe_load(open(os.environ["CURRENT"])) or {}
+except OSError:
+    current = {}
+fp = current.get("project_fingerprint")
+if fp:
+    project["project_fingerprint"] = fp
+with open(os.environ["OUT"], "w") as fh:
+    yaml.safe_dump(project, fh, sort_keys=False, default_flow_style=False)
+PY
+  then
+    chmod 600 "$_merged"
+    ROTATION_CONFIG_FILE="$_merged"
+  fi
+fi
+
 # Which provider this config drives decides which environments matter. The
 # coverage check already skipped jobs gated on the other provider; the install
 # loops did not, and kept trying to put Cloudflare tokens on
@@ -380,6 +409,9 @@ yaml.safe_dump(d, open(p, "w"), sort_keys=False, default_flow_style=False)
 fi
 
 head_ "rotation config"
+if [[ "$ROTATION_CONFIG_FILE" == *rotation.effective.yml ]]; then
+  say "[ok]    publishing the committed rotation.project.yml (fingerprint carried over)"
+fi
 # Every environment whose jobs run the setup action needs this, and that list
 # is NOT hand-maintained here — it is read out of run.yml below. The hand
 # list said hetzner-plan and hetzner-production; dns_scan sits on

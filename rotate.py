@@ -531,6 +531,7 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
         )
 
     server = data.get("server") or {}
+    data["server"] = server
     # `expected_ipv4` is required only where it is LOAD-BEARING. On a
     # DataForest Seed it IS old_ip: the Seed carries several addresses at
     # once and this names the one being replaced, so a wrong value picks the
@@ -543,7 +544,15 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
     required = ("id", "expected_name", "expected_location")
     if provider == "dataforest":
         required = required + ("expected_ipv4",)
-    for key in required:
+    # A config with NO server block is per-PROJECT (hcloud only): the number
+    # typed on the dispatch form is the identity, `--expect-ipv4` is the second
+    # factor, and name + location are pinned from the live read at plan and
+    # asserted on every later read. Pinning one server in the secret meant
+    # editing three environments before any OTHER server could be rotated —
+    # run 34312249225 refused for exactly that. A server block that IS present
+    # must be complete: a partial pin is a typo, not a choice.
+    per_project = provider == "hcloud" and not server
+    for key in (() if per_project else required):
         if not server.get(key):
             raise ConfigError(
                 f"{path}: server.{key} is required. The numeric id is immutable and "
@@ -552,7 +561,8 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
             )
     if provider == "hcloud":
         try:
-            server["id"] = int(server["id"])
+            if server:
+                server["id"] = int(server["id"])
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"{path}: server.id must be the numeric id, not a name") from exc
     else:
@@ -597,7 +607,7 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
             )
 
     ans = data.get("ansible") or {}
-    if not ans.get("host_alias"):
+    if not ans.get("host_alias") and not per_project:
         raise ConfigError(f"{path}: ansible.host_alias is required (the inventory alias)")
     if ans.get("auto_edit_inventory"):
         raise ConfigError(
@@ -606,9 +616,9 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
         )
 
     dns = data.get("dns") or {}
-    if not dns.get("node_record_zone"):
+    if dns and not dns.get("node_record_zone"):
         raise ConfigError(f"{path}: dns.node_record_zone is required (e.g. tinooer.top)")
-    if not dns.get("allowed_records"):
+    if dns and not dns.get("allowed_records"):
         raise ConfigError(
             f"{path}: dns.allowed_records must list the record this run may move. "
             "An empty allow-list means nothing is allowed, which is a stop, not a pass."
@@ -691,11 +701,12 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
                 # any other name. The two-map bookkeeping is the only
                 # remaining work.
                 pass
-            records = account_cfg.get("records")
-            if not isinstance(records, list) or not records:
+            records = account_cfg.get("records") or []
+            if not isinstance(records, list):
                 raise ConfigError(
                     f"{path}: cloudflare.accounts.{account_name}.records "
-                    "must be a non-empty list of FQDNs"
+                    "must be a list of FQDNs (empty is allowed: the list is a "
+                    "floor, the content scan finds whatever points at old_ip)"
                 )
             for fqdn in records:
                 if not isinstance(fqdn, str) or not fqdn.strip():
@@ -711,11 +722,11 @@ def validate_config(data: Dict[str, Any], path: str = "<config>") -> Dict[str, A
                         "each FQDN belongs to exactly one credential reference"
                     )
                 seen_records[lf] = account_name
-            expected = account_cfg.get("expected_record_count")
-            if not isinstance(expected, int) or expected < 1:
+            expected = account_cfg.get("expected_record_count", len(records))
+            if not isinstance(expected, int) or expected < 0:
                 raise ConfigError(
                     f"{path}: cloudflare.accounts.{account_name}.expected_record_count "
-                    "must be a positive integer"
+                    "must be a non-negative integer"
                 )
             if expected != len(records):
                 raise ConfigError(
@@ -883,6 +894,7 @@ class Rotation:
         guest_op: Optional[Callable[..., Dict[str, Any]]] = None,
         ssh_keyscan: Optional[Callable[..., Dict[str, Any]]] = None,
         expect_ipv4: Optional[str] = None,
+        provider_only: bool = False,
     ):
         # ROTATION_TEST_MODE=1 + ROTATION_PROBE=accept / refuse lets the
         # test harness short-circuit the real SSH probe. Production
@@ -932,7 +944,12 @@ class Rotation:
         # the run at `connectivity_ok` and never writes to DNS. Structurally
         # bounded because `--until` is an argparse choice, not a flag read
         # from the checkpoint after preflight has already PATCHed.
-        self.provider_only = (
+        # Two ways in, one meaning: the config declares a project that never
+        # has DNS, or the dispatch declares THIS run as provider-only. The
+        # second exists because `operation: provider-only` is a per-run choice
+        # on a form, and pinning it in the config meant a config edit to move
+        # between the two — the manual step this repo exists to remove.
+        self.provider_only = bool(provider_only) or (
             (self.cfg.get("cloudflare") or {}).get("mode") == "provider_only"
         )
 
@@ -1144,6 +1161,55 @@ class Rotation:
         return {"id": target.id, "ip": address, "released": True}
 
     # -- finish a change-ip whose DNS half has nothing to do -------------------
+    def declare_ansible_out_of_scope(self, cp: Dict[str, Any],
+                                     inventory_path: Optional[str] = None) -> Dict[str, Any]:
+        """connectivity_ok -> ansible_done WITHOUT `make ip-change`.
+
+        For a box that is not a shikoonet node: DNS records point at its old
+        address (the scan found them, the manifest holds them), but there is
+        no inventory line to edit and no playbook to run. The PATCH that
+        follows is the tool's own `cloudflare_replaced` step, on the manifest
+        built at preflight — the inventory half is what is out of scope, not
+        DNS. Declared from evidence: the shikoonet inventory, if one is
+        available, must name NEITHER address. A node whose old address is in
+        the inventory is a fleet node whose commit is missing; that is the
+        red gate in run.yml, never this.
+        """
+        if cp.get("provider") != "hcloud":
+            raise NonRetryableError("declare-ansible-out-of-scope is hcloud-only")
+        if cp.get("state") != "connectivity_ok":
+            raise NonRetryableError(
+                f"transaction is at {cp.get('state')!r}; only a run paused at "
+                "connectivity_ok can be declared ansible-out-of-scope"
+            )
+        old_ip, new_ip = cp["old_ip"]["ip"], cp["new_ip"]["ip"]
+        if inventory_path:
+            try:
+                with open(inventory_path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as exc:
+                raise NonRetryableError(f"inventory {inventory_path}: unreadable ({exc})") from exc
+            for label, ip in (("old", old_ip), ("new", new_ip)):
+                if ip and ip in text:
+                    raise IdentityMismatch(
+                        f"{inventory_path} names the {label} address {ip}: this IS a "
+                        "shikoonet node, so the inventory commit and `make ip-change` "
+                        "are in scope, not declared away"
+                    )
+            evidence = {"inventory": os.path.basename(inventory_path),
+                        "names_old_ip": False, "names_new_ip": False}
+        else:
+            evidence = {"inventory": None, "reason": "no shikoonet checkout available"}
+        self.assert_identity(cp, expect_ip="new")
+        cp["ansible"] = {"skipped": True, "ts": utcnow(),
+                         "reason": "node is not in shikoonet's inventory", "evidence": evidence}
+        self.record(cp, "ansible_out_of_scope",
+                    f"no inventory line for {old_ip} or {new_ip}; make ip-change not run")
+        self._transition(cp, "ansible_done")
+        self.out(f"ansible half declared out of scope; resume PATCHes "
+                 f"{len(cp.get('cloudflare_manifest') or [])} manifest record(s) itself.")
+        return cp
+
     def declare_dns_out_of_scope(self, cp: Dict[str, Any],
                                  scan_paths: List[str]) -> Dict[str, Any]:
         """Take a change-ip from connectivity_ok to done WITHOUT the DNS half.
@@ -1319,7 +1385,7 @@ class Rotation:
     # -- plan --------------------------------------------------------------
     def plan(self, txid: Optional[str] = None) -> Dict[str, Any]:
         """Read everything, mutate nothing. Terminal state is `planned`."""
-        alias = self.cfg["ansible"]["host_alias"]
+        alias = (self.cfg.get("ansible") or {}).get("host_alias")
         txid = txid or new_txid()
         provider_name = self.provider_name
         cp: Dict[str, Any] = {
@@ -1333,16 +1399,16 @@ class Rotation:
             "project_fingerprint": getattr(self.provider, "fingerprint", ""),
             "config_path": os.path.abspath(self.config_path),
             "server": {
-                "id": self.cfg["server"]["id"],
-                "expected_name": self.cfg["server"]["expected_name"],
+                "id": (self.cfg.get("server") or {}).get("id"),
+                "expected_name": (self.cfg.get("server") or {}).get("expected_name"),
                 # `--expect-ipv4` wins over the config's copy, and when
                 # neither is given this is filled in below from the live
                 # read. The checkpoint always ends up recording the address
                 # the box ACTUALLY had, so resume and rollback never depend
                 # on whether a human kept the secret current.
                 "expected_ipv4": self.expect_ipv4
-                or self.cfg["server"].get("expected_ipv4"),
-                "expected_location": self.cfg["server"]["expected_location"],
+                or (self.cfg.get("server") or {}).get("expected_ipv4"),
+                "expected_location": (self.cfg.get("server") or {}).get("expected_location"),
             },
             "alias": alias,
             "snapshot": {},
@@ -1382,8 +1448,32 @@ class Rotation:
 
     def _plan_hcloud(self, cp: Dict[str, Any]) -> None:
         """Hetzner-specific plan: numeric id, server.location, Primary IP."""
-        alias = cp["alias"]
+        if cp["server"].get("id") is None:
+            raise ConfigError(
+                "the config pins no server, so the id must come from --confirm-server-id "
+                "(the dispatch form's server_id). Nothing was contacted."
+            )
         server = self.with_retries("read_server", self.provider.get_server, cp["server"]["id"])
+        # Per-project config: name and location are pinned HERE, from this
+        # read, and every later assert_identity compares against the pin. The
+        # typed address is then the second factor that proves the typed
+        # number is the box the operator meant — without it, one mistyped
+        # digit could select any other server in the project.
+        pinned_here = not cp["server"].get("expected_name")
+        if pinned_here:
+            if not cp["server"].get("expected_ipv4"):
+                raise IdentityMismatch(
+                    "the config pins no server, so the typed address is required as the "
+                    "second factor: pass --expect-ipv4 (server_ip on the dispatch form)"
+                )
+            cp["server"]["expected_name"] = server.name
+            cp["server"]["expected_location"] = server.location
+            self.log(f"  identity pinned from the live read: {server.name} in {server.location}")
+        alias = cp["alias"] or server.name
+        if cp["alias"] != alias:
+            cp["alias"] = alias
+            cp["new_ip"]["name"] = f"{alias}-ipv4-{cp['txid']}"
+            self.log(f"  alias defaults to the server name: {alias}")
         if server.name != cp["server"]["expected_name"]:
             raise IdentityMismatch(
                 f"server {server.id} is named {server.name!r}, config expects "
@@ -1443,9 +1533,11 @@ class Rotation:
 
         # DNS allow-list. A run that would move a record the operator never
         # approved stops HERE, at `validated`, before anything is powered off.
-        touched = ansible_adapter.dns_records_touched(alias, self.cfg["dns"]["node_record_zone"])
+        dns_cfg = self.cfg.get("dns") or {}
+        touched = (ansible_adapter.dns_records_touched(alias, dns_cfg["node_record_zone"])
+                   if dns_cfg.get("node_record_zone") else [])
         violations = ansible_adapter.check_dns_allowlist(
-            touched, self.cfg["dns"].get("allowed_records") or []
+            touched, dns_cfg.get("allowed_records") or []
         )
         cp["snapshot"]["dns_records"] = touched
         self._transition(cp, "validated")
@@ -1548,9 +1640,11 @@ class Rotation:
         )
 
         # DNS allow-list (same logic as hcloud).
-        touched = ansible_adapter.dns_records_touched(alias, self.cfg["dns"]["node_record_zone"])
+        dns_cfg = self.cfg.get("dns") or {}
+        touched = (ansible_adapter.dns_records_touched(alias, dns_cfg["node_record_zone"])
+                   if dns_cfg.get("node_record_zone") else [])
         violations = ansible_adapter.check_dns_allowlist(
-            touched, self.cfg["dns"].get("allowed_records") or []
+            touched, dns_cfg.get("allowed_records") or []
         )
         cp["snapshot"]["dns_records"] = touched
         self._transition(cp, "validated")
@@ -1698,7 +1792,7 @@ class Rotation:
                     f"# export the named env var(s) for: {', '.join(missing)}",
                 ],
             )
-        if not accounts or not any(a["records"] for a in accounts):
+        if not accounts:
             raise EscalationRequired(
                 "no Cloudflare accounts configured — refusing to discover.",
                 [f"# edit {self.config_path} and fill cloudflare.accounts"],
@@ -4359,6 +4453,9 @@ def main(
 
     p_plan = sub.add_parser("plan", help="read everything, change nothing (default)")
     p_plan.add_argument("--config", required=True)
+    p_plan.add_argument("--confirm-server-id", default=None,
+                        help="the server id; REQUIRED when the config pins no server "
+                             "(per-project config), ignored otherwise")
     # The address the operator states this box is on right now. Compared
     # against a fresh live read, never trusted as truth. Lives here rather
     # than in the config because it is the one value that changes on every
@@ -4370,6 +4467,10 @@ def main(
     p_apply = sub.add_parser("apply", help="execute a rotation")
     p_apply.add_argument("--config", required=True)
     p_apply.add_argument("--confirm-server-id", default=None)
+    p_apply.add_argument("--provider-only", action="store_true",
+                         help="declare THIS run provider-only: no Cloudflare call at all, "
+                              "pause at connectivity_ok. Same meaning as the config's "
+                              "cloudflare.mode, chosen per run instead of per project")
     p_apply.add_argument("--expect-ipv4", default=None,
                          help="assert the server is currently on this address")
     p_apply.add_argument("--until", choices=PAUSABLE, default=None,
@@ -4379,6 +4480,8 @@ def main(
     p_resume.add_argument("--txid", required=True)
     p_resume.add_argument("--config", default=None)
     p_resume.add_argument("--confirm-server-id", default=None)
+    p_resume.add_argument("--provider-only", action="store_true",
+                          help="see `apply --provider-only`")
     p_resume.add_argument("--until", choices=PAUSABLE, default=None,
                           help="stop cleanly at this state instead of running to done")
 
@@ -4422,6 +4525,17 @@ def main(
     p_declare.add_argument("--txid", required=True)
     p_declare.add_argument("--config", default=None)
     p_declare.add_argument("--confirm-server-id", default=None)
+    p_declare_ans = sub.add_parser(
+        "declare-ansible-out-of-scope",
+        help="connectivity_ok -> ansible_done without `make ip-change`: the node is "
+             "not in shikoonet's inventory; resume then PATCHes the manifest itself",
+    )
+    p_declare_ans.add_argument("--txid", required=True)
+    p_declare_ans.add_argument("--config", default=None)
+    p_declare_ans.add_argument("--confirm-server-id", default=None)
+    p_declare_ans.add_argument("--inventory", default=None,
+                               help="shikoonet inventory/hosts.yml; naming either "
+                                    "address is a refusal (that is a fleet node)")
     p_declare.add_argument("--scan", action="append", default=[],
                            help="a discover --scan_only result file; repeat per account")
 
@@ -4565,6 +4679,17 @@ def _dispatch(
             ) from exc
 
     cfg = load_config(config_path)
+    # Per-project config (no server block): the dispatch form's number becomes
+    # server.id before anything else looks at the config.
+    given_id = getattr(args, "confirm_server_id", None)
+    if (cfg.get("provider") or "hcloud") == "hcloud" \
+            and not (cfg.get("server") or {}).get("id") and given_id is not None:
+        try:
+            cfg.setdefault("server", {})["id"] = int(str(given_id).strip())
+        except ValueError:
+            print(f"--confirm-server-id must be the numeric Hetzner server id, got {given_id!r}",
+                  file=sys.stderr)
+            return EXIT_USAGE
     register_secret(os.environ.get("HCLOUD_TOKEN"))
     register_secret(os.environ.get(CLOUDFLARE_TOKEN_ENV))
     register_secret(os.environ.get(DATAFOREST_TOKEN_ENV))
@@ -4635,6 +4760,7 @@ def _dispatch(
         # resume/rollback/status do not take the flag: their expectation is
         # already frozen in the checkpoint that plan wrote.
         expect_ipv4=getattr(args, "expect_ipv4", None),
+        provider_only=bool(getattr(args, "provider_only", False)),
         # Every transition also lands in GitHub's job summary. Outside Actions
         # the hook writes nothing, so this costs a dict lookup on a terminal.
         **{"on_transition": github_summary, **(rotation_kwargs or {})},
@@ -4643,6 +4769,21 @@ def _dispatch(
     if args.command == "status":
         print(json.dumps(rotation.load(args.txid), indent=2, sort_keys=True))
         return EXIT_OK
+
+    # Any command naming BOTH a checkpoint and a confirmation must agree with
+    # the checkpoint. With a per-project config the config-level gates below
+    # compare the typed number with itself; this is what makes the
+    # confirmation mean something for resume, rollback, release and declare.
+    txid = getattr(args, "txid", None)
+    if given_id is not None and txid and os.path.exists(rotation._path(txid)):
+        cp_id = (rotation.load(txid).get("server") or {}).get("id")
+        if str(cp_id) != str(given_id).strip():
+            print(
+                f"identity mismatch: --confirm-server-id {given_id} != server {cp_id} in "
+                f"checkpoint {txid}. Nothing was contacted.",
+                file=sys.stderr,
+            )
+            return EXIT_IDENTITY
 
     if args.command == "release-old-ip":
         # Mutating, so it takes the same identity gate as apply/rollback.
@@ -4664,6 +4805,22 @@ def _dispatch(
                 rotation.release_orphan_ip(args.ip)
         except (NonRetryableError, IdentityMismatch) as exc:
             print(f"release refused: {exc}", file=sys.stderr)
+            return EXIT_IDENTITY
+        return EXIT_OK
+
+    if args.command == "declare-ansible-out-of-scope":
+        expected_id = cfg["server"]["id"]
+        if args.confirm_server_id is None or str(args.confirm_server_id) != str(expected_id):
+            print(
+                f"refusing: --confirm-server-id must be {expected_id} "
+                "(the config's server.id). Nothing was contacted.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        try:
+            rotation.declare_ansible_out_of_scope(rotation.load(args.txid), args.inventory)
+        except (NonRetryableError, IdentityMismatch) as exc:
+            print(f"declare refused: {exc}", file=sys.stderr)
             return EXIT_IDENTITY
         return EXIT_OK
 

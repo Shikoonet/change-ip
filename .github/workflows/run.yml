@@ -178,6 +178,7 @@ jobs:
       # secret is what stops ROTATION_CONFIG going stale after every rotation.
       - run: |
           python3 rotate.py plan --config rotation.yml \
+            --confirm-server-id "${{ inputs.server_id }}" \
             --expect-ipv4 "${{ inputs.server_ip }}"
 
   plan_dataforest:
@@ -231,9 +232,11 @@ jobs:
     env:
       HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
       GH_TOKEN: ${{ github.token }}
-      # CLOUDFLARE_API_TOKEN is intentionally absent here. The provider
-      # half never talks to Cloudflare; the token lives on the dns job
-      # only.
+      # No Cloudflare token at JOB level. change-ip needs one exactly once in
+      # here — the preflight step below, which builds the DNS manifest BEFORE
+      # anything is allocated or powered off — and that step carries it
+      # itself, gated on the operation. The swap step that follows holds only
+      # the Hetzner token, and provider-only never sees a Cloudflare token.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -244,12 +247,52 @@ jobs:
       # `--until connectivity_ok`, and the `dns` job is gated off by
       # `inputs.operation == 'change-ip'`. The old ROTATION_PROVIDER_ONLY env
       # was read by nothing in rotate.py — a flag that looked like a control.
-      - id: run
+      # change-ip: the DNS manifest FIRST, while the box still has its
+      # address. Every configured account is asked which A records point at
+      # it (the allowlist is a floor, usually empty), and the manifest is
+      # persisted on the checkpoint — it is the only thing the later PATCH
+      # ever touches. A bad token or an unreadable zone fails HERE, before a
+      # Primary IP is billed or a box goes dark. Pauses at
+      # cloudflare_preflighted, which is rc 6.
+      - name: Preflight DNS — build the manifest before anything moves (change-ip)
+        if: inputs.operation == 'change-ip'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
         run: |
           set +e
           python3 rotate.py apply --config rotation.yml \
             --confirm-server-id "${{ inputs.server_id }}" \
-            --expect-ipv4 "${{ inputs.server_ip }}" --until connectivity_ok
+            --expect-ipv4 "${{ inputs.server_ip }}" --until cloudflare_preflighted
+          rc=$?
+          set -e
+          test "$rc" -eq 6 || exit "$rc"
+          python3 -c "
+          import json, glob, os
+          cp = json.load(open(sorted(glob.glob('state/*.json'), key=os.path.getmtime)[-1]))
+          m = cp.get('cloudflare_manifest') or []
+          print(f'manifest: {len(m)} A record(s) will move with this address')
+          for r in m:
+              print('  ' + r['name'])"
+      - id: run
+        run: |
+          set +e
+          if [ "${{ inputs.operation }}" = "change-ip" ]; then
+            # Resume the checkpoint the preflight step just created. Nothing
+            # from Cloudflare is in this step's env: from here to
+            # connectivity_ok the run only talks to Hetzner.
+            TXID=$(ls -t state/*.json | head -1 | xargs -n1 basename | sed 's/\.json$//')
+            python3 rotate.py resume --config rotation.yml --txid "$TXID" \
+              --confirm-server-id "${{ inputs.server_id }}" --until connectivity_ok
+          else
+            # provider-only is declared per RUN, not pinned in the config:
+            # the same project rotates a throwaway box today and a real node
+            # tomorrow with nothing edited in between.
+            python3 rotate.py apply --config rotation.yml --provider-only \
+              --confirm-server-id "${{ inputs.server_id }}" \
+              --expect-ipv4 "${{ inputs.server_ip }}" --until connectivity_ok
+          fi
           rc=$?
           set -e
           # 6 = paused at --until, the expected end of this job. Green on
@@ -265,7 +308,7 @@ jobs:
             echo "txid=$TXID"
             echo "new_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['new_ip']['ip'])")"
             echo "old_ip=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['old_ip']['ip'])")"
-            echo "alias=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['ansible']['host_alias'])")"
+            echo "alias=$(python3 -c "import json;print(json.load(open('state/$TXID.json'))['alias'])")"
           } >> "$GITHUB_OUTPUT"
       # Nothing to update after this run. ROTATION_CONFIG carries only what
       # cannot change under a rotation — id, name, location, project
@@ -737,27 +780,34 @@ jobs:
         if: steps.decide.outputs.dns_scope == 'records'
         env:
           NEW_IP: ${{ needs.swap.outputs.new_ip }}
+          OLD_IP: ${{ needs.swap.outputs.old_ip }}
         run: |
           set -e
-          # Assign in_scope in the shell scope — NOT just stdout. The earlier
-          # version only echoed `in_scope=true`, never assigned it, so
-          # `${in_scope:-false}` always expanded to `false` and the DNS +
-          # inventory step below was skipped on EVERY Hetzner rotation.
-          in_scope=false
+          # Two facts, ASSIGNED in the shell scope — an earlier version only
+          # echoed one and the DNS half was skipped on every rotation:
+          #   fleet    = the inventory names this box (either address), so
+          #              `make ip-change` is how its DNS moves;
+          #   in_scope = it names the NEW address, so the human commit exists.
+          # Not a fleet node at all means hand-made records with no inventory
+          # line — the tool PATCHes those itself from the manifest.
+          in_scope=false; fleet=false
+          inv=/tmp/shikoonet/inventory/hosts.yml
           if [ -e /tmp/shikoonet.absent ]; then
-            echo "no shikoonet checkout -> out of scope"
-          elif grep -q -- "$NEW_IP" /tmp/shikoonet/inventory/hosts.yml; then
-            in_scope=true
+            echo "no shikoonet checkout -> not a fleet node"
           else
-            echo "$NEW_IP is not in shikoonet inventory/hosts.yml -> out of scope"
+            grep -q -- "$NEW_IP" "$inv" && in_scope=true
+            { grep -q -- "$NEW_IP" "$inv" || grep -q -- "$OLD_IP" "$inv"; } && fleet=true
+            echo "$inv: names the new address=$in_scope, fleet node=$fleet"
           fi
-          echo "in_scope=$in_scope"
           echo "in_scope=$in_scope" >> "$GITHUB_OUTPUT"
+          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
       # Records point at the old address and the node is NOT in the inventory:
       # the human commit is missing. This is the gate the whole CD design
       # keeps on purpose. It fails; it does not skip.
       - name: Refuse — records exist but the inventory commit is missing
-        if: steps.decide.outputs.dns_scope == 'records' && steps.in_scope.outputs.in_scope != 'true'
+        if: steps.decide.outputs.dns_scope == 'records'
+            && steps.in_scope.outputs.fleet == 'true'
+            && steps.in_scope.outputs.in_scope != 'true'
         env:
           NEW_IP: ${{ needs.swap.outputs.new_ip }}
         run: |
@@ -802,6 +852,35 @@ jobs:
             --label "dns.hcloud_resume" \
             -- python3 rotate.py resume --config rotation.yml \
               --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
+      # ---- records exist and this is NOT a shikoonet node -------------------
+      # Hand-made records on a box with no inventory line: nothing to commit,
+      # no playbook to run, and skipping would leave a domain pointing at an
+      # address about to be released. rotate.py records that the INVENTORY
+      # half is out of scope — refusing if the inventory names either address,
+      # because that is a fleet node whose commit is missing — and then
+      # resumes. The PATCH is its own `cloudflare_replaced` step against the
+      # manifest built at preflight, each record through the token of the
+      # account that discovered it, read back afterwards.
+      - name: Move DNS directly (records exist, node is not in shikoonet)
+        if: steps.decide.outputs.dns_scope == 'records' && steps.in_scope.outputs.fleet == 'false'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_A: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_A }}
+          CLOUDFLARE_API_TOKEN_ACCOUNT_B: ${{ secrets.CLOUDFLARE_API_TOKEN_ACCOUNT_B }}
+        run: |
+          set -e
+          inv=""
+          test -f /tmp/shikoonet/inventory/hosts.yml \
+            && inv="--inventory /tmp/shikoonet/inventory/hosts.yml"
+          python3 rotate.py declare-ansible-out-of-scope --config rotation.yml \
+            --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}" $inv
+          python3 .github/scripts/stage.py \
+            --expect-rc 0 \
+            --expect-state done \
+            --txid "$TXID" \
+            --label "dns.hcloud_direct" \
+            -- python3 rotate.py resume --config rotation.yml \
+              --txid "$TXID" --confirm-server-id "${{ inputs.server_id }}"
       # ---- no records anywhere: finish without the DNS half ----------------
       - name: Declare DNS out of scope and finish
         if: steps.decide.outputs.dns_scope == 'none'
@@ -818,7 +897,9 @@ jobs:
       # on the new address, and the old Primary IP is re-read as the same
       # address attached to nothing. success() means nothing before it failed.
       - name: Release the old address (retention=release, change-ip)
-        if: success() && (steps.decide.outputs.dns_scope == 'none' || steps.in_scope.outputs.in_scope == 'true')
+        if: success() && (steps.decide.outputs.dns_scope == 'none'
+            || steps.in_scope.outputs.in_scope == 'true'
+            || steps.in_scope.outputs.fleet == 'false')
         run: |
           set -e
           retention=$(python3 -c "import yaml;print((yaml.safe_load(open('rotation.yml')).get('old_ip') or {}).get('retention','keep'))")

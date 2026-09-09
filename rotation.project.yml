@@ -1,0 +1,64 @@
+---
+# =============================================================================
+# rotation.project.yml — the PROJECT's rotation config, committed on purpose.
+#
+# It pins no server. The number and the address come from the dispatch form
+# (`server_id`, `server_ip`) and are checked against a live read, so rotating
+# a different box in this project needs no secret edit and nothing here goes
+# stale after a rotation. Pinning one server was what refused run
+# 34312249225: a brand-new box, a correct form, and an "identity mismatch"
+# against the previous server's id.
+#
+# There is NO secret in this file and there must never be one — the repo is
+# public. `project_fingerprint` is deliberately absent: it is
+# sha256(HCLOUD_TOKEN)[:12], and scripts/setup-secrets.sh carries the value
+# forward from the existing ROTATION_CONFIG when it publishes this file, so
+# the project pin keeps working without the hash living in git.
+#
+# HOW IT REACHES THE RUNNERS (no hand-editing, no local command):
+#   Actions -> bootstrap -> Run workflow -> mode: apply
+# which writes this file, plus the carried-over fingerprint, to
+# ROTATION_CONFIG on every environment that needs it.
+# =============================================================================
+provider: hcloud
+
+# No `server:` block. See above.
+
+ansible:
+  # No `host_alias`: it defaults to the server's own name from the live read,
+  # which is also what the Primary IP is named after. A fleet node's alias in
+  # shikoonet's inventory is the same string.
+  inventory: inventory/hosts.yml
+  repo_dir: ..
+  # Must stay false. inventory/hosts.yml is the single source of truth.
+  auto_edit_inventory: false
+
+cloudflare:
+  # No `mode:`. A run is provider-only because the OPERATOR picked
+  # `operation: provider-only` on the form (which passes --provider-only),
+  # not because the project is. The same project rotates a throwaway box and
+  # a real node on consecutive days.
+  #
+  # `records` is a FLOOR, not the whole set: every name listed here must come
+  # back pointing at the old address or preflight stops. Empty means no floor
+  # — discover then asks each zone which A records hold the old address and
+  # the manifest is whatever it finds. That is what moves a record nobody
+  # remembered to list, which is the failure this repo was written after.
+  accounts:
+    account_a:
+      token_env: CLOUDFLARE_API_TOKEN_ACCOUNT_A
+      records: []
+    account_b:
+      token_env: CLOUDFLARE_API_TOKEN_ACCOUNT_B
+      records: []
+
+old_ip:
+  # `release`: the old Primary IP is deleted once the rotation is done and a
+  # fresh read proves it is attached to nothing. After that there is no
+  # rollback to it. `keep` retains it, unassigned and billed.
+  retention: release
+
+timeouts: {power_off: 180, power_on: 300, ssh: 10}
+retries: {provider: 3, provider_delay: 10, health: 30, health_delay: 10}
+health: {ssh_port: 22}
+state_dir: state
