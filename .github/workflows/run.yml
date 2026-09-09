@@ -107,7 +107,7 @@ on:
         description: 'Hetzner server id OR DataForest Seed UUID. Must equal server.id in the config.'
         required: true
       server_ip:
-        description: 'The address the server is on RIGHT NOW. change-ip: the one being burned. rollback: the new one it is sitting on. provider-only: same as change-ip. dns-scan: the address to SEARCH DNS for — it does not have to be a current address, and that is the point.'
+        description: 'The address the server is on RIGHT NOW. change-ip/provider-only: the old IP. rollback: the new IP on the first attempt, or the old IP when resuming after provider rollback. dns-scan: the address to SEARCH DNS for; it need not be current.'
         required: true
       dns_names:
         description: 'Optional extra assertion, comma- or space-separated. You do NOT need to list every record: preflight automatically finds every A record on the old IP across every visible zone and every result page. If supplied, each name must be in that manifest. A full change-ip also refuses an empty manifest before anything moves; use provider-only only when DNS is intentionally out of scope.'
